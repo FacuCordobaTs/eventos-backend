@@ -14,7 +14,7 @@ app.use(logger())
 app.use(
   "/*",
   cors({
-    origin: ["https://totem.uno", "http://localhost:5173", "https://totem-admin-9hw.pages.dev/login"],
+    origin: ["https://totem.uno", "http://localhost:5173", "https://totem-admin-9hw.pages.dev"],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
     credentials: true,
