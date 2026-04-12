@@ -2,7 +2,7 @@ import { createPool } from 'mysql2/promise';
 
 export const pool = createPool({
     host: 'localhost',
-    user: 'root',
+    user: 'facu',
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     port: 3306,
