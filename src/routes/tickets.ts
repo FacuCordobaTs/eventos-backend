@@ -3,7 +3,7 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { tickets } from "../db/schema"
+import { ticketTypes, tickets } from "../db/schema"
 import { and, eq } from "drizzle-orm"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import {
@@ -20,10 +20,28 @@ const sellTicketSchema = z.object({
   buyerEmail: z.string().email(),
 })
 
+const validateTicketSchema = z.object({
+  qrHash: z.string().min(1),
+  eventId: z.string().min(1),
+})
+
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
   if (id == null || id === "") return null
   return id
+}
+
+function sanitizeValidatedTicket(row: typeof tickets.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    qrHash: row.qrHash,
+    status: row.status,
+    buyerName: row.buyerName,
+    buyerEmail: row.buyerEmail,
+    scannedAt: row.scannedAt,
+    scannedBy: row.scannedBy,
+  }
 }
 
 export const ticketsRoute = new Hono()
@@ -63,6 +81,97 @@ export const ticketsRoute = new Hono()
       }
       throw e
     }
+  })
+  .post("/validate", authMiddleware, zValidator("json", validateTicketSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+
+    const body = c.req.valid("json")
+    const { qrHash, eventId } = body
+    const staffId = ctx.staff.id
+    const db = drizzle(pool)
+
+    const outcome = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .select({
+          id: tickets.id,
+          eventId: tickets.eventId,
+          status: tickets.status,
+          buyerName: tickets.buyerName,
+          buyerEmail: tickets.buyerEmail,
+          qrHash: tickets.qrHash,
+          ticketTypeName: ticketTypes.name,
+          typeEventId: ticketTypes.eventId,
+        })
+        .from(tickets)
+        .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+        .where(
+          and(
+            eq(tickets.qrHash, qrHash),
+            eq(tickets.tenantId, tenantId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (!row) {
+        return { kind: "err" as const, status: 404 as const, error: "Ticket inválido" }
+      }
+
+      if (row.eventId !== eventId || row.typeEventId !== eventId) {
+        return {
+          kind: "err" as const,
+          status: 400 as const,
+          error: "Ticket para otro evento",
+        }
+      }
+
+      if (row.status === "USED") {
+        return { kind: "err" as const, status: 409 as const, error: "Ticket ya usado" }
+      }
+
+      if (row.status === "CANCELLED") {
+        return { kind: "err" as const, status: 404 as const, error: "Ticket inválido" }
+      }
+
+      await tx
+        .update(tickets)
+        .set({
+          status: "USED",
+          scannedAt: new Date(),
+          scannedBy: staffId,
+        })
+        .where(and(eq(tickets.id, row.id), eq(tickets.status, "PENDING")))
+
+      const [updated] = await tx
+        .select()
+        .from(tickets)
+        .where(eq(tickets.id, row.id))
+        .limit(1)
+
+      if (!updated || updated.status !== "USED") {
+        return { kind: "err" as const, status: 409 as const, error: "Ticket ya usado" }
+      }
+
+      return {
+        kind: "ok" as const,
+        ticket: sanitizeValidatedTicket(updated),
+        ticketTypeName: row.ticketTypeName,
+      }
+    })
+
+    if (outcome.kind === "err") {
+      return c.json({ error: outcome.error }, outcome.status)
+    }
+
+    return c.json({
+      message: "Entrada válida",
+      ticket: outcome.ticket,
+      ticketTypeName: outcome.ticketTypeName,
+    })
   })
   .get("/:id/qr", authMiddleware, async (c) => {
     const ctx = c as AuthenticatedContext

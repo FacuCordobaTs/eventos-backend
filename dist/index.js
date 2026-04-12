@@ -50762,11 +50762,27 @@ var sellTicketSchema = exports_external.object({
   buyerName: exports_external.string().min(1).max(255),
   buyerEmail: exports_external.string().email()
 });
+var validateTicketSchema = exports_external.object({
+  qrHash: exports_external.string().min(1),
+  eventId: exports_external.string().min(1)
+});
 function requireTenantId2(ctx) {
   const id = ctx.staff.tenantId;
   if (id == null || id === "")
     return null;
   return id;
+}
+function sanitizeValidatedTicket(row) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    qrHash: row.qrHash,
+    status: row.status,
+    buyerName: row.buyerName,
+    buyerEmail: row.buyerEmail,
+    scannedAt: row.scannedAt,
+    scannedBy: row.scannedBy
+  };
 }
 var ticketsRoute = new Hono2().post("/sell", authMiddleware, zValidator("json", sellTicketSchema), async (c) => {
   const ctx = c;
@@ -50797,6 +50813,66 @@ var ticketsRoute = new Hono2().post("/sell", authMiddleware, zValidator("json", 
     }
     throw e;
   }
+}).post("/validate", authMiddleware, zValidator("json", validateTicketSchema), async (c) => {
+  const ctx = c;
+  const tenantId = requireTenantId2(ctx);
+  if (!tenantId) {
+    return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400);
+  }
+  const body = c.req.valid("json");
+  const { qrHash, eventId } = body;
+  const staffId = ctx.staff.id;
+  const db = drizzle(pool);
+  const outcome = await db.transaction(async (tx) => {
+    const [row] = await tx.select({
+      id: tickets.id,
+      eventId: tickets.eventId,
+      status: tickets.status,
+      buyerName: tickets.buyerName,
+      buyerEmail: tickets.buyerEmail,
+      qrHash: tickets.qrHash,
+      ticketTypeName: ticketTypes.name,
+      typeEventId: ticketTypes.eventId
+    }).from(tickets).innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id)).where(and(eq(tickets.qrHash, qrHash), eq(tickets.tenantId, tenantId), eq(ticketTypes.tenantId, tenantId))).limit(1);
+    if (!row) {
+      return { kind: "err", status: 404, error: "Ticket inv\xE1lido" };
+    }
+    if (row.eventId !== eventId || row.typeEventId !== eventId) {
+      return {
+        kind: "err",
+        status: 400,
+        error: "Ticket para otro evento"
+      };
+    }
+    if (row.status === "USED") {
+      return { kind: "err", status: 409, error: "Ticket ya usado" };
+    }
+    if (row.status === "CANCELLED") {
+      return { kind: "err", status: 404, error: "Ticket inv\xE1lido" };
+    }
+    await tx.update(tickets).set({
+      status: "USED",
+      scannedAt: new Date,
+      scannedBy: staffId
+    }).where(and(eq(tickets.id, row.id), eq(tickets.status, "PENDING")));
+    const [updated] = await tx.select().from(tickets).where(eq(tickets.id, row.id)).limit(1);
+    if (!updated || updated.status !== "USED") {
+      return { kind: "err", status: 409, error: "Ticket ya usado" };
+    }
+    return {
+      kind: "ok",
+      ticket: sanitizeValidatedTicket(updated),
+      ticketTypeName: row.ticketTypeName
+    };
+  });
+  if (outcome.kind === "err") {
+    return c.json({ error: outcome.error }, outcome.status);
+  }
+  return c.json({
+    message: "Entrada v\xE1lida",
+    ticket: outcome.ticket,
+    ticketTypeName: outcome.ticketTypeName
+  });
 }).get("/:id/qr", authMiddleware, async (c) => {
   const ctx = c;
   const tenantId = requireTenantId2(ctx);
@@ -50988,7 +51064,7 @@ var cors = (options) => {
 var app = new Hono2;
 app.use(logger());
 app.use("/*", cors({
-  origin: ["https://totem.uno", "http://localhost:5173"],
+  origin: ["https://totem.uno", "http://localhost:5173", "https://totem-admin-9hw.pages.dev"],
   allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowHeaders: ["Content-Type", "Authorization"],
   credentials: true
