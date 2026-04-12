@@ -4,13 +4,14 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { staff } from "../db/schema"
+import { staff, tenants } from "../db/schema"
 import { v4 as uuidv4 } from "uuid"
 import { setCookie } from "hono/cookie"
 import { and, eq, isNull, type SQL } from "drizzle-orm"
 import { createAccessToken } from "../lib/jwt"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 
 const signupStaffSchema = z.object({
   name: z.string().min(1),
@@ -39,20 +40,6 @@ const updateTeamMemberSchema = z
   .refine((b) => b.name !== undefined || b.role !== undefined || b.password !== undefined, {
     message: "Al menos un campo para actualizar",
   })
-
-type StaffRow = typeof staff.$inferSelect
-
-function sanitizeStaff(row: StaffRow) {
-  return {
-    id: row.id,
-    tenantId: row.tenantId,
-    name: row.name,
-    email: row.email,
-    role: row.role,
-    isActive: row.isActive,
-    createdAt: row.createdAt,
-  }
-}
 
 function staffTenantScope(tenantId: string | null | undefined): SQL {
   if (tenantId == null || tenantId === "") {
@@ -91,13 +78,37 @@ const cookieOptions = (c: { req: { header: (name: string) => string | undefined 
   }
 }
 
+async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffRow) {
+  const base = sanitizeStaff(row)
+  if (!row.tenantId) {
+    return { ...base, tenantName: null as string | null }
+  }
+  const [t] = await db
+    .select({ name: tenants.name })
+    .from(tenants)
+    .where(eq(tenants.id, row.tenantId))
+    .limit(1)
+  return { ...base, tenantName: t?.name ?? null }
+}
+
 export const staffRoute = new Hono()
   .get("/", (c) => {
     return c.json({ message: "Staff API" })
   })
-  .get("/me", authMiddleware, (c) => {
+  .get("/me", authMiddleware, async (c) => {
     const ctx = c as AuthenticatedContext
-    return c.json({ staff: ctx.staff })
+    const db = drizzle(pool)
+    const [row] = await db
+      .select()
+      .from(staff)
+      .where(eq(staff.id, ctx.staff.id))
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Usuario no encontrado" }, 401)
+    }
+    return c.json({
+      staff: await staffPayloadForClient(db, row),
+    })
   })
   .get("/team", authMiddleware, async (c) => {
     const db = drizzle(pool)
@@ -260,7 +271,7 @@ export const staffRoute = new Hono()
       {
         message: "Administrador registrado correctamente",
         token,
-        staff: sanitizeStaff(row),
+        staff: await staffPayloadForClient(db, row),
       },
       201
     )
@@ -290,7 +301,7 @@ export const staffRoute = new Hono()
     return c.json({
       message: "Inicio de sesión exitoso",
       token,
-      staff: sanitizeStaff(row),
+      staff: await staffPayloadForClient(db, row),
     })
   })
   .post("/logout", (c) => {
