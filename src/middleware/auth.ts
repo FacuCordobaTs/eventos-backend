@@ -12,6 +12,7 @@ export interface AuthenticatedContext extends Context {
     name: string
     role: string
     tenantId?: string
+    isActive: boolean
   }
 }
 
@@ -37,12 +38,17 @@ export const authMiddleware = async (c: Context, next: Next) => {
     }
 
     const staff = staffResult[0]
+    if (!staff.isActive) {
+      return c.json({ error: "Cuenta desactivada" }, 401)
+    }
+
     ;(c as AuthenticatedContext).staff = {
       id: staff.id,
       email: staff.email,
       name: staff.name,
       role: staff.role,
       tenantId: staff.tenantId ?? undefined,
+      isActive: staff.isActive,
     }
 
     await next()

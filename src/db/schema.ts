@@ -5,7 +5,8 @@ import {
     timestamp, 
     decimal, 
     boolean, 
-    mysqlEnum 
+    mysqlEnum,
+    index,
   } from 'drizzle-orm/mysql-core';
 import { relations } from 'drizzle-orm';
 
@@ -17,16 +18,23 @@ export const tenants = mysqlTable('tenants', {
   updatedAt: timestamp('updated_at').onUpdateNow(),
 });
 
-export const staff = mysqlTable('staff', {
-  id: varchar('id', { length: 36 }).primaryKey(),
-  tenantId: varchar('tenant_id', { length: 36 }).references(() => tenants.id),
-  name: varchar('name', { length: 255 }).notNull(),
-  email: varchar('email', { length: 255 }).notNull().unique(),
-  passwordHash: varchar('password_hash', { length: 255 }).notNull(),
-  role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
-  pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
-  createdAt: timestamp('created_at').defaultNow(),
-});
+export const staff = mysqlTable(
+  'staff',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 }).references(() => tenants.id),
+    name: varchar('name', { length: 255 }).notNull(),
+    email: varchar('email', { length: 255 }).notNull().unique(),
+    passwordHash: varchar('password_hash', { length: 255 }).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
+    pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    tenantIdIdx: index('staff_tenant_id_idx').on(table.tenantId),
+  })
+);
 
 // -----------------------------------------------------------------------------
 // 2. EVENTOS Y ENTRADAS (El control de acceso)
