@@ -3,11 +3,15 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, ticketTypes, tickets } from "../db/schema"
-import { and, count, eq, ne } from "drizzle-orm"
-import { v4 as uuidv4 } from "uuid"
-import { randomUUID } from "node:crypto"
+import { tickets } from "../db/schema"
+import { and, eq } from "drizzle-orm"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import {
+  executeTicketPurchase,
+  PurchaseError,
+  purchaseErrorStatus,
+} from "../lib/ticket-purchase"
+import { qrCodeDataUrl, ticketValidationUrl } from "../lib/qr"
 
 const sellTicketSchema = z.object({
   eventId: z.string().min(1),
@@ -22,9 +26,8 @@ function requireTenantId(ctx: AuthenticatedContext): string | null {
   return id
 }
 
-export const ticketsSellRoute = new Hono()
-  .use("*", authMiddleware)
-  .post("/sell", zValidator("json", sellTicketSchema), async (c) => {
+export const ticketsRoute = new Hono()
+  .post("/sell", authMiddleware, zValidator("json", sellTicketSchema), async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
@@ -34,93 +37,59 @@ export const ticketsSellRoute = new Hono()
     const db = drizzle(pool)
 
     try {
-      const result = await db.transaction(async (tx) => {
-        const [ev] = await tx
-          .select()
-          .from(events)
-          .where(and(eq(events.id, body.eventId), eq(events.tenantId, tenantId)))
-          .limit(1)
-        if (!ev) {
-          throw new Error("EVENT_NOT_FOUND")
-        }
-
-        const [tt] = await tx
-          .select()
-          .from(ticketTypes)
-          .where(
-            and(
-              eq(ticketTypes.id, body.ticketTypeId),
-              eq(ticketTypes.tenantId, tenantId),
-              eq(ticketTypes.eventId, body.eventId)
-            )
-          )
-          .limit(1)
-        if (!tt) {
-          throw new Error("TICKET_TYPE_NOT_FOUND")
-        }
-
-        const [soldRow] = await tx
-          .select({ n: count() })
-          .from(tickets)
-          .where(
-            and(
-              eq(tickets.tenantId, tenantId),
-              eq(tickets.ticketTypeId, body.ticketTypeId),
-              ne(tickets.status, "CANCELLED")
-            )
-          )
-        const sold = Number(soldRow?.n ?? 0)
-        const limit = tt.stockLimit
-        if (limit != null && sold >= limit) {
-          throw new Error("OUT_OF_STOCK")
-        }
-
-        const ticketId = uuidv4()
-        const qrHash = randomUUID()
-
-        await tx.insert(tickets).values({
-          id: ticketId,
-          ticketTypeId: body.ticketTypeId,
+      const result = await db.transaction(async (tx) =>
+        executeTicketPurchase(tx, {
           eventId: body.eventId,
-          tenantId,
-          qrHash,
-          status: "PENDING",
+          ticketTypeId: body.ticketTypeId,
           buyerName: body.buyerName,
           buyerEmail: body.buyerEmail,
-          createdAt: new Date(),
+          enforceTenantId: tenantId,
         })
-
-        const [row] = await tx
-          .select()
-          .from(tickets)
-          .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
-          .limit(1)
-
-        return {
-          ticket: row,
-          ticketTypeName: tt.name,
-          payment: { status: "completed" as const, method: "mock" as const },
-        }
-      })
+      )
 
       return c.json(
         {
           message: "Venta simulada completada",
-          ...result,
+          ticket: result.ticket,
+          ticketTypeName: result.ticketTypeName,
+          payment: { status: "completed" as const, method: "mock" as const },
         },
         201
       )
     } catch (e) {
-      const msg = e instanceof Error ? e.message : ""
-      if (msg === "EVENT_NOT_FOUND") {
-        return c.json({ error: "Evento no encontrado" }, 404)
-      }
-      if (msg === "TICKET_TYPE_NOT_FOUND") {
-        return c.json({ error: "Tipo de entrada no encontrado" }, 404)
-      }
-      if (msg === "OUT_OF_STOCK") {
-        return c.json({ error: "Sin stock disponible para este tipo de entrada" }, 409)
+      if (e instanceof PurchaseError) {
+        const { status, body: errBody } = purchaseErrorStatus(e.code)
+        return c.json(errBody, status)
       }
       throw e
     }
+  })
+  .get("/:id/qr", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+
+    const ticketId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [row] = await db
+      .select()
+      .from(tickets)
+      .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
+      .limit(1)
+
+    if (!row) {
+      return c.json({ error: "Entrada no encontrada" }, 404)
+    }
+
+    const validationUrl = ticketValidationUrl(row.qrHash)
+    const qrDataUrl = await qrCodeDataUrl(validationUrl)
+
+    return c.json({
+      qrDataUrl,
+      validationUrl,
+      qrHash: row.qrHash,
+    })
   })
