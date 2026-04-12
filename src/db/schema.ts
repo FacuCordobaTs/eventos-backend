@@ -37,6 +37,20 @@ export const staff = mysqlTable(
 );
 
 // -----------------------------------------------------------------------------
+// 6. CLIENTES (App B2B2C)
+// -----------------------------------------------------------------------------
+
+export const customers = mysqlTable('customers', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  name: varchar('name', { length: 255 }).notNull(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  passwordHash: varchar('password_hash', { length: 255 }),
+  phone: varchar('phone', { length: 50 }),
+  isActive: boolean('is_active').default(true),
+  createdAt: timestamp('created_at').defaultNow(),
+});
+
+// -----------------------------------------------------------------------------
 // 2. EVENTOS Y ENTRADAS (El control de acceso)
 // -----------------------------------------------------------------------------
 
@@ -83,6 +97,7 @@ export const tickets = mysqlTable(
     status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).default('PENDING'),
     buyerName: varchar('buyer_name', { length: 255 }),
     buyerEmail: varchar('buyer_email', { length: 255 }),
+    customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
     scannedAt: timestamp('scanned_at'),
     scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
     createdAt: timestamp('created_at').defaultNow(),
@@ -90,6 +105,7 @@ export const tickets = mysqlTable(
   (table) => ({
     tenantIdIdx: index('tickets_tenant_id_idx').on(table.tenantId),
     eventTenantIdx: index('tickets_event_tenant_idx').on(table.eventId, table.tenantId),
+    customerIdx: index('tickets_customer_id_idx').on(table.customerId),
   })
 );
 
@@ -129,6 +145,8 @@ export const sales = mysqlTable('sales', {
   eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   staffId: varchar('staff_id', { length: 36 }).references(() => staff.id), // Quién cobró
+  customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+  source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
   totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
   paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),
   status: mysqlEnum('status', ['COMPLETED', 'REFUNDED']).default('COMPLETED'),
@@ -141,6 +159,20 @@ export const saleItems = mysqlTable('sale_items', {
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
   quantity: int('quantity').notNull(),
   priceAtTime: decimal('price_at_time', { precision: 10, scale: 2 }).notNull(),
+});
+
+export const digitalConsumptions = mysqlTable('digital_consumptions', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  customerId: varchar('customer_id', { length: 36 }).notNull().references(() => customers.id),
+  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
+  saleId: varchar('sale_id', { length: 36 }).notNull().references(() => sales.id),
+  qrHash: varchar('qr_hash', { length: 255 }).notNull().unique(),
+  status: mysqlEnum('status', ['PENDING', 'REDEEMED', 'CANCELLED']).default('PENDING'),
+  redeemedAt: timestamp('redeemed_at'),
+  redeemedBy: varchar('redeemed_by', { length: 36 }).references(() => staff.id),
+  createdAt: timestamp('created_at').defaultNow(),
 });
 
 // -----------------------------------------------------------------------------

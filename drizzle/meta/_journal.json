@@ -22,6 +22,13 @@
       "when": 1775973291006,
       "tag": "0002_skinny_morph",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1776028735929,
+      "tag": "0003_yielding_viper",
+      "breakpoints": true
     }
   ]
 }
