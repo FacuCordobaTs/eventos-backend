@@ -40,36 +40,58 @@ export const staff = mysqlTable(
 // 2. EVENTOS Y ENTRADAS (El control de acceso)
 // -----------------------------------------------------------------------------
 
-export const events = mysqlTable('events', {
-  id: varchar('id', { length: 36 }).primaryKey(),
-  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-  name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
-  date: timestamp('date').notNull(),
-  location: varchar('location', { length: 255 }),
-  isActive: boolean('is_active').default(true),
-  createdAt: timestamp('created_at').defaultNow(),
-});
+export const events = mysqlTable(
+  'events',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
+    date: timestamp('date').notNull(),
+    location: varchar('location', { length: 255 }),
+    isActive: boolean('is_active').default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    tenantIdIdx: index('events_tenant_id_idx').on(table.tenantId),
+  })
+);
 
-export const ticketTypes = mysqlTable('ticket_types', {
-  id: varchar('id', { length: 36 }).primaryKey(),
-  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
-  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-  name: varchar('name', { length: 100 }).notNull(), // "General", "VIP", "Mesa"
-  price: decimal('price', { precision: 10, scale: 2 }).notNull(),
-  stockLimit: int('stock_limit'), // null = ilimitado
-});
+export const ticketTypes = mysqlTable(
+  'ticket_types',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    name: varchar('name', { length: 100 }).notNull(), // "General", "VIP", "Mesa"
+    price: decimal('price', { precision: 10, scale: 2 }).notNull(),
+    stockLimit: int('stock_limit'), // null = ilimitado
+  },
+  (table) => ({
+    tenantIdIdx: index('ticket_types_tenant_id_idx').on(table.tenantId),
+    eventTenantIdx: index('ticket_types_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
 
-export const tickets = mysqlTable('tickets', {
-  id: varchar('id', { length: 36 }).primaryKey(),
-  ticketTypeId: varchar('ticket_type_id', { length: 36 }).notNull().references(() => ticketTypes.id),
-  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
-  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-  qrHash: varchar('qr_hash', { length: 255 }).notNull().unique(),
-  status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).default('PENDING'),
-  scannedAt: timestamp('scanned_at'),
-  scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
-  createdAt: timestamp('created_at').defaultNow(),
-});
+export const tickets = mysqlTable(
+  'tickets',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    ticketTypeId: varchar('ticket_type_id', { length: 36 }).notNull().references(() => ticketTypes.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    qrHash: varchar('qr_hash', { length: 255 }).notNull().unique(),
+    status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).default('PENDING'),
+    buyerName: varchar('buyer_name', { length: 255 }),
+    buyerEmail: varchar('buyer_email', { length: 255 }),
+    scannedAt: timestamp('scanned_at'),
+    scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    tenantIdIdx: index('tickets_tenant_id_idx').on(table.tenantId),
+    eventTenantIdx: index('tickets_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
 
 // -----------------------------------------------------------------------------
 // 3. INVENTARIO PRO
