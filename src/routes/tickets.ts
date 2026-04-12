@@ -11,7 +11,7 @@ import {
   PurchaseError,
   purchaseErrorStatus,
 } from "../lib/ticket-purchase"
-import { qrCodeDataUrl, ticketValidationUrl } from "../lib/qr"
+import { qrCodeDataUrl } from "../lib/qr"
 
 const sellTicketSchema = z.object({
   eventId: z.string().min(1),
@@ -84,12 +84,10 @@ export const ticketsRoute = new Hono()
       return c.json({ error: "Entrada no encontrada" }, 404)
     }
 
-    const validationUrl = ticketValidationUrl(row.qrHash)
-    const qrDataUrl = await qrCodeDataUrl(validationUrl)
+    const qrDataUrl = await qrCodeDataUrl(row.qrHash)
 
     return c.json({
       qrDataUrl,
-      validationUrl,
       qrHash: row.qrHash,
     })
   })

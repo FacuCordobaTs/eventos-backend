@@ -3,14 +3,14 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, ticketTypes, tickets } from "../db/schema"
+import { events, tenants, ticketTypes, tickets } from "../db/schema"
 import { and, count, eq, ne } from "drizzle-orm"
 import {
   executeTicketPurchase,
   PurchaseError,
   purchaseErrorStatus,
 } from "../lib/ticket-purchase"
-import { qrCodeDataUrl, ticketValidationUrl } from "../lib/qr"
+import { qrCodeDataUrl } from "../lib/qr"
 
 const purchaseSchema = z.object({
   eventId: z.string().min(1),
@@ -47,6 +47,12 @@ export const publicRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
+    const [productoraRow] = await db
+      .select({ name: tenants.name })
+      .from(tenants)
+      .where(eq(tenants.id, ev.tenantId))
+      .limit(1)
+
     const types = await db
       .select()
       .from(ticketTypes)
@@ -71,6 +77,9 @@ export const publicRoute = new Hono()
     }
 
     return c.json({
+      productora: {
+        name: productoraRow?.name ?? "Productora",
+      },
       event: {
         id: ev.id,
         name: ev.name,
@@ -94,8 +103,7 @@ export const publicRoute = new Hono()
         })
       )
 
-      const validationUrl = ticketValidationUrl(result.ticket.qrHash)
-      const qrDataUrl = await qrCodeDataUrl(validationUrl)
+      const qrDataUrl = await qrCodeDataUrl(result.ticket.qrHash)
 
       return c.json(
         {
@@ -108,7 +116,6 @@ export const publicRoute = new Hono()
             buyerEmail: result.ticket.buyerEmail,
             ticketTypeName: result.ticketTypeName,
           },
-          validationUrl,
           qrDataUrl,
           payment: { status: "completed" as const, method: "mock" as const },
         },
