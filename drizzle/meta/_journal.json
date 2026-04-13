@@ -43,6 +43,13 @@
       "when": 1776109814138,
       "tag": "0005_bars",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1776110511731,
+      "tag": "0006_event_staff",
+      "breakpoints": true
     }
   ]
 }

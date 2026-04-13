@@ -179,6 +179,34 @@ export const bars = mysqlTable(
   })
 );
 
+export const eventStaff = mysqlTable(
+  'event_staff',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 })
+      .notNull()
+      .references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    staffId: varchar('staff_id', { length: 36 })
+      .notNull()
+      .references(() => staff.id),
+    barId: varchar('bar_id', { length: 36 }).references(() => bars.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventTenantIdx: index('event_staff_event_tenant_idx').on(
+      table.eventId,
+      table.tenantId
+    ),
+    uniqueEventStaff: uniqueIndex('event_staff_event_staff_unique').on(
+      table.eventId,
+      table.staffId
+    ),
+  })
+);
+
 export const productRecipes = mysqlTable('product_recipes', {
   id: varchar('id', { length: 36 }).primaryKey(),
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
@@ -232,6 +260,7 @@ export const digitalConsumptions = mysqlTable('digital_consumptions', {
 export const eventsRelations = relations(events, ({ many }) => ({
   eventProducts: many(eventProducts),
   bars: many(bars),
+  eventStaff: many(eventStaff),
 }));
 
 export const productsRelations = relations(products, ({ many }) => ({
@@ -254,13 +283,37 @@ export const eventProductsRelations = relations(eventProducts, ({ one }) => ({
   }),
 }));
 
-export const barsRelations = relations(bars, ({ one }) => ({
+export const barsRelations = relations(bars, ({ one, many }) => ({
   event: one(events, {
     fields: [bars.eventId],
     references: [events.id],
   }),
   tenant: one(tenants, {
     fields: [bars.tenantId],
+    references: [tenants.id],
+  }),
+  eventStaff: many(eventStaff),
+}));
+
+export const staffRelations = relations(staff, ({ many }) => ({
+  eventAssignments: many(eventStaff),
+}));
+
+export const eventStaffRelations = relations(eventStaff, ({ one }) => ({
+  event: one(events, {
+    fields: [eventStaff.eventId],
+    references: [events.id],
+  }),
+  staff: one(staff, {
+    fields: [eventStaff.staffId],
+    references: [staff.id],
+  }),
+  bar: one(bars, {
+    fields: [eventStaff.barId],
+    references: [bars.id],
+  }),
+  tenant: one(tenants, {
+    fields: [eventStaff.tenantId],
     references: [tenants.id],
   }),
 }));

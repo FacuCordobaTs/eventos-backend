@@ -8,9 +8,11 @@ import {
   digitalConsumptions,
   eventProducts,
   events,
+  eventStaff,
   products,
   saleItems,
   sales,
+  staff,
   ticketTypes,
   tickets,
 } from "../db/schema"
@@ -55,6 +57,12 @@ const updateBarSchema = z
   .refine((b) => b.name !== undefined || b.isActive !== undefined, {
     message: "Se requiere name o isActive",
   })
+
+const assignEventStaffSchema = z.object({
+  staffId: z.string().min(1).max(36),
+  isAssigned: z.boolean(),
+  barId: z.union([z.string().min(1).max(36), z.null()]).optional(),
+})
 
 async function countIssuedTickets(
   db: ReturnType<typeof drizzle>,
@@ -606,6 +614,162 @@ export const eventsRoute = new Hono()
         },
         201
       )
+    }
+  )
+  .get("/:id/staff", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select({
+        id: staff.id,
+        name: staff.name,
+        email: staff.email,
+        role: staff.role,
+        isActive: staff.isActive,
+        assignmentId: eventStaff.id,
+        barId: eventStaff.barId,
+      })
+      .from(staff)
+      .leftJoin(
+        eventStaff,
+        and(
+          eq(eventStaff.staffId, staff.id),
+          eq(eventStaff.eventId, eventId),
+          eq(eventStaff.tenantId, tenantId)
+        )
+      )
+      .where(and(eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
+      .orderBy(asc(staff.name))
+
+    return c.json({
+      staff: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        email: r.email,
+        role: r.role,
+        isAssigned: r.assignmentId != null,
+        barId: r.barId ?? null,
+      })),
+    })
+  })
+  .post(
+    "/:id/staff/assign",
+    zValidator("json", assignEventStaffSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      if (!body.isAssigned) {
+        await db
+          .delete(eventStaff)
+          .where(
+            and(
+              eq(eventStaff.eventId, eventId),
+              eq(eventStaff.staffId, body.staffId),
+              eq(eventStaff.tenantId, tenantId)
+            )
+          )
+        return c.json({ ok: true })
+      }
+
+      const [st] = await db
+        .select({ id: staff.id })
+        .from(staff)
+        .where(
+          and(
+            eq(staff.id, body.staffId),
+            eq(staff.tenantId, tenantId),
+            eq(staff.isActive, true)
+          )
+        )
+        .limit(1)
+      if (!st) {
+        return c.json(
+          { error: "Personal no encontrado o inactivo en tu Productora" },
+          404
+        )
+      }
+
+      let nextBarId: string | null | undefined = undefined
+      if (body.barId === null) {
+        nextBarId = null
+      } else if (typeof body.barId === "string") {
+        const bar = await requireBarForEventTenant(
+          db,
+          body.barId,
+          eventId,
+          tenantId
+        )
+        if (!bar) {
+          return c.json({ error: "Barra no encontrada en este evento" }, 404)
+        }
+        if (bar.isActive === false) {
+          return c.json({ error: "La barra está inactiva" }, 400)
+        }
+        nextBarId = body.barId
+      }
+
+      const [existing] = await db
+        .select()
+        .from(eventStaff)
+        .where(
+          and(
+            eq(eventStaff.eventId, eventId),
+            eq(eventStaff.staffId, body.staffId),
+            eq(eventStaff.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (existing) {
+        if (nextBarId === undefined) {
+          return c.json({ ok: true })
+        }
+        await db
+          .update(eventStaff)
+          .set({ barId: nextBarId })
+          .where(
+            and(
+              eq(eventStaff.id, existing.id),
+              eq(eventStaff.tenantId, tenantId)
+            )
+          )
+        return c.json({ ok: true })
+      }
+
+      const newId = uuidv4()
+      await db.insert(eventStaff).values({
+        id: newId,
+        eventId,
+        tenantId,
+        staffId: body.staffId,
+        barId: nextBarId === undefined ? null : nextBarId,
+        createdAt: new Date(),
+      })
+
+      return c.json({ ok: true }, 201)
     }
   )
   .get("/:id/bars", async (c) => {
