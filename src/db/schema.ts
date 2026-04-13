@@ -360,7 +360,8 @@ export const saleItems = mysqlTable('sale_items', {
 
 export const digitalConsumptions = mysqlTable('digital_consumptions', {
   id: varchar('id', { length: 36 }).primaryKey(),
-  customerId: varchar('customer_id', { length: 36 }).notNull().references(() => customers.id),
+  /** Null cuando la consumición proviene del POS (venta sin cliente en app). */
+  customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
   eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),

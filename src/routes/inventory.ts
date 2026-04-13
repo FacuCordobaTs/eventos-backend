@@ -5,8 +5,10 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { and, eq, inArray } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
+import { randomUUID } from "node:crypto"
 import {
   bars,
+  digitalConsumptions,
   eventInventory,
   events,
   inventoryItems,
@@ -551,6 +553,22 @@ export const inventoryRoute = new Hono()
             quantity: line.quantity,
             priceAtTime: p.price,
           })
+        }
+
+        for (const line of body.items) {
+          for (let u = 0; u < line.quantity; u++) {
+            await tx.insert(digitalConsumptions).values({
+              id: uuidv4(),
+              customerId: null,
+              eventId: body.eventId,
+              tenantId,
+              productId: line.productId,
+              saleId,
+              qrHash: randomUUID(),
+              status: "PENDING",
+              createdAt: new Date(),
+            })
+          }
         }
 
         if (needs.size > 0) {

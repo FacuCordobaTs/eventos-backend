@@ -4,10 +4,10 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { staff, tenants } from "../db/schema"
+import { bars, events, eventStaff, staff, tenants } from "../db/schema"
 import { v4 as uuidv4 } from "uuid"
 import { setCookie } from "hono/cookie"
-import { and, eq, isNull, type SQL } from "drizzle-orm"
+import { and, desc, eq, isNull, type SQL } from "drizzle-orm"
 import { createAccessToken } from "../lib/jwt"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
@@ -94,6 +94,55 @@ async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffR
 export const staffRoute = new Hono()
   .get("/", (c) => {
     return c.json({ message: "Staff API" })
+  })
+  .get("/me/shift", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "BARTENDER") {
+      return c.json(
+        { error: "Este recurso es solo para personal de barra." },
+        403
+      )
+    }
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ shift: null })
+    }
+
+    const db = drizzle(pool)
+    const rows = await db
+      .select({
+        eventId: events.id,
+        eventName: events.name,
+        barId: eventStaff.barId,
+        barName: bars.name,
+      })
+      .from(eventStaff)
+      .innerJoin(events, eq(eventStaff.eventId, events.id))
+      .leftJoin(bars, eq(eventStaff.barId, bars.id))
+      .where(
+        and(
+          eq(eventStaff.staffId, ctx.staff.id),
+          eq(eventStaff.tenantId, tenantId),
+          eq(events.tenantId, tenantId),
+          eq(events.isActive, true)
+        )
+      )
+      .orderBy(desc(events.date))
+      .limit(1)
+
+    const row = rows[0]
+    if (!row?.barId) {
+      return c.json({ shift: null })
+    }
+
+    return c.json({
+      shift: {
+        eventId: row.eventId,
+        eventName: row.eventName,
+        barId: row.barId,
+        barName: row.barName ?? "",
+      },
+    })
   })
   .get("/me", authMiddleware, async (c) => {
     const ctx = c as AuthenticatedContext

@@ -1448,6 +1448,7 @@ export const eventsRoute = new Hono()
     const eventId = c.req.param("id")
     const limitRaw = c.req.query("limit")
     const offsetRaw = c.req.query("offset")
+    const barIdRaw = c.req.query("barId")?.trim()
     const limit = Math.min(
       Math.max(Number.parseInt(limitRaw ?? "50", 10) || 50, 1),
       200
@@ -1460,12 +1461,31 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
+    let filterBarId: string | undefined
+    if (barIdRaw && barIdRaw.length > 0) {
+      const bar = await requireBarForEventTenant(db, barIdRaw, eventId, tenantId)
+      if (!bar) {
+        return c.json({ error: "Barra no encontrada" }, 404)
+      }
+      filterBarId = barIdRaw
+    }
+
+    const saleFilters = [
+      eq(sales.eventId, eventId),
+      eq(sales.tenantId, tenantId),
+      eq(sales.status, "COMPLETED"),
+    ]
+    if (filterBarId) {
+      saleFilters.push(eq(sales.barId, filterBarId))
+    }
+
     const pageRows = await db
       .select({
         id: sales.id,
         createdAt: sales.createdAt,
         source: sales.source,
         totalAmount: sales.totalAmount,
+        paymentMethod: sales.paymentMethod,
         staffName: staff.name,
         customerName: customers.name,
       })
@@ -1475,13 +1495,7 @@ export const eventsRoute = new Hono()
         and(eq(sales.staffId, staff.id), eq(staff.tenantId, tenantId))
       )
       .leftJoin(customers, eq(sales.customerId, customers.id))
-      .where(
-        and(
-          eq(sales.eventId, eventId),
-          eq(sales.tenantId, tenantId),
-          eq(sales.status, "COMPLETED")
-        )
-      )
+      .where(and(...saleFilters))
       .orderBy(desc(sales.createdAt))
       .limit(limit + 1)
       .offset(offset)
@@ -1532,6 +1546,7 @@ export const eventsRoute = new Hono()
         createdAt: r.createdAt,
         source: r.source,
         totalAmount: String(r.totalAmount),
+        paymentMethod: r.paymentMethod,
         staffName: r.staffName,
         customerName: r.customerName,
         itemsSummary: itemsSummary(r.id),

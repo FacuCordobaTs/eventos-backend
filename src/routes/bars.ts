@@ -9,14 +9,17 @@ import {
   barInventory,
   barProducts,
   bars,
+  digitalConsumptions,
   eventInventory,
   eventProducts,
   events,
   inventoryItems,
+  productRecipes,
   products,
+  sales,
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { dec, decToDb } from "../lib/decimal-money"
+import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -35,6 +38,10 @@ const patchBarInventorySchema = z.object({
     z.number().nonnegative(),
     z.string().regex(/^\d+(\.\d{1,4})?$/),
   ]),
+})
+
+const redeemQrSchema = z.object({
+  qrHash: z.string().min(1).max(255),
 })
 
 async function requireBarForTenant(
@@ -392,5 +399,156 @@ export const barsRoute = new Hono()
       })
 
       return c.json({ ok: true, currentStock: stockStr }, 201)
+    }
+  )
+  .post(
+    "/:barId/redeem",
+    zValidator("json", redeemQrSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const barId = c.req.param("barId")
+      const qrHash = c.req.valid("json").qrHash.trim()
+      const db = drizzle(pool)
+
+      const result = await db.transaction(async (tx) => {
+        const [bar] = await tx
+          .select()
+          .from(bars)
+          .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+          .limit(1)
+        if (!bar) {
+          return { kind: "no_bar" as const }
+        }
+
+        const [row] = await tx
+          .select({
+            consumption: digitalConsumptions,
+            sale: sales,
+            productName: products.name,
+          })
+          .from(digitalConsumptions)
+          .innerJoin(sales, eq(digitalConsumptions.saleId, sales.id))
+          .innerJoin(products, eq(digitalConsumptions.productId, products.id))
+          .where(
+            and(
+              eq(digitalConsumptions.qrHash, qrHash),
+              eq(digitalConsumptions.tenantId, tenantId)
+            )
+          )
+          .limit(1)
+
+        if (!row) {
+          return { kind: "invalid_qr" as const }
+        }
+
+        if (row.consumption.status !== "PENDING") {
+          return { kind: "used" as const }
+        }
+
+        if (row.consumption.eventId !== bar.eventId) {
+          return { kind: "wrong_event" as const }
+        }
+
+        if (row.sale.barId != null && row.sale.barId !== barId) {
+          return { kind: "wrong_bar" as const }
+        }
+
+        await tx
+          .update(digitalConsumptions)
+          .set({
+            status: "REDEEMED",
+            redeemedAt: new Date(),
+            redeemedBy: ctx.staff.id,
+          })
+          .where(
+            and(
+              eq(digitalConsumptions.id, row.consumption.id),
+              eq(digitalConsumptions.status, "PENDING")
+            )
+          )
+
+        const [verify] = await tx
+          .select({ status: digitalConsumptions.status })
+          .from(digitalConsumptions)
+          .where(eq(digitalConsumptions.id, row.consumption.id))
+          .limit(1)
+
+        if (!verify || verify.status !== "REDEEMED") {
+          return { kind: "race_used" as const }
+        }
+
+        const recipes = await tx
+          .select()
+          .from(productRecipes)
+          .where(eq(productRecipes.productId, row.consumption.productId))
+
+        for (const r of recipes) {
+          const deduct = decFromDb(r.quantityUsed)
+          const [bRow] = await tx
+            .select()
+            .from(barInventory)
+            .where(
+              and(
+                eq(barInventory.barId, barId),
+                eq(barInventory.inventoryItemId, r.inventoryItemId),
+                eq(barInventory.tenantId, tenantId)
+              )
+            )
+            .limit(1)
+
+          if (bRow) {
+            const next = decFromDb(bRow.currentStock).minus(deduct)
+            await tx
+              .update(barInventory)
+              .set({ currentStock: decToDb(next) })
+              .where(
+                and(
+                  eq(barInventory.id, bRow.id),
+                  eq(barInventory.tenantId, tenantId)
+                )
+              )
+          } else {
+            const next = dec(0).minus(deduct)
+            await tx.insert(barInventory).values({
+              id: uuidv4(),
+              barId,
+              inventoryItemId: r.inventoryItemId,
+              tenantId,
+              currentStock: decToDb(next),
+            })
+          }
+        }
+
+        return {
+          kind: "ok" as const,
+          productName: row.productName,
+        }
+      })
+
+      if (result.kind === "no_bar") {
+        return c.json({ error: "Barra no encontrada" }, 404)
+      }
+      if (result.kind === "invalid_qr") {
+        return c.json({ error: "QR inválido" }, 404)
+      }
+      if (result.kind === "used" || result.kind === "race_used") {
+        return c.json({ error: "QR ya usado o cancelado" }, 400)
+      }
+      if (result.kind === "wrong_event") {
+        return c.json({ error: "Este código no pertenece a este evento" }, 400)
+      }
+      if (result.kind === "wrong_bar") {
+        return c.json({ error: "Este código no es válido en esta barra" }, 400)
+      }
+
+      return c.json({
+        ok: true,
+        productName: result.productName,
+        message: `Servir: 1× ${result.productName}`,
+      })
     }
   )

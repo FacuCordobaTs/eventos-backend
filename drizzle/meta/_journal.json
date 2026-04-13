@@ -78,6 +78,13 @@
       "when": 1776113000000,
       "tag": "0010_sales_bar_id",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "5",
+      "when": 1776114000000,
+      "tag": "0011_digital_consumptions_customer_nullable",
+      "breakpoints": true
     }
   ]
 }
