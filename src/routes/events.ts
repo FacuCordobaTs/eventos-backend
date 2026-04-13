@@ -3,8 +3,16 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, ticketTypes, tickets } from "../db/schema"
-import { and, count, desc, eq, ne } from "drizzle-orm"
+import {
+  digitalConsumptions,
+  events,
+  products,
+  saleItems,
+  sales,
+  ticketTypes,
+  tickets,
+} from "../db/schema"
+import { and, count, desc, eq, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 
@@ -56,6 +64,19 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     isActive: row.isActive,
     createdAt: row.createdAt,
   }
+}
+
+async function requireEventForTenant(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string
+): Promise<typeof events.$inferSelect | null> {
+  const [ev] = await db
+    .select()
+    .from(events)
+    .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+    .limit(1)
+  return ev ?? null
 }
 
 function sanitizeTicketType(
@@ -231,6 +252,147 @@ export const eventsRoute = new Hono()
         ticketTypeId: r.ticketTypeId,
         ticketTypeName: r.ticketTypeName,
       })),
+    })
+  })
+  .get("/:id/summary", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [ticketsRow] = await db
+      .select({ n: count() })
+      .from(tickets)
+      .where(
+        and(
+          eq(tickets.eventId, eventId),
+          eq(tickets.tenantId, tenantId),
+          ne(tickets.status, "CANCELLED")
+        )
+      )
+
+    const [revenueRow] = await db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
+      })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      )
+
+    const [consumptionsRow] = await db
+      .select({ n: count() })
+      .from(digitalConsumptions)
+      .where(
+        and(
+          eq(digitalConsumptions.eventId, eventId),
+          eq(digitalConsumptions.tenantId, tenantId),
+          ne(digitalConsumptions.status, "CANCELLED")
+        )
+      )
+
+    return c.json({
+      ticketsSold: Number(ticketsRow?.n ?? 0),
+      totalRevenue: revenueRow?.total ?? "0.00",
+      digitalConsumptionsSold: Number(consumptionsRow?.n ?? 0),
+    })
+  })
+  .get("/:id/bar-sales", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select({
+        productName: products.name,
+        quantitySold: sum(saleItems.quantity),
+        revenue:
+          sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .innerJoin(products, eq(saleItems.productId, products.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED"),
+          eq(products.tenantId, tenantId)
+        )
+      )
+      .groupBy(saleItems.productId, products.id, products.name)
+
+    const items = rows
+      .map((r) => ({
+        productName: r.productName,
+        quantitySold: Number(r.quantitySold ?? 0),
+        revenue: String(r.revenue ?? "0"),
+      }))
+      .filter((r) => r.quantitySold > 0)
+      .sort((a, b) => b.quantitySold - a.quantitySold)
+
+    return c.json({ items })
+  })
+  .get("/:id/gate-stats", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [totalRow] = await db
+      .select({ n: count() })
+      .from(tickets)
+      .where(
+        and(
+          eq(tickets.eventId, eventId),
+          eq(tickets.tenantId, tenantId),
+          ne(tickets.status, "CANCELLED")
+        )
+      )
+
+    const [scannedRow] = await db
+      .select({ n: count() })
+      .from(tickets)
+      .where(
+        and(
+          eq(tickets.eventId, eventId),
+          eq(tickets.tenantId, tenantId),
+          eq(tickets.status, "USED")
+        )
+      )
+
+    return c.json({
+      totalTickets: Number(totalRow?.n ?? 0),
+      scannedTickets: Number(scannedRow?.n ?? 0),
     })
   })
   .get("/:id", async (c) => {
