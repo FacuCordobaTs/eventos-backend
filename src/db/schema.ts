@@ -7,6 +7,7 @@ import {
     boolean, 
     mysqlEnum,
     index,
+    uniqueIndex,
   } from 'drizzle-orm/mysql-core';
 import { relations } from 'drizzle-orm';
 
@@ -129,6 +130,35 @@ export const products = mysqlTable('products', {
   isActive: boolean('is_active').default(true),
 });
 
+export const eventProducts = mysqlTable(
+  'event_products',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 })
+      .notNull()
+      .references(() => events.id),
+    productId: varchar('product_id', { length: 36 })
+      .notNull()
+      .references(() => products.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    priceOverride: decimal('price_override', { precision: 10, scale: 2 }),
+    isActive: boolean('is_active').default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventTenantIdx: index('event_products_event_tenant_idx').on(
+      table.eventId,
+      table.tenantId
+    ),
+    uniqueEventProduct: uniqueIndex('event_products_event_product_unique').on(
+      table.eventId,
+      table.productId
+    ),
+  })
+);
+
 export const productRecipes = mysqlTable('product_recipes', {
   id: varchar('id', { length: 36 }).primaryKey(),
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
@@ -179,8 +209,28 @@ export const digitalConsumptions = mysqlTable('digital_consumptions', {
 // 5. RELACIONES
 // -----------------------------------------------------------------------------
 
+export const eventsRelations = relations(events, ({ many }) => ({
+  eventProducts: many(eventProducts),
+}));
+
 export const productsRelations = relations(products, ({ many }) => ({
   recipes: many(productRecipes),
+  eventProducts: many(eventProducts),
+}));
+
+export const eventProductsRelations = relations(eventProducts, ({ one }) => ({
+  event: one(events, {
+    fields: [eventProducts.eventId],
+    references: [events.id],
+  }),
+  product: one(products, {
+    fields: [eventProducts.productId],
+    references: [products.id],
+  }),
+  tenant: one(tenants, {
+    fields: [eventProducts.tenantId],
+    references: [tenants.id],
+  }),
 }));
 
 export const productRecipesRelations = relations(productRecipes, ({ one }) => ({

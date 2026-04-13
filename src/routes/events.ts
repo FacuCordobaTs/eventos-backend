@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   digitalConsumptions,
+  eventProducts,
   events,
   products,
   saleItems,
@@ -12,7 +13,7 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { and, count, desc, eq, ne, sql, sum } from "drizzle-orm"
+import { and, asc, count, desc, eq, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 
@@ -34,6 +35,11 @@ const createTicketTypeSchema = z.object({
   stockLimit: z
     .union([z.coerce.number().int().positive(), z.null()])
     .optional(),
+})
+
+const toggleEventProductSchema = z.object({
+  productId: z.string().min(1).max(36),
+  isActive: z.boolean(),
 })
 
 async function countIssuedTickets(
@@ -395,6 +401,167 @@ export const eventsRoute = new Hono()
       scannedTickets: Number(scannedRow?.n ?? 0),
     })
   })
+  .get("/:id/products", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const catalog = await db
+      .select({
+        id: products.id,
+        name: products.name,
+        price: products.price,
+        catalogIsActive: products.isActive,
+      })
+      .from(products)
+      .where(eq(products.tenantId, tenantId))
+      .orderBy(asc(products.name))
+
+    const links = await db
+      .select({
+        productId: eventProducts.productId,
+        isActive: eventProducts.isActive,
+        priceOverride: eventProducts.priceOverride,
+      })
+      .from(eventProducts)
+      .where(
+        and(
+          eq(eventProducts.eventId, eventId),
+          eq(eventProducts.tenantId, tenantId)
+        )
+      )
+
+    const byProduct = new Map(
+      links.map((r) => [
+        r.productId,
+        { isActive: r.isActive, priceOverride: r.priceOverride },
+      ])
+    )
+
+    return c.json({
+      products: catalog.map((p) => {
+        const row = byProduct.get(p.id)
+        return {
+          id: p.id,
+          name: p.name,
+          price: p.price,
+          catalogIsActive: p.catalogIsActive,
+          isActiveForEvent: row?.isActive === true,
+          priceOverride:
+            row?.priceOverride === null || row?.priceOverride === undefined
+              ? null
+              : String(row.priceOverride),
+        }
+      }),
+    })
+  })
+  .post(
+    "/:id/products/toggle",
+    zValidator("json", toggleEventProductSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const [prod] = await db
+        .select({ id: products.id })
+        .from(products)
+        .where(
+          and(eq(products.id, body.productId), eq(products.tenantId, tenantId))
+        )
+        .limit(1)
+      if (!prod) {
+        return c.json({ error: "Producto no encontrado" }, 404)
+      }
+
+      const [existing] = await db
+        .select()
+        .from(eventProducts)
+        .where(
+          and(
+            eq(eventProducts.eventId, eventId),
+            eq(eventProducts.productId, body.productId),
+            eq(eventProducts.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (existing) {
+        await db
+          .update(eventProducts)
+          .set({ isActive: body.isActive })
+          .where(
+            and(
+              eq(eventProducts.id, existing.id),
+              eq(eventProducts.tenantId, tenantId)
+            )
+          )
+        return c.json({
+          ok: true,
+          eventProduct: {
+            id: existing.id,
+            eventId,
+            productId: body.productId,
+            tenantId,
+            isActive: body.isActive,
+            priceOverride: existing.priceOverride,
+          },
+        })
+      }
+
+      if (!body.isActive) {
+        return c.json({
+          ok: true,
+          eventProduct: null,
+        })
+      }
+
+      const newId = uuidv4()
+      await db.insert(eventProducts).values({
+        id: newId,
+        eventId,
+        productId: body.productId,
+        tenantId,
+        priceOverride: null,
+        isActive: true,
+        createdAt: new Date(),
+      })
+
+      return c.json(
+        {
+          ok: true,
+          eventProduct: {
+            id: newId,
+            eventId,
+            productId: body.productId,
+            tenantId,
+            isActive: true,
+            priceOverride: null,
+          },
+        },
+        201
+      )
+    }
+  )
   .get("/:id", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)

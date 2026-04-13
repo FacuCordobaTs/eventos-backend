@@ -29,6 +29,13 @@
       "when": 1776028735929,
       "tag": "0003_yielding_viper",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1776105254180,
+      "tag": "0004_event_products",
+      "breakpoints": true
     }
   ]
 }
