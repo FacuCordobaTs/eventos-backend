@@ -4,12 +4,15 @@ import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
+  barInventory,
   bars,
+  customers,
   digitalConsumptions,
   eventProducts,
   eventExpenses,
   events,
   eventStaff,
+  inventoryItems,
   products,
   saleItems,
   sales,
@@ -17,7 +20,7 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { and, asc, count, desc, eq, ne, sql, sum } from "drizzle-orm"
+import { and, asc, count, desc, eq, inArray, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decToDb } from "../lib/decimal-money"
@@ -305,6 +308,32 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
     }
     const eventId = c.req.param("id")
+    const statusQ = c.req.query("status")
+    const ticketTypeIdQ = c.req.query("ticketTypeId")
+    const orderByQ = c.req.query("orderBy") ?? "createdAt"
+    const orderQ = c.req.query("order") ?? "desc"
+
+    if (
+      statusQ != null &&
+      statusQ !== "" &&
+      statusQ !== "PENDING" &&
+      statusQ !== "USED"
+    ) {
+      return c.json(
+        { error: "status debe ser PENDING, USED u omitirse" },
+        400
+      )
+    }
+    if (orderByQ !== "createdAt" && orderByQ !== "scannedAt") {
+      return c.json(
+        { error: "orderBy debe ser createdAt o scannedAt" },
+        400
+      )
+    }
+    if (orderQ !== "asc" && orderQ !== "desc") {
+      return c.json({ error: "order debe ser asc o desc" }, 400)
+    }
+
     const db = drizzle(pool)
     const [ev] = await db
       .select()
@@ -314,6 +343,26 @@ export const eventsRoute = new Hono()
     if (!ev) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
+
+    const conditions = [
+      eq(tickets.eventId, eventId),
+      eq(tickets.tenantId, tenantId),
+      eq(ticketTypes.tenantId, tenantId),
+      eq(ticketTypes.eventId, eventId),
+    ]
+
+    if (statusQ === "PENDING" || statusQ === "USED") {
+      conditions.push(eq(tickets.status, statusQ))
+    }
+
+    if (ticketTypeIdQ != null && ticketTypeIdQ !== "") {
+      conditions.push(eq(tickets.ticketTypeId, ticketTypeIdQ))
+    }
+
+    const orderColumn =
+      orderByQ === "scannedAt" ? tickets.scannedAt : tickets.createdAt
+    const orderFn = orderQ === "asc" ? asc : desc
+
     const rows = await db
       .select({
         id: tickets.id,
@@ -322,19 +371,15 @@ export const eventsRoute = new Hono()
         buyerName: tickets.buyerName,
         buyerEmail: tickets.buyerEmail,
         createdAt: tickets.createdAt,
+        scannedAt: tickets.scannedAt,
         ticketTypeId: tickets.ticketTypeId,
         ticketTypeName: ticketTypes.name,
       })
       .from(tickets)
       .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
-      .where(
-        and(
-          eq(tickets.eventId, eventId),
-          eq(tickets.tenantId, tenantId),
-          eq(ticketTypes.tenantId, tenantId),
-          eq(ticketTypes.eventId, eventId)
-        )
-      )
+      .where(and(...conditions))
+      .orderBy(orderFn(orderColumn))
+
     return c.json({
       tickets: rows.map((r) => ({
         id: r.id,
@@ -343,6 +388,7 @@ export const eventsRoute = new Hono()
         buyerName: r.buyerName,
         buyerEmail: r.buyerEmail,
         createdAt: r.createdAt,
+        scannedAt: r.scannedAt,
         ticketTypeId: r.ticketTypeId,
         ticketTypeName: r.ticketTypeName,
       })),
@@ -1038,6 +1084,200 @@ export const eventsRoute = new Hono()
       )
 
     return c.json({ ok: true })
+  })
+  .get("/:id/sales", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const limitRaw = c.req.query("limit")
+    const offsetRaw = c.req.query("offset")
+    const limit = Math.min(
+      Math.max(Number.parseInt(limitRaw ?? "50", 10) || 50, 1),
+      200
+    )
+    const offset = Math.max(Number.parseInt(offsetRaw ?? "0", 10) || 0, 0)
+
+    const db = drizzle(pool)
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const pageRows = await db
+      .select({
+        id: sales.id,
+        createdAt: sales.createdAt,
+        source: sales.source,
+        totalAmount: sales.totalAmount,
+        staffName: staff.name,
+        customerName: customers.name,
+      })
+      .from(sales)
+      .leftJoin(
+        staff,
+        and(eq(sales.staffId, staff.id), eq(staff.tenantId, tenantId))
+      )
+      .leftJoin(customers, eq(sales.customerId, customers.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      )
+      .orderBy(desc(sales.createdAt))
+      .limit(limit + 1)
+      .offset(offset)
+
+    const hasMore = pageRows.length > limit
+    const slice = hasMore ? pageRows.slice(0, limit) : pageRows
+    const saleIds = slice.map((r) => r.id)
+
+    const itemsBySale = new Map<
+      string,
+      { quantity: number; productName: string }[]
+    >()
+
+    if (saleIds.length > 0) {
+      const itemRows = await db
+        .select({
+          saleId: saleItems.saleId,
+          quantity: saleItems.quantity,
+          productName: products.name,
+        })
+        .from(saleItems)
+        .innerJoin(products, eq(saleItems.productId, products.id))
+        .where(
+          and(inArray(saleItems.saleId, saleIds), eq(products.tenantId, tenantId))
+        )
+
+      for (const row of itemRows) {
+        const list = itemsBySale.get(row.saleId) ?? []
+        list.push({
+          quantity: row.quantity,
+          productName: row.productName,
+        })
+        itemsBySale.set(row.saleId, list)
+      }
+    }
+
+    function itemsSummary(saleId: string): string {
+      const lines = itemsBySale.get(saleId) ?? []
+      if (lines.length === 0) return "—"
+      return lines
+        .map((l) => `${l.quantity}× ${l.productName}`)
+        .join(", ")
+    }
+
+    return c.json({
+      sales: slice.map((r) => ({
+        id: r.id,
+        createdAt: r.createdAt,
+        source: r.source,
+        totalAmount: String(r.totalAmount),
+        staffName: r.staffName,
+        customerName: r.customerName,
+        itemsSummary: itemsSummary(r.id),
+      })),
+      hasMore,
+      limit,
+      offset,
+    })
+  })
+  .get("/:id/inventory-breakdown", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const eventBars = await db
+      .select({ id: bars.id, name: bars.name })
+      .from(bars)
+      .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
+
+    if (eventBars.length === 0) {
+      return c.json({ items: [] })
+    }
+
+    const barIds = eventBars.map((b) => b.id)
+    const barNameById = new Map(eventBars.map((b) => [b.id, b.name]))
+
+    const rows = await db
+      .select({
+        inventoryItemId: inventoryItems.id,
+        itemName: inventoryItems.name,
+        unit: inventoryItems.unit,
+        barId: barInventory.barId,
+        stock: barInventory.currentStock,
+      })
+      .from(barInventory)
+      .innerJoin(bars, eq(barInventory.barId, bars.id))
+      .innerJoin(
+        inventoryItems,
+        eq(barInventory.inventoryItemId, inventoryItems.id)
+      )
+      .where(
+        and(
+          eq(barInventory.tenantId, tenantId),
+          eq(inventoryItems.tenantId, tenantId),
+          eq(bars.eventId, eventId),
+          eq(bars.tenantId, tenantId),
+          inArray(bars.id, barIds)
+        )
+      )
+
+    type Agg = {
+      itemName: string
+      unit: (typeof inventoryItems.$inferSelect)["unit"]
+      bars: { barName: string; stock: string }[]
+      total: ReturnType<typeof dec>
+    }
+
+    const byItem = new Map<string, Agg>()
+
+    for (const r of rows) {
+      const key = r.inventoryItemId
+      let agg = byItem.get(key)
+      if (!agg) {
+        agg = {
+          itemName: r.itemName,
+          unit: r.unit,
+          bars: [],
+          total: dec(0),
+        }
+        byItem.set(key, agg)
+      }
+      const stockDec = dec(r.stock)
+      agg.total = agg.total.plus(stockDec)
+      const barName = barNameById.get(r.barId) ?? "—"
+      agg.bars.push({
+        barName,
+        stock: decToDb(stockDec),
+      })
+    }
+
+    const items = [...byItem.entries()]
+      .map(([inventoryItemId, agg]) => ({
+        inventoryItemId,
+        itemName: agg.itemName,
+        unit: agg.unit,
+        totalEventStock: decToDb(agg.total),
+        bars: agg.bars.sort((a, b) => a.barName.localeCompare(b.barName)),
+      }))
+      .sort((a, b) => a.itemName.localeCompare(b.itemName))
+
+    return c.json({ items })
   })
   .get("/:id", async (c) => {
     const ctx = c as AuthenticatedContext
