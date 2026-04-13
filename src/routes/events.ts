@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   barInventory,
+  barProducts,
   bars,
   customers,
   digitalConsumptions,
@@ -194,8 +195,23 @@ async function requireBarForEventTenant(
   return row ?? null
 }
 
-function sanitizeBar(row: typeof bars.$inferSelect) {
-  return {
+const EMPTY_BAR_STATS = {
+  staffCount: 0,
+  productCount: 0,
+  totalStock: "0.00",
+  totalSales: "0.00",
+} as const
+
+function sanitizeBar(
+  row: typeof bars.$inferSelect,
+  stats?: {
+    staffCount: number
+    productCount: number
+    totalStock: string
+    totalSales: string
+  }
+) {
+  const base = {
     id: row.id,
     eventId: row.eventId,
     tenantId: row.tenantId,
@@ -203,6 +219,16 @@ function sanitizeBar(row: typeof bars.$inferSelect) {
     isActive: row.isActive,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  }
+  if (!stats) {
+    return base
+  }
+  return {
+    ...base,
+    staffCount: stats.staffCount,
+    productCount: stats.productCount,
+    totalStock: stats.totalStock,
+    totalSales: stats.totalSales,
   }
 }
 
@@ -1082,7 +1108,122 @@ export const eventsRoute = new Hono()
       )
       .orderBy(asc(bars.name))
 
-    return c.json({ bars: rows.map(sanitizeBar) })
+    if (rows.length === 0) {
+      return c.json({ bars: [] })
+    }
+
+    const barIds = rows.map((r) => r.id)
+
+    const [staffAgg, prodAgg, invAgg, salesAgg] = await Promise.all([
+      db
+        .select({
+          barId: eventStaff.barId,
+          n: count(),
+        })
+        .from(eventStaff)
+        .where(
+          and(
+            eq(eventStaff.eventId, eventId),
+            eq(eventStaff.tenantId, tenantId),
+            inArray(eventStaff.barId, barIds)
+          )
+        )
+        .groupBy(eventStaff.barId),
+      db
+        .select({
+          barId: barProducts.barId,
+          n: count(),
+        })
+        .from(barProducts)
+        .where(
+          and(
+            eq(barProducts.tenantId, tenantId),
+            eq(barProducts.isActive, true),
+            inArray(barProducts.barId, barIds)
+          )
+        )
+        .groupBy(barProducts.barId),
+      db
+        .select({
+          barId: barInventory.barId,
+          total: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,4))), 0)`,
+        })
+        .from(barInventory)
+        .where(
+          and(
+            eq(barInventory.tenantId, tenantId),
+            inArray(barInventory.barId, barIds)
+          )
+        )
+        .groupBy(barInventory.barId),
+      db
+        .select({
+          barId: sales.barId,
+          total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,4))), 0)`,
+        })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.eventId, eventId),
+            eq(sales.tenantId, tenantId),
+            eq(sales.status, "COMPLETED"),
+            inArray(sales.barId, barIds)
+          )
+        )
+        .groupBy(sales.barId),
+    ])
+
+    const staffByBar = new Map<string, number>()
+    for (const r of staffAgg) {
+      if (r.barId != null) {
+        staffByBar.set(r.barId, Number(r.n ?? 0))
+      }
+    }
+
+    const productsByBar = new Map<string, number>()
+    for (const r of prodAgg) {
+      if (r.barId != null) {
+        productsByBar.set(r.barId, Number(r.n ?? 0))
+      }
+    }
+
+    const stockByBar = new Map<string, string>()
+    for (const r of invAgg) {
+      if (r.barId != null) {
+        stockByBar.set(r.barId, String(r.total ?? "0"))
+      }
+    }
+
+    const salesByBar = new Map<string, string>()
+    for (const r of salesAgg) {
+      if (r.barId != null) {
+        salesByBar.set(r.barId, String(r.total ?? "0"))
+      }
+    }
+
+    function money2(raw: string): string {
+      const n = Number.parseFloat(raw)
+      if (Number.isNaN(n)) return "0.00"
+      return n.toFixed(2)
+    }
+
+    function stock2(raw: string): string {
+      const n = Number.parseFloat(raw)
+      if (Number.isNaN(n)) return "0.00"
+      return n.toFixed(2)
+    }
+
+    return c.json({
+      bars: rows.map((row) => {
+        const id = row.id
+        return sanitizeBar(row, {
+          staffCount: staffByBar.get(id) ?? 0,
+          productCount: productsByBar.get(id) ?? 0,
+          totalStock: stock2(stockByBar.get(id) ?? "0"),
+          totalSales: money2(salesByBar.get(id) ?? "0"),
+        })
+      }),
+    })
   })
   .post("/:id/bars", zValidator("json", createBarSchema), async (c) => {
     const ctx = c as AuthenticatedContext
@@ -1117,7 +1258,10 @@ export const eventsRoute = new Hono()
       )
       .limit(1)
 
-    return c.json({ bar: row ? sanitizeBar(row) : null }, 201)
+    return c.json(
+      { bar: row ? sanitizeBar(row, { ...EMPTY_BAR_STATS }) : null },
+      201
+    )
   })
   .patch(
     "/:id/bars/:barId",
@@ -1169,7 +1313,9 @@ export const eventsRoute = new Hono()
         )
         .limit(1)
 
-      return c.json({ bar: row ? sanitizeBar(row) : null })
+      return c.json({
+        bar: row ? sanitizeBar(row, { ...EMPTY_BAR_STATS }) : null,
+      })
     }
   )
   .get("/:id/expenses", async (c) => {

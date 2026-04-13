@@ -6,6 +6,7 @@ import { and, eq, inArray } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
+  bars,
   eventInventory,
   events,
   inventoryItems,
@@ -50,6 +51,7 @@ const updateProductSchema = createProductSchema
 
 const createSaleSchema = z.object({
   eventId: z.string().min(1),
+  barId: z.string().min(1).max(36).optional(),
   paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER"]),
   items: z
     .array(
@@ -419,6 +421,25 @@ export const inventoryRoute = new Hono()
           return { kind: "bad_event" as const }
         }
 
+        let saleBarId: string | null = null
+        if (body.barId != null && body.barId !== "") {
+          const [barRow] = await tx
+            .select({ id: bars.id })
+            .from(bars)
+            .where(
+              and(
+                eq(bars.id, body.barId),
+                eq(bars.eventId, body.eventId),
+                eq(bars.tenantId, tenantId)
+              )
+            )
+            .limit(1)
+          if (!barRow) {
+            return { kind: "bad_bar" as const }
+          }
+          saleBarId = barRow.id
+        }
+
         const productIds = [...new Set(body.items.map((i) => i.productId))]
         const prodRows = await tx
           .select()
@@ -513,6 +534,7 @@ export const inventoryRoute = new Hono()
           id: saleId,
           eventId: body.eventId,
           tenantId,
+          barId: saleBarId,
           staffId: ctx.staff.id,
           totalAmount: decToDb(total),
           paymentMethod: body.paymentMethod,
@@ -551,6 +573,9 @@ export const inventoryRoute = new Hono()
 
       if (result.kind === "bad_event") {
         return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      if (result.kind === "bad_bar") {
+        return c.json({ error: "Barra no válida para este evento" }, 400)
       }
       if (result.kind === "bad_product") {
         return c.json({ error: "Uno o más productos no son válidos." }, 400)

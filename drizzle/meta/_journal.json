@@ -71,6 +71,13 @@
       "when": 1776112000000,
       "tag": "0009_event_inventory",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1776113000000,
+      "tag": "0010_sales_bar_id",
+      "breakpoints": true
     }
   ]
 }

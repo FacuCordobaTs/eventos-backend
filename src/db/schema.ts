@@ -330,18 +330,25 @@ export const productRecipes = mysqlTable('product_recipes', {
 // 4. VENTAS (El POS y la caja)
 // -----------------------------------------------------------------------------
 
-export const sales = mysqlTable('sales', {
-  id: varchar('id', { length: 36 }).primaryKey(),
-  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
-  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-  staffId: varchar('staff_id', { length: 36 }).references(() => staff.id), // Quién cobró
-  customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
-  source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
-  totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
-  paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),
-  status: mysqlEnum('status', ['COMPLETED', 'REFUNDED']).default('COMPLETED'),
-  createdAt: timestamp('created_at').defaultNow(),
-});
+export const sales = mysqlTable(
+  'sales',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    barId: varchar('bar_id', { length: 36 }).references(() => bars.id),
+    staffId: varchar('staff_id', { length: 36 }).references(() => staff.id), // Quién cobró
+    customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+    source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
+    totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
+    paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),
+    status: mysqlEnum('status', ['COMPLETED', 'REFUNDED']).default('COMPLETED'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    barIdx: index('sales_bar_id_idx').on(table.barId),
+  })
+);
 
 export const saleItems = mysqlTable('sale_items', {
   id: varchar('id', { length: 36 }).primaryKey(),
@@ -410,6 +417,7 @@ export const barsRelations = relations(bars, ({ one, many }) => ({
   eventStaff: many(eventStaff),
   barProducts: many(barProducts),
   barInventory: many(barInventory),
+  sales: many(sales),
 }));
 
 export const barProductsRelations = relations(barProducts, ({ one }) => ({
@@ -507,7 +515,11 @@ export const productRecipesRelations = relations(productRecipes, ({ one }) => ({
   }),
 }));
 
-export const salesRelations = relations(sales, ({ many }) => ({
+export const salesRelations = relations(sales, ({ one, many }) => ({
+  bar: one(bars, {
+    fields: [sales.barId],
+    references: [bars.id],
+  }),
   items: many(saleItems),
 }));
 
