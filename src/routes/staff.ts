@@ -263,7 +263,7 @@ export const staffRoute = new Hono()
 
     const rows = await db.select().from(staff).where(eq(staff.email, body.email))
     const row = rows[0]
-    const token = await createAccessToken({ sub: row.id })
+    const token = await createAccessToken(row.id, "staff")
 
     setCookie(c, "token", token, cookieOptions(c))
 
@@ -295,7 +295,7 @@ export const staffRoute = new Hono()
       return c.json({ error: "Email o contraseña incorrectos" }, 401)
     }
 
-    const token = await createAccessToken({ sub: row.id })
+    const token = await createAccessToken(row.id, "staff")
     setCookie(c, "token", token, cookieOptions(c))
 
     return c.json({

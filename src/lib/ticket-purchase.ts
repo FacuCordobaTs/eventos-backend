@@ -10,6 +10,7 @@ export type PurchaseErrorCode =
   | "TICKET_TYPE_NOT_FOUND"
   | "OUT_OF_STOCK"
   | "EVENT_INACTIVE"
+  | "PRODUCT_NOT_FOUND"
 
 export class PurchaseError extends Error {
   readonly code: PurchaseErrorCode
@@ -46,6 +47,8 @@ export type PurchaseParams = {
   ticketTypeId: string
   buyerName: string
   buyerEmail: string
+  /** App B2B2C: vincula la entrada al cliente. */
+  customerId?: string
   /** Staff flows: must match event tenant. Omit for public (tenant taken from event). */
   enforceTenantId?: string
 }
@@ -114,6 +117,7 @@ export async function executeTicketPurchase(
     status: "PENDING",
     buyerName: params.buyerName,
     buyerEmail: params.buyerEmail,
+    ...(params.customerId !== undefined ? { customerId: params.customerId } : {}),
     createdAt: new Date(),
   })
 
@@ -145,6 +149,8 @@ export function purchaseErrorStatus(
         status: 409,
         body: { error: "Sin stock disponible para este tipo de entrada" },
       }
+    case "PRODUCT_NOT_FOUND":
+      return { status: 404, body: { error: "Producto no disponible" } }
     default:
       return { status: 500, body: { error: "Error al procesar la compra" } }
   }

@@ -1,22 +1,21 @@
 import { Context, Next } from "hono"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { staff as StaffTable } from "../db/schema"
+import { customers } from "../db/schema"
 import { eq } from "drizzle-orm"
 import { verifyToken } from "../lib/jwt"
 
-export interface AuthenticatedContext extends Context {
-  staff: {
+export interface ClientAuthContext extends Context {
+  customer: {
     id: string
     email: string
     name: string
-    role: string
-    tenantId?: string
-    isActive: boolean
+    phone: string | null
+    isActive: boolean | null
   }
 }
 
-export const authMiddleware = async (c: Context, next: Next) => {
+export const clientAuthMiddleware = async (c: Context, next: Next) => {
   const authHeader = c.req.header("Authorization")
   if (!authHeader?.startsWith("Bearer ")) {
     return c.json({ error: "Se requiere encabezado Authorization" }, 401)
@@ -26,33 +25,31 @@ export const authMiddleware = async (c: Context, next: Next) => {
 
   try {
     const payload = await verifyToken(token)
-    if (payload.aud !== "staff") {
-      return c.json({ error: "Token inválido para panel de staff" }, 401)
+    if (payload.aud !== "customer") {
+      return c.json({ error: "Token inválido para la app de asistentes" }, 401)
     }
-    const staffId = payload.sub
+
     const db = drizzle(pool)
-    const staffResult = await db
+    const [row] = await db
       .select()
-      .from(StaffTable)
-      .where(eq(StaffTable.id, staffId))
+      .from(customers)
+      .where(eq(customers.id, payload.sub))
       .limit(1)
 
-    if (!staffResult.length) {
+    if (!row) {
       return c.json({ error: "Usuario no encontrado" }, 401)
     }
 
-    const staff = staffResult[0]
-    if (!staff.isActive) {
+    if (row.isActive === false) {
       return c.json({ error: "Cuenta desactivada" }, 401)
     }
 
-    ;(c as AuthenticatedContext).staff = {
-      id: staff.id,
-      email: staff.email,
-      name: staff.name,
-      role: staff.role,
-      tenantId: staff.tenantId ?? undefined,
-      isActive: staff.isActive,
+    ;(c as ClientAuthContext).customer = {
+      id: row.id,
+      email: row.email,
+      name: row.name,
+      phone: row.phone ?? null,
+      isActive: row.isActive,
     }
 
     await next()

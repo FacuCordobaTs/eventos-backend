@@ -3,8 +3,8 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, tenants, ticketTypes, tickets } from "../db/schema"
-import { and, count, eq, ne } from "drizzle-orm"
+import { events, products, tenants, ticketTypes, tickets } from "../db/schema"
+import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
 import {
   executeTicketPurchase,
   PurchaseError,
@@ -38,6 +38,43 @@ async function countIssued(
 }
 
 export const publicRoute = new Hono()
+  .get("/events", async (c) => {
+    const db = drizzle(pool)
+    const tenantFilter = c.req.query("productoraId")
+
+    const filters: SQL[] = [
+      eq(events.isActive, true),
+      eq(tenants.isActive, true),
+      gte(events.date, new Date()),
+    ]
+    if (tenantFilter != null && tenantFilter !== "") {
+      filters.push(eq(events.tenantId, tenantFilter))
+    }
+
+    const rows = await db
+      .select({
+        id: events.id,
+        name: events.name,
+        date: events.date,
+        location: events.location,
+        tenantId: events.tenantId,
+        productoraName: tenants.name,
+      })
+      .from(events)
+      .innerJoin(tenants, eq(events.tenantId, tenants.id))
+      .where(and(...filters))
+      .orderBy(asc(events.date))
+
+    return c.json({
+      events: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        date: r.date,
+        location: r.location,
+        productora: { id: r.tenantId, name: r.productoraName },
+      })),
+    })
+  })
   .get("/events/:id", async (c) => {
     const eventId = c.req.param("id")
     const db = drizzle(pool)
@@ -60,6 +97,16 @@ export const publicRoute = new Hono()
         and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, ev.tenantId))
       )
 
+    const drinkProducts = await db
+      .select({
+        id: products.id,
+        name: products.name,
+        price: products.price,
+      })
+      .from(products)
+      .where(and(eq(products.tenantId, ev.tenantId), eq(products.isActive, true)))
+      .orderBy(products.name)
+
     const ticketTypesOut = []
     for (const t of types) {
       const sold = await countIssued(db, ev.tenantId, t.id)
@@ -78,6 +125,7 @@ export const publicRoute = new Hono()
 
     return c.json({
       productora: {
+        id: ev.tenantId,
         name: productoraRow?.name ?? "Productora",
       },
       event: {
@@ -87,6 +135,7 @@ export const publicRoute = new Hono()
         location: ev.location,
       },
       ticketTypes: ticketTypesOut,
+      drinkProducts,
     })
   })
   .post("/tickets/purchase", zValidator("json", purchaseSchema), async (c) => {
