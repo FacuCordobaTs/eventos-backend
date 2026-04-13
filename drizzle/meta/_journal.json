@@ -64,6 +64,13 @@
       "when": 1776111434811,
       "tag": "0008_event_expenses",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1776112000000,
+      "tag": "0009_event_inventory",
+      "breakpoints": true
     }
   ]
 }

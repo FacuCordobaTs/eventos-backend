@@ -2,13 +2,14 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, eq } from "drizzle-orm"
+import { and, asc, eq, ne, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
   barInventory,
   barProducts,
   bars,
+  eventInventory,
   eventProducts,
   events,
   inventoryItems,
@@ -238,11 +239,19 @@ export const barsRoute = new Hono()
         inventoryItemId: inventoryItems.id,
         name: inventoryItems.name,
         unit: inventoryItems.unit,
-        globalStock: inventoryItems.currentStock,
+        eventStockAllocated: eventInventory.stockAllocated,
         barRowId: barInventory.id,
         barStock: barInventory.currentStock,
       })
       .from(inventoryItems)
+      .leftJoin(
+        eventInventory,
+        and(
+          eq(eventInventory.inventoryItemId, inventoryItems.id),
+          eq(eventInventory.eventId, bar.eventId),
+          eq(eventInventory.tenantId, tenantId)
+        )
+      )
       .leftJoin(
         barInventory,
         and(
@@ -259,7 +268,10 @@ export const barsRoute = new Hono()
         inventoryItemId: r.inventoryItemId,
         name: r.name,
         unit: r.unit,
-        globalStock: String(r.globalStock),
+        eventStockAllocated:
+          r.eventStockAllocated == null
+            ? "0.00"
+            : String(r.eventStockAllocated),
         barInventoryRowId: r.barRowId,
         barCurrentStock:
           r.barStock == null ? "0.00" : String(r.barStock),
@@ -303,6 +315,47 @@ export const barsRoute = new Hono()
         return c.json({ error: "El stock no puede ser negativo" }, 400)
       }
       const stockStr = decToDb(qty)
+
+      const [evInv] = await db
+        .select()
+        .from(eventInventory)
+        .where(
+          and(
+            eq(eventInventory.eventId, bar.eventId),
+            eq(eventInventory.inventoryItemId, body.inventoryItemId),
+            eq(eventInventory.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      const cap = evInv ? decFromDb(evInv.stockAllocated) : dec(0)
+
+      const [sumOthersRow] = await db
+        .select({
+          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+        })
+        .from(barInventory)
+        .innerJoin(bars, eq(barInventory.barId, bars.id))
+        .where(
+          and(
+            eq(bars.eventId, bar.eventId),
+            eq(bars.tenantId, tenantId),
+            eq(barInventory.tenantId, tenantId),
+            eq(barInventory.inventoryItemId, body.inventoryItemId),
+            ne(barInventory.barId, barId)
+          )
+        )
+
+      const others = decFromDb(sumOthersRow?.s ?? "0")
+      const totalBars = others.plus(qty)
+      if (totalBars.gt(cap)) {
+        return c.json(
+          {
+            error:
+              "El stock en barras no puede superar el stock asignado al evento para este insumo.",
+          },
+          400
+        )
+      }
 
       const [existing] = await db
         .select()

@@ -6,6 +6,7 @@ import { and, eq, inArray } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
+  eventInventory,
   events,
   inventoryItems,
   productRecipes,
@@ -28,16 +29,6 @@ const upsertItemSchema = z.object({
   id: z.string().min(1).optional(),
   name: z.string().min(1).max(255),
   unit: unitSchema,
-  currentStock: z
-    .union([z.string().regex(/^\d+(\.\d{1,2})?$/), z.number()])
-    .optional()
-    .transform((v) => (v === undefined ? undefined : String(v))),
-})
-
-const adjustStockSchema = z.object({
-  delta: z
-    .union([z.string().regex(/^\d+(\.\d{1,4})?$/), z.number().positive()])
-    .transform((v) => (typeof v === "number" ? String(v) : v)),
 })
 
 const recipeLineSchema = z.object({
@@ -70,10 +61,6 @@ const createSaleSchema = z.object({
     .min(1),
 })
 
-function alertThreshold(): ReturnType<typeof dec> {
-  return dec(process.env.INVENTORY_ALERT_THRESHOLD ?? "100")
-}
-
 export class InsufficientStockError extends Error {
   constructor(
     message: string,
@@ -99,19 +86,13 @@ export const inventoryRoute = new Hono()
       .from(inventoryItems)
       .where(eq(inventoryItems.tenantId, tenantId))
 
-    const th = alertThreshold()
     const items = rows.map((r) => ({
       id: r.id,
       name: r.name,
       unit: r.unit,
-      currentStock: r.currentStock,
-      isLowStock: decFromDb(r.currentStock).lt(th),
     }))
 
-    return c.json({
-      items,
-      alertThreshold: decToDb(th),
-    })
+    return c.json({ items })
   })
   .post("/items", zValidator("json", upsertItemSchema), async (c) => {
     const ctx = c as AuthenticatedContext
@@ -133,16 +114,11 @@ export const inventoryRoute = new Hono()
       if (!existing) {
         return c.json({ error: "Ítem no encontrado" }, 404)
       }
-      const stock =
-        body.currentStock !== undefined
-          ? decToDb(dec(body.currentStock))
-          : existing.currentStock
       await db
         .update(inventoryItems)
         .set({
           name: body.name,
           unit: body.unit,
-          currentStock: stock,
         })
         .where(eq(inventoryItems.id, body.id))
       const [row] = await db
@@ -150,100 +126,37 @@ export const inventoryRoute = new Hono()
         .from(inventoryItems)
         .where(eq(inventoryItems.id, body.id))
         .limit(1)
-      const th = alertThreshold()
       return c.json({
         item: {
           id: row!.id,
           name: row!.name,
           unit: row!.unit,
-          currentStock: row!.currentStock,
-          isLowStock: decFromDb(row!.currentStock).lt(th),
         },
-        alertThreshold: decToDb(th),
       })
     }
 
     const id = uuidv4()
-    const stock = body.currentStock !== undefined ? decToDb(dec(body.currentStock)) : "0.00"
     await db.insert(inventoryItems).values({
       id,
       tenantId,
       name: body.name,
       unit: body.unit,
-      currentStock: stock,
     })
     const [row] = await db
       .select()
       .from(inventoryItems)
       .where(eq(inventoryItems.id, id))
       .limit(1)
-    const th = alertThreshold()
     return c.json(
       {
         item: {
           id: row!.id,
           name: row!.name,
           unit: row!.unit,
-          currentStock: row!.currentStock,
-          isLowStock: decFromDb(row!.currentStock).lt(th),
         },
-        alertThreshold: decToDb(th),
       },
       201
     )
-  })
-  .patch("/items/:id/stock", zValidator("json", adjustStockSchema), async (c) => {
-    const ctx = c as AuthenticatedContext
-    const tenantId = requireTenantId(ctx)
-    if (!tenantId) {
-      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
-    }
-    const id = c.req.param("id")
-    const { delta } = c.req.valid("json")
-    const db = drizzle(pool)
-
-    const result = await db.transaction(async (tx) => {
-      const [row] = await tx
-        .select()
-        .from(inventoryItems)
-        .where(and(eq(inventoryItems.id, id), eq(inventoryItems.tenantId, tenantId)))
-        .limit(1)
-      if (!row) {
-        return { kind: "notfound" as const }
-      }
-      const next = decFromDb(row.currentStock).plus(dec(delta))
-      if (next.lt(0)) {
-        return { kind: "negative" as const }
-      }
-      await tx
-        .update(inventoryItems)
-        .set({ currentStock: decToDb(next) })
-        .where(eq(inventoryItems.id, id))
-      const [updated] = await tx
-        .select()
-        .from(inventoryItems)
-        .where(eq(inventoryItems.id, id))
-        .limit(1)
-      return { kind: "ok" as const, row: updated! }
-    })
-
-    if (result.kind === "notfound") {
-      return c.json({ error: "Ítem no encontrado" }, 404)
-    }
-    if (result.kind === "negative") {
-      return c.json({ error: "El ajuste dejaría stock negativo." }, 400)
-    }
-    const th = alertThreshold()
-    return c.json({
-      item: {
-        id: result.row.id,
-        name: result.row.name,
-        unit: result.row.unit,
-        currentStock: result.row.currentStock,
-        isLowStock: decFromDb(result.row.currentStock).lt(th),
-      },
-      alertThreshold: decToDb(th),
-    })
   })
   .get("/products", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -543,11 +456,18 @@ export const inventoryRoute = new Hono()
           }
         }
 
-        let invRowsSnapshot: (typeof inventoryItems.$inferSelect)[] = []
+        let evInvByItem = new Map<string, typeof eventInventory.$inferSelect>()
+        let invMetaById = new Map<
+          string,
+          { id: string; name: string }
+        >()
         if (needs.size > 0) {
           const invIds = [...needs.keys()]
-          invRowsSnapshot = await tx
-            .select()
+          const invRowsSnapshot = await tx
+            .select({
+              id: inventoryItems.id,
+              name: inventoryItems.name,
+            })
             .from(inventoryItems)
             .where(
               and(
@@ -558,13 +478,31 @@ export const inventoryRoute = new Hono()
           if (invRowsSnapshot.length !== invIds.length) {
             return { kind: "bad_inventory" as const }
           }
+          for (const r of invRowsSnapshot) {
+            invMetaById.set(r.id, r)
+          }
+
+          const evInvRows = await tx
+            .select()
+            .from(eventInventory)
+            .where(
+              and(
+                eq(eventInventory.eventId, body.eventId),
+                eq(eventInventory.tenantId, tenantId),
+                inArray(eventInventory.inventoryItemId, invIds)
+              )
+            )
+          evInvByItem = new Map(evInvRows.map((r) => [r.inventoryItemId, r]))
+
           for (const [invId, need] of needs) {
-            const row = invRowsSnapshot.find((r) => r.id === invId)!
-            if (decFromDb(row.currentStock).lt(need)) {
+            const evRow = evInvByItem.get(invId)
+            const avail = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
+            if (avail.lt(need)) {
+              const meta = invMetaById.get(invId)!
               throw new InsufficientStockError(
                 "Stock insuficiente",
-                row.id,
-                row.name
+                meta.id,
+                meta.name
               )
             }
           }
@@ -595,12 +533,12 @@ export const inventoryRoute = new Hono()
 
         if (needs.size > 0) {
           for (const [invId, need] of needs) {
-            const row = invRowsSnapshot.find((r) => r.id === invId)!
-            const next = decFromDb(row.currentStock).minus(need)
+            const evRow = evInvByItem.get(invId)!
+            const next = decFromDb(evRow.stockAllocated).minus(need)
             await tx
-              .update(inventoryItems)
-              .set({ currentStock: decToDb(next) })
-              .where(eq(inventoryItems.id, invId))
+              .update(eventInventory)
+              .set({ stockAllocated: decToDb(next) })
+              .where(eq(eventInventory.id, evRow.id))
           }
         }
 

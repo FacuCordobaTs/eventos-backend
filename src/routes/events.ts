@@ -8,6 +8,7 @@ import {
   bars,
   customers,
   digitalConsumptions,
+  eventInventory,
   eventProducts,
   eventExpenses,
   events,
@@ -23,7 +24,7 @@ import {
 import { and, asc, count, desc, eq, inArray, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { dec, decToDb } from "../lib/decimal-money"
+import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 
 function requireTenantId(c: AuthenticatedContext): string | null {
   const id = c.staff.tenantId
@@ -48,6 +49,25 @@ const createTicketTypeSchema = z.object({
 const toggleEventProductSchema = z.object({
   productId: z.string().min(1).max(36),
   isActive: z.boolean(),
+})
+
+const patchEventInventorySchema = z.object({
+  inventoryItemId: z.string().min(1).max(36),
+  stockAllocated: z.union([
+    z.number().nonnegative(),
+    z.string().regex(/^\d+(\.\d{1,2})?$/),
+  ]),
+})
+
+const createEventInsumoSchema = z.object({
+  name: z.string().min(1).max(255),
+  unit: z.enum(["ML", "UNIDAD", "GRAMOS"]),
+  initialStock: z
+    .union([
+      z.number().nonnegative(),
+      z.string().regex(/^\d+(\.\d{1,2})?$/),
+    ])
+    .optional(),
 })
 
 const createBarSchema = z.object({
@@ -129,6 +149,29 @@ async function requireEventForTenant(
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
   return ev ?? null
+}
+
+async function sumBarStockForEventItem(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string,
+  inventoryItemId: string
+): Promise<string> {
+  const [row] = await db
+    .select({
+      s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+    })
+    .from(barInventory)
+    .innerJoin(bars, eq(barInventory.barId, bars.id))
+    .where(
+      and(
+        eq(bars.eventId, eventId),
+        eq(bars.tenantId, tenantId),
+        eq(barInventory.tenantId, tenantId),
+        eq(barInventory.inventoryItemId, inventoryItemId)
+      )
+    )
+  return row?.s ?? "0"
 }
 
 async function requireBarForEventTenant(
@@ -696,6 +739,171 @@ export const eventsRoute = new Hono()
       )
     }
   )
+  .get("/:id/inventory", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select({
+        id: inventoryItems.id,
+        name: inventoryItems.name,
+        unit: inventoryItems.unit,
+        eventInventoryId: eventInventory.id,
+        stockAllocated: eventInventory.stockAllocated,
+      })
+      .from(inventoryItems)
+      .leftJoin(
+        eventInventory,
+        and(
+          eq(eventInventory.inventoryItemId, inventoryItems.id),
+          eq(eventInventory.eventId, eventId),
+          eq(eventInventory.tenantId, tenantId)
+        )
+      )
+      .where(eq(inventoryItems.tenantId, tenantId))
+      .orderBy(asc(inventoryItems.name))
+
+    return c.json({
+      items: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        unit: r.unit,
+        eventInventoryId: r.eventInventoryId ?? null,
+        stockAllocated:
+          r.stockAllocated == null ? "0.00" : String(r.stockAllocated),
+      })),
+    })
+  })
+  .patch(
+    "/:id/inventory",
+    zValidator("json", patchEventInventorySchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const [inv] = await db
+        .select({ id: inventoryItems.id })
+        .from(inventoryItems)
+        .where(
+          and(
+            eq(inventoryItems.id, body.inventoryItemId),
+            eq(inventoryItems.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!inv) {
+        return c.json({ error: "Ítem no encontrado" }, 404)
+      }
+
+      const stockStr = decToDb(dec(body.stockAllocated))
+      const sumBars = decFromDb(
+        await sumBarStockForEventItem(db, eventId, tenantId, body.inventoryItemId)
+      )
+      if (decFromDb(stockStr).lt(sumBars)) {
+        return c.json(
+          {
+            error:
+              "El stock del evento no puede ser menor que la suma ya distribuida en las barras.",
+          },
+          400
+        )
+      }
+
+      await db
+        .insert(eventInventory)
+        .values({
+          id: uuidv4(),
+          eventId,
+          inventoryItemId: body.inventoryItemId,
+          tenantId,
+          stockAllocated: stockStr,
+          createdAt: new Date(),
+        })
+        .onDuplicateKeyUpdate({
+          set: { stockAllocated: stockStr },
+        })
+
+      return c.json({ ok: true, stockAllocated: stockStr })
+    }
+  )
+  .post(
+    "/:id/inventory/create",
+    zValidator("json", createEventInsumoSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const initialStr =
+        body.initialStock !== undefined
+          ? decToDb(dec(body.initialStock))
+          : "0.00"
+
+      const itemId = uuidv4()
+      const evInvId = uuidv4()
+
+      await db.transaction(async (tx) => {
+        await tx.insert(inventoryItems).values({
+          id: itemId,
+          tenantId,
+          name: body.name.trim(),
+          unit: body.unit,
+        })
+        await tx.insert(eventInventory).values({
+          id: evInvId,
+          eventId,
+          inventoryItemId: itemId,
+          tenantId,
+          stockAllocated: initialStr,
+          createdAt: new Date(),
+        })
+      })
+
+      return c.json(
+        {
+          item: {
+            id: itemId,
+            name: body.name.trim(),
+            unit: body.unit,
+            eventInventoryId: evInvId,
+            stockAllocated: initialStr,
+          },
+        },
+        201
+      )
+    }
+  )
   .get("/:id/staff", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -1206,60 +1414,90 @@ export const eventsRoute = new Hono()
       .from(bars)
       .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
 
-    if (eventBars.length === 0) {
-      return c.json({ items: [] })
-    }
-
     const barIds = eventBars.map((b) => b.id)
     const barNameById = new Map(eventBars.map((b) => [b.id, b.name]))
 
-    const rows = await db
+    const evInvRows = await db
       .select({
         inventoryItemId: inventoryItems.id,
         itemName: inventoryItems.name,
         unit: inventoryItems.unit,
-        barId: barInventory.barId,
-        stock: barInventory.currentStock,
+        stockAllocated: eventInventory.stockAllocated,
       })
-      .from(barInventory)
-      .innerJoin(bars, eq(barInventory.barId, bars.id))
+      .from(eventInventory)
       .innerJoin(
         inventoryItems,
-        eq(barInventory.inventoryItemId, inventoryItems.id)
+        eq(eventInventory.inventoryItemId, inventoryItems.id)
       )
       .where(
         and(
-          eq(barInventory.tenantId, tenantId),
-          eq(inventoryItems.tenantId, tenantId),
-          eq(bars.eventId, eventId),
-          eq(bars.tenantId, tenantId),
-          inArray(bars.id, barIds)
+          eq(eventInventory.eventId, eventId),
+          eq(eventInventory.tenantId, tenantId),
+          eq(inventoryItems.tenantId, tenantId)
         )
       )
+
+    const barDistRows =
+      barIds.length === 0
+        ? []
+        : await db
+            .select({
+              inventoryItemId: inventoryItems.id,
+              itemName: inventoryItems.name,
+              unit: inventoryItems.unit,
+              barId: barInventory.barId,
+              stock: barInventory.currentStock,
+            })
+            .from(barInventory)
+            .innerJoin(bars, eq(barInventory.barId, bars.id))
+            .innerJoin(
+              inventoryItems,
+              eq(barInventory.inventoryItemId, inventoryItems.id)
+            )
+            .where(
+              and(
+                eq(barInventory.tenantId, tenantId),
+                eq(inventoryItems.tenantId, tenantId),
+                eq(bars.eventId, eventId),
+                eq(bars.tenantId, tenantId),
+                inArray(bars.id, barIds)
+              )
+            )
 
     type Agg = {
       itemName: string
       unit: (typeof inventoryItems.$inferSelect)["unit"]
+      stockAllocated: ReturnType<typeof dec>
       bars: { barName: string; stock: string }[]
-      total: ReturnType<typeof dec>
+      sumBars: ReturnType<typeof dec>
     }
 
     const byItem = new Map<string, Agg>()
 
-    for (const r of rows) {
-      const key = r.inventoryItemId
-      let agg = byItem.get(key)
+    for (const r of evInvRows) {
+      byItem.set(r.inventoryItemId, {
+        itemName: r.itemName,
+        unit: r.unit,
+        stockAllocated: decFromDb(r.stockAllocated),
+        bars: [],
+        sumBars: dec(0),
+      })
+    }
+
+    for (const r of barDistRows) {
+      let agg = byItem.get(r.inventoryItemId)
       if (!agg) {
         agg = {
           itemName: r.itemName,
           unit: r.unit,
+          stockAllocated: dec(0),
           bars: [],
-          total: dec(0),
+          sumBars: dec(0),
         }
-        byItem.set(key, agg)
+        byItem.set(r.inventoryItemId, agg)
       }
       const stockDec = dec(r.stock)
-      agg.total = agg.total.plus(stockDec)
+      agg.sumBars = agg.sumBars.plus(stockDec)
       const barName = barNameById.get(r.barId) ?? "—"
       agg.bars.push({
         barName,
@@ -1272,7 +1510,8 @@ export const eventsRoute = new Hono()
         inventoryItemId,
         itemName: agg.itemName,
         unit: agg.unit,
-        totalEventStock: decToDb(agg.total),
+        stockAllocated: decToDb(agg.stockAllocated),
+        totalInBars: decToDb(agg.sumBars),
         bars: agg.bars.sort((a, b) => a.barName.localeCompare(b.barName)),
       }))
       .sort((a, b) => a.itemName.localeCompare(b.itemName))

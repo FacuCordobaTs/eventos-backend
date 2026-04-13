@@ -3,6 +3,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { and, asc, count, desc, eq, gte, ne, sql } from "drizzle-orm"
 import { pool } from "../db"
 import {
+  eventInventory,
   events,
   inventoryItems,
   sales,
@@ -106,21 +107,46 @@ export const analyticsRoute = new Hono()
       .from(tickets)
       .where(and(eq(tickets.tenantId, tenantId), eq(tickets.status, "USED")))
 
-    const invRows = await db
-      .select()
-      .from(inventoryItems)
-      .where(eq(inventoryItems.tenantId, tenantId))
-
     const th = alertThreshold()
-    const stockAlerts = invRows
-      .filter((r) => decFromDb(r.currentStock).lt(th))
-      .map((r) => ({
-        id: r.id,
-        name: r.name,
-        unit: r.unit,
-        currentStock: r.currentStock,
-        threshold: decToDb(th),
-      }))
+    let stockAlerts: {
+      id: string
+      name: string
+      unit: (typeof inventoryItems.$inferSelect)["unit"]
+      currentStock: string
+      threshold: string
+    }[] = []
+
+    if (focusEvent) {
+      const invRows = await db
+        .select({
+          id: inventoryItems.id,
+          name: inventoryItems.name,
+          unit: inventoryItems.unit,
+          stockAllocated: eventInventory.stockAllocated,
+        })
+        .from(eventInventory)
+        .innerJoin(
+          inventoryItems,
+          eq(eventInventory.inventoryItemId, inventoryItems.id)
+        )
+        .where(
+          and(
+            eq(eventInventory.eventId, focusEvent.id),
+            eq(eventInventory.tenantId, tenantId),
+            eq(inventoryItems.tenantId, tenantId)
+          )
+        )
+
+      stockAlerts = invRows
+        .filter((r) => decFromDb(r.stockAllocated).lt(th))
+        .map((r) => ({
+          id: r.id,
+          name: r.name,
+          unit: r.unit,
+          currentStock: String(r.stockAllocated),
+          threshold: decToDb(th),
+        }))
+    }
 
     const hourTotals = Array.from({ length: 24 }, () => dec(0))
 

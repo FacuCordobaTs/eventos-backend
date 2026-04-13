@@ -119,8 +119,34 @@ export const inventoryItems = mysqlTable('inventory_items', {
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   name: varchar('name', { length: 255 }).notNull(),
   unit: mysqlEnum('unit', ['ML', 'UNIDAD', 'GRAMOS']).notNull(), // Para saber si descontar mililitros o latas
-  currentStock: decimal('current_stock', { precision: 10, scale: 2 }).notNull().default('0'), // Ej: 7500 (10 botellas de 750ml)
 });
+
+export const eventInventory = mysqlTable(
+  'event_inventory',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 })
+      .notNull()
+      .references(() => events.id),
+    inventoryItemId: varchar('inventory_item_id', { length: 36 })
+      .notNull()
+      .references(() => inventoryItems.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    stockAllocated: decimal('stock_allocated', { precision: 10, scale: 2 })
+      .notNull()
+      .default('0'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    uniqueEventItem: uniqueIndex('event_inventory_event_item_unique').on(
+      table.eventId,
+      table.inventoryItemId
+    ),
+    tenantIdx: index('event_inventory_tenant_idx').on(table.tenantId),
+  })
+);
 
 export const products = mysqlTable('products', {
   id: varchar('id', { length: 36 }).primaryKey(),
@@ -345,6 +371,7 @@ export const digitalConsumptions = mysqlTable('digital_consumptions', {
 
 export const eventsRelations = relations(events, ({ many }) => ({
   eventProducts: many(eventProducts),
+  eventInventory: many(eventInventory),
   bars: many(bars),
   eventStaff: many(eventStaff),
   expenses: many(eventExpenses),
@@ -417,6 +444,22 @@ export const barInventoryRelations = relations(barInventory, ({ one }) => ({
 
 export const inventoryItemsRelations = relations(inventoryItems, ({ many }) => ({
   barInventory: many(barInventory),
+  eventInventory: many(eventInventory),
+}));
+
+export const eventInventoryRelations = relations(eventInventory, ({ one }) => ({
+  event: one(events, {
+    fields: [eventInventory.eventId],
+    references: [events.id],
+  }),
+  inventoryItem: one(inventoryItems, {
+    fields: [eventInventory.inventoryItemId],
+    references: [inventoryItems.id],
+  }),
+  tenant: one(tenants, {
+    fields: [eventInventory.tenantId],
+    references: [tenants.id],
+  }),
 }));
 
 export const staffRelations = relations(staff, ({ many }) => ({
