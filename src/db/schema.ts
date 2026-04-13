@@ -179,6 +179,58 @@ export const bars = mysqlTable(
   })
 );
 
+export const barProducts = mysqlTable(
+  'bar_products',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    barId: varchar('bar_id', { length: 36 })
+      .notNull()
+      .references(() => bars.id),
+    productId: varchar('product_id', { length: 36 })
+      .notNull()
+      .references(() => products.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    isActive: boolean('is_active').default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    barTenantIdx: index('bar_products_tenant_idx').on(table.barId, table.tenantId),
+    uniqueBarProduct: uniqueIndex('bar_products_bar_product_unique').on(
+      table.barId,
+      table.productId
+    ),
+  })
+);
+
+export const barInventory = mysqlTable(
+  'bar_inventory',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    barId: varchar('bar_id', { length: 36 })
+      .notNull()
+      .references(() => bars.id),
+    inventoryItemId: varchar('inventory_item_id', { length: 36 })
+      .notNull()
+      .references(() => inventoryItems.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    currentStock: decimal('current_stock', { precision: 10, scale: 2 })
+      .notNull()
+      .default('0'),
+    updatedAt: timestamp('updated_at').onUpdateNow(),
+  },
+  (table) => ({
+    barTenantIdx: index('bar_inventory_tenant_idx').on(table.barId, table.tenantId),
+    uniqueBarInventory: uniqueIndex('bar_inventory_bar_item_unique').on(
+      table.barId,
+      table.inventoryItemId
+    ),
+  })
+);
+
 export const eventStaff = mysqlTable(
   'event_staff',
   {
@@ -266,6 +318,7 @@ export const eventsRelations = relations(events, ({ many }) => ({
 export const productsRelations = relations(products, ({ many }) => ({
   recipes: many(productRecipes),
   eventProducts: many(eventProducts),
+  barProducts: many(barProducts),
 }));
 
 export const eventProductsRelations = relations(eventProducts, ({ one }) => ({
@@ -293,6 +346,42 @@ export const barsRelations = relations(bars, ({ one, many }) => ({
     references: [tenants.id],
   }),
   eventStaff: many(eventStaff),
+  barProducts: many(barProducts),
+  barInventory: many(barInventory),
+}));
+
+export const barProductsRelations = relations(barProducts, ({ one }) => ({
+  bar: one(bars, {
+    fields: [barProducts.barId],
+    references: [bars.id],
+  }),
+  product: one(products, {
+    fields: [barProducts.productId],
+    references: [products.id],
+  }),
+  tenant: one(tenants, {
+    fields: [barProducts.tenantId],
+    references: [tenants.id],
+  }),
+}));
+
+export const barInventoryRelations = relations(barInventory, ({ one }) => ({
+  bar: one(bars, {
+    fields: [barInventory.barId],
+    references: [bars.id],
+  }),
+  inventoryItem: one(inventoryItems, {
+    fields: [barInventory.inventoryItemId],
+    references: [inventoryItems.id],
+  }),
+  tenant: one(tenants, {
+    fields: [barInventory.tenantId],
+    references: [tenants.id],
+  }),
+}));
+
+export const inventoryItemsRelations = relations(inventoryItems, ({ many }) => ({
+  barInventory: many(barInventory),
 }));
 
 export const staffRelations = relations(staff, ({ many }) => ({

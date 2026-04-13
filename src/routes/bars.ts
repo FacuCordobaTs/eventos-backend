@@ -1,0 +1,343 @@
+import { Hono } from "hono"
+import { z } from "zod"
+import { zValidator } from "@hono/zod-validator"
+import { drizzle } from "drizzle-orm/mysql2"
+import { and, asc, eq } from "drizzle-orm"
+import { v4 as uuidv4 } from "uuid"
+import { pool } from "../db"
+import {
+  barInventory,
+  barProducts,
+  bars,
+  eventProducts,
+  events,
+  inventoryItems,
+  products,
+} from "../db/schema"
+import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { dec, decToDb } from "../lib/decimal-money"
+
+function requireTenantId(ctx: AuthenticatedContext): string | null {
+  const id = ctx.staff.tenantId
+  if (id == null || id === "") return null
+  return id
+}
+
+const barProductToggleSchema = z.object({
+  productId: z.string().min(1).max(36),
+  isActive: z.boolean(),
+})
+
+const patchBarInventorySchema = z.object({
+  inventoryItemId: z.string().min(1).max(36),
+  stockToAddOrSet: z.union([
+    z.number().nonnegative(),
+    z.string().regex(/^\d+(\.\d{1,4})?$/),
+  ]),
+})
+
+async function requireBarForTenant(
+  db: ReturnType<typeof drizzle>,
+  barId: string,
+  tenantId: string
+): Promise<typeof bars.$inferSelect | null> {
+  const [row] = await db
+    .select()
+    .from(bars)
+    .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+    .limit(1)
+  return row ?? null
+}
+
+async function requireEventForTenant(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string
+): Promise<typeof events.$inferSelect | null> {
+  const [row] = await db
+    .select()
+    .from(events)
+    .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+    .limit(1)
+  return row ?? null
+}
+
+export const barsRoute = new Hono()
+  .use("*", authMiddleware)
+  .get("/:barId/products", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const eventId = c.req.query("eventId")
+    if (!eventId || eventId.length === 0) {
+      return c.json({ error: "Query eventId es requerido" }, 400)
+    }
+
+    const db = drizzle(pool)
+    const bar = await requireBarForTenant(db, barId, tenantId)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+    if (bar.eventId !== eventId) {
+      return c.json({ error: "La barra no pertenece a este evento" }, 400)
+    }
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select({
+        id: products.id,
+        name: products.name,
+        price: products.price,
+        barProductId: barProducts.id,
+        barIsActive: barProducts.isActive,
+      })
+      .from(products)
+      .innerJoin(
+        eventProducts,
+        and(
+          eq(eventProducts.productId, products.id),
+          eq(eventProducts.eventId, eventId),
+          eq(eventProducts.tenantId, tenantId),
+          eq(eventProducts.isActive, true)
+        )
+      )
+      .leftJoin(
+        barProducts,
+        and(
+          eq(barProducts.productId, products.id),
+          eq(barProducts.barId, barId),
+          eq(barProducts.tenantId, tenantId)
+        )
+      )
+      .where(eq(products.tenantId, tenantId))
+      .orderBy(asc(products.name))
+
+    return c.json({
+      products: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        price: String(r.price),
+        isActiveForBar:
+          r.barProductId != null && r.barIsActive === true,
+      })),
+    })
+  })
+  .post(
+    "/:barId/products/toggle",
+    zValidator("json", barProductToggleSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const barId = c.req.param("barId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const bar = await requireBarForTenant(db, barId, tenantId)
+      if (!bar) {
+        return c.json({ error: "Barra no encontrada" }, 404)
+      }
+
+      const [prod] = await db
+        .select({ id: products.id })
+        .from(products)
+        .where(
+          and(eq(products.id, body.productId), eq(products.tenantId, tenantId))
+        )
+        .limit(1)
+      if (!prod) {
+        return c.json({ error: "Producto no encontrado" }, 404)
+      }
+
+      const [ep] = await db
+        .select({ id: eventProducts.id })
+        .from(eventProducts)
+        .where(
+          and(
+            eq(eventProducts.eventId, bar.eventId),
+            eq(eventProducts.productId, body.productId),
+            eq(eventProducts.tenantId, tenantId),
+            eq(eventProducts.isActive, true)
+          )
+        )
+        .limit(1)
+      if (!ep) {
+        return c.json(
+          { error: "El producto no está activo en el menú de este evento" },
+          400
+        )
+      }
+
+      const [existing] = await db
+        .select()
+        .from(barProducts)
+        .where(
+          and(
+            eq(barProducts.barId, barId),
+            eq(barProducts.productId, body.productId),
+            eq(barProducts.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (existing) {
+        await db
+          .update(barProducts)
+          .set({ isActive: body.isActive })
+          .where(
+            and(
+              eq(barProducts.id, existing.id),
+              eq(barProducts.tenantId, tenantId)
+            )
+          )
+        return c.json({ ok: true })
+      }
+
+      if (!body.isActive) {
+        return c.json({ ok: true })
+      }
+
+      const id = uuidv4()
+      await db.insert(barProducts).values({
+        id,
+        barId,
+        productId: body.productId,
+        tenantId,
+        isActive: true,
+        createdAt: new Date(),
+      })
+
+      return c.json({ ok: true }, 201)
+    }
+  )
+  .get("/:barId/inventory", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const db = drizzle(pool)
+
+    const bar = await requireBarForTenant(db, barId, tenantId)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+
+    const rows = await db
+      .select({
+        inventoryItemId: inventoryItems.id,
+        name: inventoryItems.name,
+        unit: inventoryItems.unit,
+        globalStock: inventoryItems.currentStock,
+        barRowId: barInventory.id,
+        barStock: barInventory.currentStock,
+      })
+      .from(inventoryItems)
+      .leftJoin(
+        barInventory,
+        and(
+          eq(barInventory.inventoryItemId, inventoryItems.id),
+          eq(barInventory.barId, barId),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+      .where(eq(inventoryItems.tenantId, tenantId))
+      .orderBy(asc(inventoryItems.name))
+
+    return c.json({
+      items: rows.map((r) => ({
+        inventoryItemId: r.inventoryItemId,
+        name: r.name,
+        unit: r.unit,
+        globalStock: String(r.globalStock),
+        barInventoryRowId: r.barRowId,
+        barCurrentStock:
+          r.barStock == null ? "0.00" : String(r.barStock),
+      })),
+    })
+  })
+  .patch(
+    "/:barId/inventory",
+    zValidator("json", patchBarInventorySchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const barId = c.req.param("barId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const bar = await requireBarForTenant(db, barId, tenantId)
+      if (!bar) {
+        return c.json({ error: "Barra no encontrada" }, 404)
+      }
+
+      const [inv] = await db
+        .select({ id: inventoryItems.id })
+        .from(inventoryItems)
+        .where(
+          and(
+            eq(inventoryItems.id, body.inventoryItemId),
+            eq(inventoryItems.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!inv) {
+        return c.json({ error: "Ítem de inventario no encontrado" }, 404)
+      }
+
+      const qty = dec(body.stockToAddOrSet)
+      if (qty.lt(0)) {
+        return c.json({ error: "El stock no puede ser negativo" }, 400)
+      }
+      const stockStr = decToDb(qty)
+
+      const [existing] = await db
+        .select()
+        .from(barInventory)
+        .where(
+          and(
+            eq(barInventory.barId, barId),
+            eq(barInventory.inventoryItemId, body.inventoryItemId),
+            eq(barInventory.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (existing) {
+        await db
+          .update(barInventory)
+          .set({ currentStock: stockStr })
+          .where(
+            and(
+              eq(barInventory.id, existing.id),
+              eq(barInventory.tenantId, tenantId)
+            )
+          )
+        return c.json({ ok: true, currentStock: stockStr })
+      }
+
+      const id = uuidv4()
+      await db.insert(barInventory).values({
+        id,
+        barId,
+        inventoryItemId: body.inventoryItemId,
+        tenantId,
+        currentStock: stockStr,
+      })
+
+      return c.json({ ok: true, currentStock: stockStr }, 201)
+    }
+  )
