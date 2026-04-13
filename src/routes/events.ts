@@ -4,6 +4,7 @@ import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
+  bars,
   digitalConsumptions,
   eventProducts,
   events,
@@ -41,6 +42,19 @@ const toggleEventProductSchema = z.object({
   productId: z.string().min(1).max(36),
   isActive: z.boolean(),
 })
+
+const createBarSchema = z.object({
+  name: z.string().min(1).max(255),
+})
+
+const updateBarSchema = z
+  .object({
+    name: z.string().min(1).max(255).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((b) => b.name !== undefined || b.isActive !== undefined, {
+    message: "Se requiere name o isActive",
+  })
 
 async function countIssuedTickets(
   db: ReturnType<typeof drizzle>,
@@ -83,6 +97,38 @@ async function requireEventForTenant(
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
   return ev ?? null
+}
+
+async function requireBarForEventTenant(
+  db: ReturnType<typeof drizzle>,
+  barId: string,
+  eventId: string,
+  tenantId: string
+): Promise<typeof bars.$inferSelect | null> {
+  const [row] = await db
+    .select()
+    .from(bars)
+    .where(
+      and(
+        eq(bars.id, barId),
+        eq(bars.eventId, eventId),
+        eq(bars.tenantId, tenantId)
+      )
+    )
+    .limit(1)
+  return row ?? null
+}
+
+function sanitizeBar(row: typeof bars.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    tenantId: row.tenantId,
+    name: row.name,
+    isActive: row.isActive,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
 }
 
 function sanitizeTicketType(
@@ -560,6 +606,118 @@ export const eventsRoute = new Hono()
         },
         201
       )
+    }
+  )
+  .get("/:id/bars", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select()
+      .from(bars)
+      .where(
+        and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId))
+      )
+      .orderBy(asc(bars.name))
+
+    return c.json({ bars: rows.map(sanitizeBar) })
+  })
+  .post("/:id/bars", zValidator("json", createBarSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const id = uuidv4()
+    await db.insert(bars).values({
+      id,
+      eventId,
+      tenantId,
+      name: body.name,
+      isActive: true,
+      createdAt: new Date(),
+    })
+
+    const [row] = await db
+      .select()
+      .from(bars)
+      .where(
+        and(eq(bars.id, id), eq(bars.tenantId, tenantId), eq(bars.eventId, eventId))
+      )
+      .limit(1)
+
+    return c.json({ bar: row ? sanitizeBar(row) : null }, 201)
+  })
+  .patch(
+    "/:id/bars/:barId",
+    zValidator("json", updateBarSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const barId = c.req.param("barId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const existing = await requireBarForEventTenant(db, barId, eventId, tenantId)
+      if (!existing) {
+        return c.json({ error: "Barra no encontrada" }, 404)
+      }
+
+      const patch: Partial<{
+        name: string
+        isActive: boolean
+      }> = {}
+      if (body.name !== undefined) patch.name = body.name
+      if (body.isActive !== undefined) patch.isActive = body.isActive
+
+      await db
+        .update(bars)
+        .set(patch)
+        .where(
+          and(eq(bars.id, barId), eq(bars.tenantId, tenantId), eq(bars.eventId, eventId))
+        )
+
+      const [row] = await db
+        .select()
+        .from(bars)
+        .where(
+          and(
+            eq(bars.id, barId),
+            eq(bars.tenantId, tenantId),
+            eq(bars.eventId, eventId)
+          )
+        )
+        .limit(1)
+
+      return c.json({ bar: row ? sanitizeBar(row) : null })
     }
   )
   .get("/:id", async (c) => {

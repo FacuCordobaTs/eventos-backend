@@ -36,6 +36,13 @@
       "when": 1776105254180,
       "tag": "0004_event_products",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1776109814138,
+      "tag": "0005_bars",
+      "breakpoints": true
     }
   ]
 }
