@@ -57,6 +57,13 @@
       "when": 1776111130914,
       "tag": "0007_bar_products_inventory",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1776111434811,
+      "tag": "0008_event_expenses",
+      "breakpoints": true
     }
   ]
 }

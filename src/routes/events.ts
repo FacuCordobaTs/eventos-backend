@@ -7,6 +7,7 @@ import {
   bars,
   digitalConsumptions,
   eventProducts,
+  eventExpenses,
   events,
   eventStaff,
   products,
@@ -19,6 +20,7 @@ import {
 import { and, asc, count, desc, eq, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { dec, decToDb } from "../lib/decimal-money"
 
 function requireTenantId(c: AuthenticatedContext): string | null {
   const id = c.staff.tenantId
@@ -62,6 +64,25 @@ const assignEventStaffSchema = z.object({
   staffId: z.string().min(1).max(36),
   isAssigned: z.boolean(),
   barId: z.union([z.string().min(1).max(36), z.null()]).optional(),
+})
+
+const expenseCategorySchema = z.enum([
+  "MUSIC",
+  "LIGHTS",
+  "FOOD",
+  "STAFF",
+  "MARKETING",
+  "INFRASTRUCTURE",
+  "OTHER",
+])
+
+const createExpenseSchema = z.object({
+  description: z.string().min(1).max(255),
+  category: expenseCategorySchema,
+  amount: z.union([
+    z.number().finite(),
+    z.string().regex(/^\d+(\.\d{1,2})?$/),
+  ]),
 })
 
 async function countIssuedTickets(
@@ -136,6 +157,19 @@ function sanitizeBar(row: typeof bars.$inferSelect) {
     isActive: row.isActive,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  }
+}
+
+function sanitizeExpense(row: typeof eventExpenses.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    tenantId: row.tenantId,
+    description: row.description,
+    category: row.category,
+    amount: String(row.amount),
+    date: row.date,
+    createdAt: row.createdAt,
   }
 }
 
@@ -884,6 +918,127 @@ export const eventsRoute = new Hono()
       return c.json({ bar: row ? sanitizeBar(row) : null })
     }
   )
+  .get("/:id/expenses", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select()
+      .from(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.eventId, eventId),
+          eq(eventExpenses.tenantId, tenantId)
+        )
+      )
+      .orderBy(desc(eventExpenses.createdAt))
+
+    return c.json({ expenses: rows.map(sanitizeExpense) })
+  })
+  .post("/:id/expenses", zValidator("json", createExpenseSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    let amt
+    try {
+      amt = dec(body.amount)
+    } catch {
+      return c.json({ error: "Monto inválido" }, 400)
+    }
+    if (amt.isNaN() || !amt.isFinite() || amt.lt(0)) {
+      return c.json({ error: "Monto inválido" }, 400)
+    }
+    const amountStr = decToDb(amt)
+
+    const id = uuidv4()
+    await db.insert(eventExpenses).values({
+      id,
+      eventId,
+      tenantId,
+      description: body.description,
+      category: body.category,
+      amount: amountStr,
+      date: new Date(),
+      createdAt: new Date(),
+    })
+
+    const [row] = await db
+      .select()
+      .from(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.id, id),
+          eq(eventExpenses.tenantId, tenantId),
+          eq(eventExpenses.eventId, eventId)
+        )
+      )
+      .limit(1)
+
+    return c.json({ expense: row ? sanitizeExpense(row) : null }, 201)
+  })
+  .delete("/:id/expenses/:expenseId", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const expenseId = c.req.param("expenseId")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [existing] = await db
+      .select({ id: eventExpenses.id })
+      .from(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.id, expenseId),
+          eq(eventExpenses.eventId, eventId),
+          eq(eventExpenses.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Gasto no encontrado" }, 404)
+    }
+
+    await db
+      .delete(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.id, expenseId),
+          eq(eventExpenses.eventId, eventId),
+          eq(eventExpenses.tenantId, tenantId)
+        )
+      )
+
+    return c.json({ ok: true })
+  })
   .get("/:id", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)

@@ -259,6 +259,40 @@ export const eventStaff = mysqlTable(
   })
 );
 
+export const eventExpenses = mysqlTable(
+  'event_expenses',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 })
+      .notNull()
+      .references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    description: varchar('description', { length: 255 }).notNull(),
+    category: mysqlEnum('category', [
+      'MUSIC',
+      'LIGHTS',
+      'FOOD',
+      'STAFF',
+      'MARKETING',
+      'INFRASTRUCTURE',
+      'OTHER',
+    ])
+      .notNull()
+      .default('OTHER'),
+    amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+    date: timestamp('date').notNull().defaultNow(),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventTenantIdx: index('event_expenses_tenant_idx').on(
+      table.eventId,
+      table.tenantId
+    ),
+  })
+);
+
 export const productRecipes = mysqlTable('product_recipes', {
   id: varchar('id', { length: 36 }).primaryKey(),
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
@@ -313,6 +347,7 @@ export const eventsRelations = relations(events, ({ many }) => ({
   eventProducts: many(eventProducts),
   bars: many(bars),
   eventStaff: many(eventStaff),
+  expenses: many(eventExpenses),
 }));
 
 export const productsRelations = relations(products, ({ many }) => ({
@@ -403,6 +438,17 @@ export const eventStaffRelations = relations(eventStaff, ({ one }) => ({
   }),
   tenant: one(tenants, {
     fields: [eventStaff.tenantId],
+    references: [tenants.id],
+  }),
+}));
+
+export const eventExpensesRelations = relations(eventExpenses, ({ one }) => ({
+  event: one(events, {
+    fields: [eventExpenses.eventId],
+    references: [events.id],
+  }),
+  tenant: one(tenants, {
+    fields: [eventExpenses.tenantId],
     references: [tenants.id],
   }),
 }));
