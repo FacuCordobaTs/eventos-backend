@@ -10,6 +10,7 @@ import { meRoute } from "./routes/me"
 import { inventoryRoute } from "./routes/inventory"
 import { analyticsRoute } from "./routes/analytics"
 import { barsRoute } from "./routes/bars"
+import { salesRoute } from "./routes/sales"
 import { cors } from "hono/cors"
 
 const app = new Hono()
@@ -41,6 +42,7 @@ app.route("/me", meRoute)
 app.route("/inventory", inventoryRoute)
 app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)
+app.route("/sales", salesRoute)
 
 const port = Number(process.env.PORT ?? 3000)
 

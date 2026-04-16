@@ -85,6 +85,13 @@
       "when": 1776114000000,
       "tag": "0011_digital_consumptions_customer_nullable",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "5",
+      "when": 1776123225465,
+      "tag": "0012_plain_black_bolt",
+      "breakpoints": true
     }
   ]
 }
