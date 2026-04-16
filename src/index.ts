@@ -11,7 +11,9 @@ import { inventoryRoute } from "./routes/inventory"
 import { analyticsRoute } from "./routes/analytics"
 import { barsRoute } from "./routes/bars"
 import { salesRoute } from "./routes/sales"
+import { mountStockWebSocket } from "./routes/ws-stock"
 import { cors } from "hono/cors"
+import { websocket as honoWebsocket } from "hono/bun"
 
 const app = new Hono()
 
@@ -44,9 +46,12 @@ app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)
 app.route("/sales", salesRoute)
 
+mountStockWebSocket(app)
+
 const port = Number(process.env.PORT ?? 3000)
 
 export default {
   port,
-  fetch: app.fetch,
+  fetch: (req: Request, server: Bun.Server) => app.fetch(req, { server }),
+  websocket: honoWebsocket,
 }

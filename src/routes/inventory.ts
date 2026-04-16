@@ -19,6 +19,7 @@ import {
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -586,6 +587,9 @@ export const inventoryRoute = new Hono()
           kind: "ok" as const,
           saleId,
           totalAmount: decToDb(total),
+          eventId: body.eventId,
+          inventoryItemIds:
+            needs.size > 0 ? [...needs.keys()] : ([] as string[]),
         }
       })
 
@@ -606,6 +610,15 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_inventory") {
         return c.json({ error: "Error al verificar inventario." }, 400)
+      }
+
+      if (
+        result.kind === "ok" &&
+        result.inventoryItemIds.length > 0
+      ) {
+        void emitCommittedStockDeltas(tenantId, result.eventId, {
+          eventItemIds: result.inventoryItemIds,
+        })
       }
 
       return c.json(

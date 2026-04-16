@@ -1556,6 +1556,70 @@ export const eventsRoute = new Hono()
       offset,
     })
   })
+  .get("/:id/stock-snapshot", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const eventBars = await db
+      .select({ id: bars.id })
+      .from(bars)
+      .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
+    const barIds = eventBars.map((b) => b.id)
+
+    const evInvRows = await db
+      .select({
+        inventoryItemId: eventInventory.inventoryItemId,
+        stockAllocated: eventInventory.stockAllocated,
+      })
+      .from(eventInventory)
+      .where(
+        and(
+          eq(eventInventory.eventId, eventId),
+          eq(eventInventory.tenantId, tenantId)
+        )
+      )
+
+    const barInvRows =
+      barIds.length === 0
+        ? []
+        : await db
+            .select({
+              barId: barInventory.barId,
+              inventoryItemId: barInventory.inventoryItemId,
+              currentStock: barInventory.currentStock,
+            })
+            .from(barInventory)
+            .innerJoin(bars, eq(barInventory.barId, bars.id))
+            .where(
+              and(
+                eq(barInventory.tenantId, tenantId),
+                eq(bars.eventId, eventId),
+                eq(bars.tenantId, tenantId),
+                inArray(barInventory.barId, barIds)
+              )
+            )
+
+    return c.json({
+      eventInventory: evInvRows.map((r) => ({
+        inventoryItemId: r.inventoryItemId,
+        stockAllocated: String(r.stockAllocated),
+      })),
+      barInventory: barInvRows.map((r) => ({
+        barId: r.barId,
+        inventoryItemId: r.inventoryItemId,
+        currentStock: String(r.currentStock),
+      })),
+    })
+  })
   .get("/:id/inventory-breakdown", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)

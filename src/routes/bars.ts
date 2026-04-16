@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, eq, ne, sql } from "drizzle-orm"
+import { and, asc, eq, inArray, ne, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
@@ -20,6 +20,7 @@ import {
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -127,6 +128,32 @@ export const barsRoute = new Hono()
       .where(eq(products.tenantId, tenantId))
       .orderBy(asc(products.name))
 
+    const productIds = rows.map((r) => r.id)
+    const recipeRows =
+      productIds.length === 0
+        ? []
+        : await db
+            .select({
+              productId: productRecipes.productId,
+              inventoryItemId: productRecipes.inventoryItemId,
+              quantityUsed: productRecipes.quantityUsed,
+            })
+            .from(productRecipes)
+            .where(inArray(productRecipes.productId, productIds))
+
+    const recipesByProduct = new Map<
+      string,
+      { inventoryItemId: string; quantityUsed: string }[]
+    >()
+    for (const rr of recipeRows) {
+      const list = recipesByProduct.get(rr.productId) ?? []
+      list.push({
+        inventoryItemId: rr.inventoryItemId,
+        quantityUsed: String(rr.quantityUsed),
+      })
+      recipesByProduct.set(rr.productId, list)
+    }
+
     return c.json({
       products: rows.map((r) => ({
         id: r.id,
@@ -134,6 +161,7 @@ export const barsRoute = new Hono()
         price: String(r.price),
         isActiveForBar:
           r.barProductId != null && r.barIsActive === true,
+        recipes: recipesByProduct.get(r.id) ?? [],
       })),
     })
   })
@@ -526,6 +554,8 @@ export const barsRoute = new Hono()
         return {
           kind: "ok" as const,
           productName: row.productName,
+          eventId: bar.eventId,
+          inventoryItemIds: recipes.map((r) => r.inventoryItemId),
         }
       })
 
@@ -543,6 +573,15 @@ export const barsRoute = new Hono()
       }
       if (result.kind === "wrong_bar") {
         return c.json({ error: "Este código no es válido en esta barra" }, 400)
+      }
+
+      if (
+        result.kind === "ok" &&
+        result.inventoryItemIds.length > 0
+      ) {
+        void emitCommittedStockDeltas(tenantId, result.eventId, {
+          barDeltas: { barId, itemIds: result.inventoryItemIds },
+        })
       }
 
       return c.json({
