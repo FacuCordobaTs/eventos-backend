@@ -1,3 +1,6 @@
 # deps
 node_modules/
 .env
+
+# Accidental Windows artifact (e.g. `bun build --outfile NUL` in repo root)
+NUL

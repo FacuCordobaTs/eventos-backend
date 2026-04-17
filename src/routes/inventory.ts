@@ -54,7 +54,10 @@ const updateProductSchema = createProductSchema
 
 const createSaleSchema = z.object({
   eventId: z.string().min(1),
-  barId: z.string().min(1).max(36).optional(),
+  barId: z.preprocess(
+    (v) => (v === null || v === "" ? undefined : v),
+    z.string().min(1).max(36).optional()
+  ),
   paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER"]),
   items: z
     .array(
@@ -574,6 +577,7 @@ export const inventoryRoute = new Hono()
 
         if (needs.size > 0) {
           for (const [invId, need] of needs) {
+            if (!need.gt(dec(0))) continue
             const evRow = evInvByItem.get(invId)!
             const next = decFromDb(evRow.stockAllocated).minus(need)
             await tx
