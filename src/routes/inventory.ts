@@ -2,15 +2,17 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, eq, inArray, ne, sql } from "drizzle-orm"
+import { and, count, eq, inArray, ne, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import { randomUUID } from "node:crypto"
 import {
   barInventory,
+  barProducts,
   bars,
   digitalConsumptions,
   eventInventory,
+  eventProducts,
   events,
   inventoryItems,
   productRecipes,
@@ -32,21 +34,18 @@ function requireTenantId(ctx: AuthenticatedContext): string | null {
   return id
 }
 
-const unitSchema = z.enum(["ML", "UNIDAD", "GRAMOS"])
-
-const contentUnitSchema = z.enum(["ML", "UNIDAD", "GRAMOS"])
+const baseUnitSchema = z.enum(["ML", "GRAMS", "UNIT"])
 
 const upsertItemSchema = z.object({
   id: z.string().min(1).optional(),
   name: z.string().min(1).max(255),
-  unit: unitSchema,
-  defaultContentValue: z
+  baseUnit: baseUnitSchema,
+  packageSize: z
     .union([
       z.number().nonnegative(),
       z.string().regex(/^\d+(\.\d{1,2})?$/),
     ])
     .optional(),
-  defaultContentUnit: contentUnitSchema.optional(),
 })
 
 const loadBottlesSchema = z
@@ -111,20 +110,14 @@ const createSaleSchema = z.object({
     .min(1),
 })
 
-function normalizeDefaultContent(body: z.infer<typeof upsertItemSchema>): {
-  defaultContentValue: string
-  defaultContentUnit: "ML" | "UNIDAD" | "GRAMOS"
-} {
+function normalizePackageSize(body: z.infer<typeof upsertItemSchema>): string {
   const raw =
-    body.defaultContentValue === undefined
+    body.packageSize === undefined
       ? "0"
-      : typeof body.defaultContentValue === "number"
-        ? body.defaultContentValue
-        : body.defaultContentValue
-  return {
-    defaultContentValue: decToDb(dec(raw)),
-    defaultContentUnit: body.defaultContentUnit ?? "ML",
-  }
+      : typeof body.packageSize === "number"
+        ? body.packageSize
+        : body.packageSize
+  return decToDb(dec(raw))
 }
 
 export class InsufficientStockError extends Error {
@@ -155,9 +148,8 @@ export const inventoryRoute = new Hono()
     const items = rows.map((r) => ({
       id: r.id,
       name: r.name,
-      unit: r.unit,
-      defaultContentValue: r.defaultContentValue,
-      defaultContentUnit: r.defaultContentUnit,
+      baseUnit: r.baseUnit,
+      packageSize: r.packageSize,
     }))
 
     return c.json({ items })
@@ -182,14 +174,13 @@ export const inventoryRoute = new Hono()
       if (!existing) {
         return c.json({ error: "Ítem no encontrado" }, 404)
       }
-      const dc = normalizeDefaultContent(body)
+      const pkg = normalizePackageSize(body)
       await db
         .update(inventoryItems)
         .set({
           name: body.name,
-          unit: body.unit,
-          defaultContentValue: dc.defaultContentValue,
-          defaultContentUnit: dc.defaultContentUnit,
+          baseUnit: body.baseUnit,
+          packageSize: pkg,
         })
         .where(eq(inventoryItems.id, body.id))
       const [row] = await db
@@ -201,22 +192,20 @@ export const inventoryRoute = new Hono()
         item: {
           id: row!.id,
           name: row!.name,
-          unit: row!.unit,
-          defaultContentValue: row!.defaultContentValue,
-          defaultContentUnit: row!.defaultContentUnit,
+          baseUnit: row!.baseUnit,
+          packageSize: row!.packageSize,
         },
       })
     }
 
     const id = uuidv4()
-    const dc = normalizeDefaultContent(body)
+    const pkg = normalizePackageSize(body)
     await db.insert(inventoryItems).values({
       id,
       tenantId,
       name: body.name,
-      unit: body.unit,
-      defaultContentValue: dc.defaultContentValue,
-      defaultContentUnit: dc.defaultContentUnit,
+      baseUnit: body.baseUnit,
+      packageSize: pkg,
     })
     const [row] = await db
       .select()
@@ -228,13 +217,103 @@ export const inventoryRoute = new Hono()
         item: {
           id: row!.id,
           name: row!.name,
-          unit: row!.unit,
-          defaultContentValue: row!.defaultContentValue,
-          defaultContentUnit: row!.defaultContentUnit,
+          baseUnit: row!.baseUnit,
+          packageSize: row!.packageSize,
         },
       },
       201
     )
+  })
+  .delete("/items/:id", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const itemId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [item] = await db
+      .select({ id: inventoryItems.id })
+      .from(inventoryItems)
+      .where(
+        and(eq(inventoryItems.id, itemId), eq(inventoryItems.tenantId, tenantId))
+      )
+      .limit(1)
+    if (!item) {
+      return c.json({ error: "Ítem no encontrado" }, 404)
+    }
+
+    const [recipeRow] = await db
+      .select({ n: count() })
+      .from(productRecipes)
+      .innerJoin(products, eq(productRecipes.productId, products.id))
+      .where(
+        and(
+          eq(productRecipes.inventoryItemId, itemId),
+          eq(products.tenantId, tenantId)
+        )
+      )
+
+    const [evRow] = await db
+      .select({ n: count() })
+      .from(eventInventory)
+      .where(
+        and(
+          eq(eventInventory.inventoryItemId, itemId),
+          eq(eventInventory.tenantId, tenantId)
+        )
+      )
+
+    const [barRow] = await db
+      .select({ n: count() })
+      .from(barInventory)
+      .where(
+        and(
+          eq(barInventory.inventoryItemId, itemId),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+
+    const nRecipes = Number(recipeRow?.n ?? 0)
+    const nEvents = Number(evRow?.n ?? 0)
+    const nBars = Number(barRow?.n ?? 0)
+
+    if (nRecipes > 0) {
+      return c.json(
+        {
+          error:
+            "No se puede eliminar: el insumo está en una o más recetas. Quitá esas líneas primero.",
+        },
+        400
+      )
+    }
+    if (nEvents > 0) {
+      return c.json(
+        {
+          error:
+            "No se puede eliminar: el insumo está asignado a uno o más eventos. Sacalo del inventario de cada evento primero.",
+        },
+        400
+      )
+    }
+    if (nBars > 0) {
+      return c.json(
+        {
+          error:
+            "No se puede eliminar: el insumo tiene stock en una o más barras. Ajustá el inventario primero.",
+        },
+        400
+      )
+    }
+
+    await db
+      .delete(inventoryItems)
+      .where(
+        and(eq(inventoryItems.id, itemId), eq(inventoryItems.tenantId, tenantId))
+      )
+
+    return c.json({ ok: true })
   })
   .get("/products", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -260,7 +339,8 @@ export const inventoryRoute = new Hono()
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
         inventoryName: inventoryItems.name,
-        inventoryUnit: inventoryItems.unit,
+        inventoryBaseUnit: inventoryItems.baseUnit,
+        inventoryPackageSize: inventoryItems.packageSize,
       })
       .from(productRecipes)
       .innerJoin(
@@ -293,7 +373,8 @@ export const inventoryRoute = new Hono()
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
           inventoryItemName: r.inventoryName,
-          inventoryUnit: r.inventoryUnit,
+          inventoryBaseUnit: r.inventoryBaseUnit,
+          inventoryPackageSize: r.inventoryPackageSize,
         })),
       })),
     })
@@ -358,7 +439,8 @@ export const inventoryRoute = new Hono()
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
         inventoryName: inventoryItems.name,
-        inventoryUnit: inventoryItems.unit,
+        inventoryBaseUnit: inventoryItems.baseUnit,
+        inventoryPackageSize: inventoryItems.packageSize,
       })
       .from(productRecipes)
       .innerJoin(
@@ -380,7 +462,8 @@ export const inventoryRoute = new Hono()
             inventoryItemId: r.inventoryItemId,
             quantityUsed: r.quantityUsed,
             inventoryItemName: r.inventoryName,
-            inventoryUnit: r.inventoryUnit,
+            inventoryBaseUnit: r.inventoryBaseUnit,
+            inventoryPackageSize: r.inventoryPackageSize,
           })),
         },
       },
@@ -453,7 +536,8 @@ export const inventoryRoute = new Hono()
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
         inventoryName: inventoryItems.name,
-        inventoryUnit: inventoryItems.unit,
+        inventoryBaseUnit: inventoryItems.baseUnit,
+        inventoryPackageSize: inventoryItems.packageSize,
       })
       .from(productRecipes)
       .innerJoin(
@@ -474,10 +558,79 @@ export const inventoryRoute = new Hono()
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
           inventoryItemName: r.inventoryName,
-          inventoryUnit: r.inventoryUnit,
+          inventoryBaseUnit: r.inventoryBaseUnit,
+          inventoryPackageSize: r.inventoryPackageSize,
         })),
       },
     })
+  })
+  .delete("/products/:id", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const productId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [existing] = await db
+      .select()
+      .from(products)
+      .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Producto no encontrado" }, 404)
+    }
+
+    const [saleRow] = await db
+      .select({ n: count() })
+      .from(saleItems)
+      .where(eq(saleItems.productId, productId))
+    const [consRow] = await db
+      .select({ n: count() })
+      .from(digitalConsumptions)
+      .where(eq(digitalConsumptions.productId, productId))
+
+    const saleCount = Number(saleRow?.n ?? 0)
+    const consCount = Number(consRow?.n ?? 0)
+
+    if (saleCount > 0 || consCount > 0) {
+      await db
+        .update(products)
+        .set({ isActive: false })
+        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+      return c.json({
+        ok: true,
+        deactivated: true,
+        message:
+          "El producto tiene ventas o consumos asociados; se desactivó en lugar de eliminarlo.",
+      })
+    }
+
+    await db.transaction(async (tx) => {
+      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
+      await tx
+        .delete(eventProducts)
+        .where(
+          and(
+            eq(eventProducts.productId, productId),
+            eq(eventProducts.tenantId, tenantId)
+          )
+        )
+      await tx
+        .delete(barProducts)
+        .where(
+          and(
+            eq(barProducts.productId, productId),
+            eq(barProducts.tenantId, tenantId)
+          )
+        )
+      await tx
+        .delete(products)
+        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+    })
+
+    return c.json({ ok: true, deleted: true })
   })
   .post("/load-bottles", zValidator("json", loadBottlesSchema), async (c) => {
     const ctx = c as AuthenticatedContext

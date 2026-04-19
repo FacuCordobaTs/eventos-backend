@@ -22,10 +22,11 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { and, asc, count, desc, eq, inArray, ne, sql, sum } from "drizzle-orm"
+import { and, asc, count, desc, eq, exists, inArray, ne, sql, sum } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { stockAllocatedToBaseUnits } from "../lib/inventory-deduction"
 
 function requireTenantId(c: AuthenticatedContext): string | null {
   const id = c.staff.tenantId
@@ -85,30 +86,33 @@ const toggleEventProductSchema = z.object({
   isActive: z.boolean(),
 })
 
+const stockInputAsSchema = z.enum(["BASE_UNITS", "PACKAGES"])
+
 const patchEventInventorySchema = z.object({
   inventoryItemId: z.string().min(1).max(36),
   stockAllocated: z.union([
     z.number().nonnegative(),
     z.string().regex(/^\d+(\.\d{1,2})?$/),
   ]),
+  stockInputAs: stockInputAsSchema.optional().default("BASE_UNITS"),
 })
 
 const createEventInsumoSchema = z.object({
   name: z.string().min(1).max(255),
-  unit: z.enum(["ML", "UNIDAD", "GRAMOS"]),
+  baseUnit: z.enum(["ML", "GRAMS", "UNIT"]),
+  packageSize: z
+    .union([
+      z.number().nonnegative(),
+      z.string().regex(/^\d+(\.\d{1,2})?$/),
+    ])
+    .optional(),
   initialStock: z
     .union([
       z.number().nonnegative(),
       z.string().regex(/^\d+(\.\d{1,2})?$/),
     ])
     .optional(),
-  defaultContentValue: z
-    .union([
-      z.number().nonnegative(),
-      z.string().regex(/^\d+(\.\d{1,2})?$/),
-    ])
-    .optional(),
-  defaultContentUnit: z.enum(["ML", "UNIDAD", "GRAMOS"]).optional(),
+  initialStockInputAs: stockInputAsSchema.optional().default("BASE_UNITS"),
 })
 
 const createBarSchema = z.object({
@@ -547,6 +551,21 @@ export const eventsRoute = new Hono()
         )
       )
 
+    /** Ingresos solo por ítems de catálogo (barras/consumos); excluye el valor de entradas en ventas mixtas. */
+    const [barProductRevenueRow] = await db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      )
+
     const [consumptionsRow] = await db
       .select({ n: count() })
       .from(digitalConsumptions)
@@ -561,6 +580,9 @@ export const eventsRoute = new Hono()
     return c.json({
       ticketsSold: Number(ticketsRow?.n ?? 0),
       totalRevenue: revenueRow?.total ?? "0.00",
+      barProductRevenue: decToDb(
+        decFromDb(barProductRevenueRow?.total ?? "0")
+      ),
       digitalConsumptionsSold: Number(consumptionsRow?.n ?? 0),
     })
   })
@@ -829,9 +851,8 @@ export const eventsRoute = new Hono()
       .select({
         id: inventoryItems.id,
         name: inventoryItems.name,
-        unit: inventoryItems.unit,
-        defaultContentValue: inventoryItems.defaultContentValue,
-        defaultContentUnit: inventoryItems.defaultContentUnit,
+        baseUnit: inventoryItems.baseUnit,
+        packageSize: inventoryItems.packageSize,
         eventInventoryId: eventInventory.id,
         stockAllocated: eventInventory.stockAllocated,
       })
@@ -851,9 +872,8 @@ export const eventsRoute = new Hono()
       items: rows.map((r) => ({
         id: r.id,
         name: r.name,
-        unit: r.unit,
-        defaultContentValue: r.defaultContentValue,
-        defaultContentUnit: r.defaultContentUnit,
+        baseUnit: r.baseUnit,
+        packageSize: r.packageSize,
         eventInventoryId: r.eventInventoryId ?? null,
         stockAllocated:
           r.stockAllocated == null ? "0.00" : String(r.stockAllocated),
@@ -878,8 +898,8 @@ export const eventsRoute = new Hono()
         return c.json({ error: "Evento no encontrado" }, 404)
       }
 
-      const [inv] = await db
-        .select({ id: inventoryItems.id })
+      const [itemRow] = await db
+        .select()
         .from(inventoryItems)
         .where(
           and(
@@ -888,11 +908,19 @@ export const eventsRoute = new Hono()
           )
         )
         .limit(1)
-      if (!inv) {
+      if (!itemRow) {
         return c.json({ error: "Ítem no encontrado" }, 404)
       }
 
-      const stockStr = decToDb(dec(body.stockAllocated))
+      const conv = stockAllocatedToBaseUnits(
+        itemRow,
+        body.stockAllocated,
+        body.stockInputAs
+      )
+      if (conv.error) {
+        return c.json({ error: conv.error }, 400)
+      }
+      const stockStr = decToDb(conv.value)
       const sumBars = decFromDb(
         await sumBarStockForEventItem(db, eventId, tenantId, body.inventoryItemId)
       )
@@ -941,16 +969,28 @@ export const eventsRoute = new Hono()
         return c.json({ error: "Evento no encontrado" }, 404)
       }
 
-      const initialStr =
-        body.initialStock !== undefined
-          ? decToDb(dec(body.initialStock))
+      const pkgStr =
+        body.packageSize !== undefined
+          ? decToDb(dec(body.packageSize))
           : "0.00"
 
-      const defaultValStr =
-        body.defaultContentValue !== undefined
-          ? decToDb(dec(body.defaultContentValue))
-          : "0.00"
-      const defaultUnit = body.defaultContentUnit ?? "ML"
+      const virtualItem = {
+        baseUnit: body.baseUnit,
+        packageSize: pkgStr,
+      } as const
+
+      let initialStr = "0.00"
+      if (body.initialStock !== undefined) {
+        const initConv = stockAllocatedToBaseUnits(
+          virtualItem,
+          body.initialStock,
+          body.initialStockInputAs
+        )
+        if (initConv.error) {
+          return c.json({ error: initConv.error }, 400)
+        }
+        initialStr = decToDb(initConv.value)
+      }
 
       const itemId = uuidv4()
       const evInvId = uuidv4()
@@ -960,9 +1000,8 @@ export const eventsRoute = new Hono()
           id: itemId,
           tenantId,
           name: body.name.trim(),
-          unit: body.unit,
-          defaultContentValue: defaultValStr,
-          defaultContentUnit: defaultUnit,
+          baseUnit: body.baseUnit,
+          packageSize: pkgStr,
         })
         await tx.insert(eventInventory).values({
           id: evInvId,
@@ -979,9 +1018,8 @@ export const eventsRoute = new Hono()
           item: {
             id: itemId,
             name: body.name.trim(),
-            unit: body.unit,
-            defaultContentValue: defaultValStr,
-            defaultContentUnit: defaultUnit,
+            baseUnit: body.baseUnit,
+            packageSize: pkgStr,
             eventInventoryId: evInvId,
             stockAllocated: initialStr,
           },
@@ -1534,6 +1572,12 @@ export const eventsRoute = new Hono()
       eq(sales.eventId, eventId),
       eq(sales.tenantId, tenantId),
       eq(sales.status, "COMPLETED"),
+      exists(
+        db
+          .select({ id: saleItems.id })
+          .from(saleItems)
+          .where(eq(saleItems.saleId, sales.id))
+      ),
     ]
     if (filterBarId) {
       saleFilters.push(eq(sales.barId, filterBarId))
@@ -1566,7 +1610,7 @@ export const eventsRoute = new Hono()
 
     const itemsBySale = new Map<
       string,
-      { quantity: number; productName: string }[]
+      { quantity: number; productName: string; priceAtTime: string }[]
     >()
 
     if (saleIds.length > 0) {
@@ -1575,6 +1619,7 @@ export const eventsRoute = new Hono()
           saleId: saleItems.saleId,
           quantity: saleItems.quantity,
           productName: products.name,
+          priceAtTime: saleItems.priceAtTime,
         })
         .from(saleItems)
         .innerJoin(products, eq(saleItems.productId, products.id))
@@ -1587,6 +1632,7 @@ export const eventsRoute = new Hono()
         list.push({
           quantity: row.quantity,
           productName: row.productName,
+          priceAtTime: String(row.priceAtTime),
         })
         itemsBySale.set(row.saleId, list)
       }
@@ -1600,12 +1646,21 @@ export const eventsRoute = new Hono()
         .join(", ")
     }
 
+    function productLinesTotal(saleId: string): string {
+      const lines = itemsBySale.get(saleId) ?? []
+      let t = dec(0)
+      for (const l of lines) {
+        t = t.plus(dec(l.quantity).times(decFromDb(l.priceAtTime)))
+      }
+      return decToDb(t)
+    }
+
     return c.json({
       sales: slice.map((r) => ({
         id: r.id,
         createdAt: r.createdAt,
         source: r.source,
-        totalAmount: String(r.totalAmount),
+        totalAmount: productLinesTotal(r.id),
         paymentMethod: r.paymentMethod,
         staffName: r.staffName,
         customerName: r.customerName,
@@ -1706,7 +1761,8 @@ export const eventsRoute = new Hono()
       .select({
         inventoryItemId: inventoryItems.id,
         itemName: inventoryItems.name,
-        unit: inventoryItems.unit,
+        baseUnit: inventoryItems.baseUnit,
+        packageSize: inventoryItems.packageSize,
         stockAllocated: eventInventory.stockAllocated,
       })
       .from(eventInventory)
@@ -1729,7 +1785,8 @@ export const eventsRoute = new Hono()
             .select({
               inventoryItemId: inventoryItems.id,
               itemName: inventoryItems.name,
-              unit: inventoryItems.unit,
+              baseUnit: inventoryItems.baseUnit,
+              packageSize: inventoryItems.packageSize,
               barId: barInventory.barId,
               stock: barInventory.currentStock,
             })
@@ -1751,7 +1808,8 @@ export const eventsRoute = new Hono()
 
     type Agg = {
       itemName: string
-      unit: (typeof inventoryItems.$inferSelect)["unit"]
+      baseUnit: (typeof inventoryItems.$inferSelect)["baseUnit"]
+      packageSize: string
       stockAllocated: ReturnType<typeof dec>
       bars: { barName: string; stock: string }[]
       sumBars: ReturnType<typeof dec>
@@ -1762,7 +1820,8 @@ export const eventsRoute = new Hono()
     for (const r of evInvRows) {
       byItem.set(r.inventoryItemId, {
         itemName: r.itemName,
-        unit: r.unit,
+        baseUnit: r.baseUnit,
+        packageSize: String(r.packageSize),
         stockAllocated: decFromDb(r.stockAllocated),
         bars: [],
         sumBars: dec(0),
@@ -1774,7 +1833,8 @@ export const eventsRoute = new Hono()
       if (!agg) {
         agg = {
           itemName: r.itemName,
-          unit: r.unit,
+          baseUnit: r.baseUnit,
+          packageSize: String(r.packageSize),
           stockAllocated: dec(0),
           bars: [],
           sumBars: dec(0),
@@ -1794,7 +1854,8 @@ export const eventsRoute = new Hono()
       .map(([inventoryItemId, agg]) => ({
         inventoryItemId,
         itemName: agg.itemName,
-        unit: agg.unit,
+        baseUnit: agg.baseUnit,
+        packageSize: agg.packageSize,
         stockAllocated: decToDb(agg.stockAllocated),
         totalInBars: decToDb(agg.sumBars),
         bars: agg.bars.sort((a, b) => a.barName.localeCompare(b.barName)),

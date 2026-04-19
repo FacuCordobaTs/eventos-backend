@@ -121,14 +121,10 @@ export const inventoryItems = mysqlTable('inventory_items', {
   id: varchar('id', { length: 36 }).primaryKey(),
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   name: varchar('name', { length: 255 }).notNull(),
-  unit: mysqlEnum('unit', ['ML', 'UNIDAD', 'GRAMOS']).notNull(), // Para saber si descontar mililitros o latas
-  /** Tamaño estándar de una unidad física (ej. 750 ml por botella) para carga y venta por botella. */
-  defaultContentValue: decimal('default_content_value', { precision: 10, scale: 2 })
-    .notNull()
-    .default('0'),
-  defaultContentUnit: mysqlEnum('default_content_unit', ['ML', 'GRAMOS', 'UNIDAD'])
-    .notNull()
-    .default('ML'),
+  /** Unidad en la que se contabiliza el stock (ml, gramos o unidades indivisibles). */
+  baseUnit: mysqlEnum('base_unit', ['ML', 'GRAMS', 'UNIT']).notNull(),
+  /** Cantidad de `baseUnit` por envase físico (ej. 750 ml por botella). 0 = sin envase fijo. */
+  packageSize: decimal('package_size', { precision: 10, scale: 2 }).notNull().default('0'),
 });
 
 export const eventInventory = mysqlTable(

@@ -21,7 +21,10 @@ import {
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
-import { recipeStockDeduction } from "../lib/inventory-deduction"
+import {
+  recipeStockDeduction,
+  stockAllocatedToBaseUnits,
+} from "../lib/inventory-deduction"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -40,6 +43,10 @@ const patchBarInventorySchema = z.object({
     z.number().nonnegative(),
     z.string().regex(/^\d+(\.\d{1,4})?$/),
   ]),
+  stockInputAs: z
+    .enum(["BASE_UNITS", "PACKAGES"])
+    .optional()
+    .default("BASE_UNITS"),
 })
 
 const redeemQrSchema = z.object({
@@ -274,7 +281,8 @@ export const barsRoute = new Hono()
       .select({
         inventoryItemId: inventoryItems.id,
         name: inventoryItems.name,
-        unit: inventoryItems.unit,
+        baseUnit: inventoryItems.baseUnit,
+        packageSize: inventoryItems.packageSize,
         eventStockAllocated: eventInventory.stockAllocated,
         barRowId: barInventory.id,
         barStock: barInventory.currentStock,
@@ -303,7 +311,8 @@ export const barsRoute = new Hono()
       items: rows.map((r) => ({
         inventoryItemId: r.inventoryItemId,
         name: r.name,
-        unit: r.unit,
+        baseUnit: r.baseUnit,
+        packageSize: r.packageSize,
         eventStockAllocated:
           r.eventStockAllocated == null
             ? "0.00"
@@ -332,8 +341,8 @@ export const barsRoute = new Hono()
         return c.json({ error: "Barra no encontrada" }, 404)
       }
 
-      const [inv] = await db
-        .select({ id: inventoryItems.id })
+      const [itemRow] = await db
+        .select()
         .from(inventoryItems)
         .where(
           and(
@@ -342,14 +351,19 @@ export const barsRoute = new Hono()
           )
         )
         .limit(1)
-      if (!inv) {
+      if (!itemRow) {
         return c.json({ error: "Ítem de inventario no encontrado" }, 404)
       }
 
-      const qty = dec(body.stockToAddOrSet)
-      if (qty.lt(0)) {
-        return c.json({ error: "El stock no puede ser negativo" }, 400)
+      const conv = stockAllocatedToBaseUnits(
+        itemRow,
+        body.stockToAddOrSet,
+        body.stockInputAs
+      )
+      if (conv.error) {
+        return c.json({ error: conv.error }, 400)
       }
+      const qty = conv.value
       const stockStr = decToDb(qty)
 
       const [evInv] = await db

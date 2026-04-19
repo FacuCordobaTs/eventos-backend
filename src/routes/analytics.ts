@@ -111,7 +111,7 @@ export const analyticsRoute = new Hono()
     let stockAlerts: {
       id: string
       name: string
-      unit: (typeof inventoryItems.$inferSelect)["unit"]
+      baseUnit: (typeof inventoryItems.$inferSelect)["baseUnit"]
       currentStock: string
       threshold: string
     }[] = []
@@ -121,7 +121,7 @@ export const analyticsRoute = new Hono()
         .select({
           id: inventoryItems.id,
           name: inventoryItems.name,
-          unit: inventoryItems.unit,
+          baseUnit: inventoryItems.baseUnit,
           stockAllocated: eventInventory.stockAllocated,
         })
         .from(eventInventory)
@@ -142,7 +142,7 @@ export const analyticsRoute = new Hono()
         .map((r) => ({
           id: r.id,
           name: r.name,
-          unit: r.unit,
+          baseUnit: r.baseUnit,
           currentStock: String(r.stockAllocated),
           threshold: decToDb(th),
         }))
