@@ -39,6 +39,39 @@ const createEventSchema = z.object({
   location: z.string().max(255).optional(),
 })
 
+/** ISO 8601 instant from client (UTC or offset); null clears the window. */
+const patchEventSchema = z
+  .object({
+    ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
+    consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const check = (key: "ticketsAvailableFrom" | "consumptionsAvailableFrom") => {
+      const v = data[key]
+      if (v === undefined || v === null) return
+      const t = Date.parse(v)
+      if (Number.isNaN(t)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Invalid date",
+          path: [key],
+        })
+      }
+    }
+    check("ticketsAvailableFrom")
+    check("consumptionsAvailableFrom")
+    if (
+      data.ticketsAvailableFrom === undefined &&
+      data.consumptionsAvailableFrom === undefined
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "At least one field is required",
+        path: ["ticketsAvailableFrom"],
+      })
+    }
+  })
+
 const createTicketTypeSchema = z.object({
   name: z.string().min(1).max(100),
   price: z.coerce.number().nonnegative(),
@@ -136,6 +169,12 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     location: row.location,
     isActive: row.isActive,
     createdAt: row.createdAt,
+    ticketsAvailableFrom: row.ticketsAvailableFrom
+      ? row.ticketsAvailableFrom.toISOString()
+      : null,
+    consumptionsAvailableFrom: row.consumptionsAvailableFrom
+      ? row.consumptionsAvailableFrom.toISOString()
+      : null,
   }
 }
 
@@ -1742,6 +1781,57 @@ export const eventsRoute = new Hono()
       .sort((a, b) => a.itemName.localeCompare(b.itemName))
 
     return c.json({ items })
+  })
+  .patch("/:id", zValidator("json", patchEventSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const [existing] = await db
+      .select({ id: events.id })
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const setPayload: {
+      ticketsAvailableFrom?: Date | null
+      consumptionsAvailableFrom?: Date | null
+    } = {}
+    if (body.ticketsAvailableFrom !== undefined) {
+      setPayload.ticketsAvailableFrom =
+        body.ticketsAvailableFrom === null
+          ? null
+          : new Date(body.ticketsAvailableFrom)
+    }
+    if (body.consumptionsAvailableFrom !== undefined) {
+      setPayload.consumptionsAvailableFrom =
+        body.consumptionsAvailableFrom === null
+          ? null
+          : new Date(body.consumptionsAvailableFrom)
+    }
+
+    await db
+      .update(events)
+      .set(setPayload)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+
+    const [row] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    return c.json({ event: sanitizeEvent(row) })
   })
   .get("/:id", async (c) => {
     const ctx = c as AuthenticatedContext

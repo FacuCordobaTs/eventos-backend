@@ -45,8 +45,7 @@ export const customers = mysqlTable('customers', {
   id: varchar('id', { length: 36 }).primaryKey(),
   name: varchar('name', { length: 255 }).notNull(),
   email: varchar('email', { length: 255 }).notNull().unique(),
-  passwordHash: varchar('password_hash', { length: 255 }),
-  phone: varchar('phone', { length: 50 }),
+  phone: varchar('phone', { length: 255 }),
   isActive: boolean('is_active').default(true),
   createdAt: timestamp('created_at').defaultNow(),
 });
@@ -63,6 +62,8 @@ export const events = mysqlTable(
     name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
     date: timestamp('date').notNull(),
     location: varchar('location', { length: 255 }),
+    ticketsAvailableFrom: timestamp('tickets_available_from'),
+    consumptionsAvailableFrom: timestamp('consumptions_available_from'),
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
   },
@@ -94,6 +95,7 @@ export const tickets = mysqlTable(
     ticketTypeId: varchar('ticket_type_id', { length: 36 }).notNull().references(() => ticketTypes.id),
     eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    saleId: varchar('sale_id', { length: 36 }).references(() => sales.id),
     qrHash: varchar('qr_hash', { length: 255 }).notNull().unique(),
     status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).default('PENDING'),
     buyerName: varchar('buyer_name', { length: 255 }),
@@ -107,6 +109,7 @@ export const tickets = mysqlTable(
     tenantIdIdx: index('tickets_tenant_id_idx').on(table.tenantId),
     eventTenantIdx: index('tickets_event_tenant_idx').on(table.eventId, table.tenantId),
     customerIdx: index('tickets_customer_id_idx').on(table.customerId),
+    saleIdIdx: index('tickets_sale_id_idx').on(table.saleId),
   })
 );
 
@@ -339,6 +342,7 @@ export const sales = mysqlTable(
     barId: varchar('bar_id', { length: 36 }).references(() => bars.id),
     staffId: varchar('staff_id', { length: 36 }).references(() => staff.id), // Quién cobró
     customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+    receiptToken: varchar('receipt_token', { length: 36 }).notNull().unique(),
     source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
     totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
     paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),

@@ -542,6 +542,7 @@ export const inventoryRoute = new Hono()
           tenantId,
           barId: saleBarId,
           staffId: ctx.staff.id,
+          receiptToken: randomUUID(),
           totalAmount: decToDb(total),
           paymentMethod: body.paymentMethod,
           status: "COMPLETED",

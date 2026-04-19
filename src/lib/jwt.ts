@@ -2,17 +2,17 @@ import * as jwt from "jsonwebtoken"
 
 const secret = () => process.env.JWT_SECRET ?? "fallback-secret"
 
-export type TokenAudience = "staff" | "customer"
+export type TokenAudience = "staff"
 
 export type AccessTokenPayload = {
   sub: string
   aud: TokenAudience
 }
 
-export function createAccessToken(sub: string, aud: TokenAudience): Promise<string> {
+export function createAccessToken(sub: string, _aud: TokenAudience = "staff"): Promise<string> {
   return new Promise((resolve, reject) => {
     jwt.sign(
-      { sub, aud },
+      { sub, aud: "staff" as const },
       secret(),
       { expiresIn: "365d" },
       (err, token) => {
@@ -37,9 +37,8 @@ export function verifyToken(token: string): Promise<AccessTokenPayload> {
               ? d.id
               : null
         if (!sub) reject(new Error("Token sin sujeto"))
-        const audRaw = d.aud
-        const aud: TokenAudience = audRaw === "customer" ? "customer" : "staff"
-        resolve({ sub, aud })
+        if (d.aud !== "staff") reject(new Error("Token inválido"))
+        resolve({ sub, aud: "staff" })
       }
     })
   })

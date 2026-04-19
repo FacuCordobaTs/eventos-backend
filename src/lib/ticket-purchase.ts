@@ -11,6 +11,10 @@ export type PurchaseErrorCode =
   | "OUT_OF_STOCK"
   | "EVENT_INACTIVE"
   | "PRODUCT_NOT_FOUND"
+  | "TICKETS_NOT_YET_AVAILABLE"
+  | "CONSUMPTIONS_NOT_YET_AVAILABLE"
+  | "CHECKOUT_TOTAL_MISMATCH"
+  | "EMPTY_CART"
 
 export class PurchaseError extends Error {
   readonly code: PurchaseErrorCode
@@ -49,6 +53,8 @@ export type PurchaseParams = {
   buyerEmail: string
   /** App B2B2C: vincula la entrada al cliente. */
   customerId?: string
+  /** Venta web/POS que agrupa entradas de esta compra. */
+  saleId?: string
   /** Staff flows: must match event tenant. Omit for public (tenant taken from event). */
   enforceTenantId?: string
 }
@@ -118,6 +124,7 @@ export async function executeTicketPurchase(
     buyerName: params.buyerName,
     buyerEmail: params.buyerEmail,
     ...(params.customerId !== undefined ? { customerId: params.customerId } : {}),
+    ...(params.saleId !== undefined ? { saleId: params.saleId } : {}),
     createdAt: new Date(),
   })
 
@@ -151,6 +158,20 @@ export function purchaseErrorStatus(
       }
     case "PRODUCT_NOT_FOUND":
       return { status: 404, body: { error: "Producto no disponible" } }
+    case "TICKETS_NOT_YET_AVAILABLE":
+      return {
+        status: 403,
+        body: { error: "La venta de entradas aún no está habilitada" },
+      }
+    case "CONSUMPTIONS_NOT_YET_AVAILABLE":
+      return {
+        status: 403,
+        body: { error: "La venta de consumos aún no está habilitada" },
+      }
+    case "CHECKOUT_TOTAL_MISMATCH":
+      return { status: 400, body: { error: "El total no coincide con el servidor" } }
+    case "EMPTY_CART":
+      return { status: 400, body: { error: "El carrito está vacío" } }
     default:
       return { status: 500, body: { error: "Error al procesar la compra" } }
   }

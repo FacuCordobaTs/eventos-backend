@@ -92,6 +92,20 @@
       "when": 1776123225465,
       "tag": "0012_plain_black_bolt",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "5",
+      "when": 1776200000000,
+      "tag": "0013_guest_checkout_magic_receipt",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "5",
+      "when": 1776560322365,
+      "tag": "0014_faulty_tyrannus",
+      "breakpoints": true
     }
   ]
 }

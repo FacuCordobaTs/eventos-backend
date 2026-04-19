@@ -5,8 +5,6 @@ import { staffRoute } from "./routes/staff"
 import { eventsRoute } from "./routes/events"
 import { ticketsRoute } from "./routes/tickets"
 import { publicRoute } from "./routes/public"
-import { authClientRoute } from "./routes/auth-client"
-import { meRoute } from "./routes/me"
 import { inventoryRoute } from "./routes/inventory"
 import { analyticsRoute } from "./routes/analytics"
 import { barsRoute } from "./routes/bars"
@@ -39,8 +37,6 @@ app.route("/staff", staffRoute)
 app.route("/events", eventsRoute)
 app.route("/tickets", ticketsRoute)
 app.route("/public", publicRoute)
-app.route("/client/auth", authClientRoute)
-app.route("/me", meRoute)
 app.route("/inventory", inventoryRoute)
 app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)

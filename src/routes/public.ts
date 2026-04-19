@@ -3,21 +3,19 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, products, tenants, ticketTypes, tickets } from "../db/schema"
-import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
 import {
-  executeTicketPurchase,
-  PurchaseError,
-  purchaseErrorStatus,
-} from "../lib/ticket-purchase"
-import { qrCodeDataUrl } from "../lib/qr"
-
-const purchaseSchema = z.object({
-  eventId: z.string().min(1),
-  ticketTypeId: z.string().min(1),
-  buyerName: z.string().min(1).max(255),
-  buyerEmail: z.string().email(),
-})
+  digitalConsumptions,
+  eventProducts,
+  events,
+  products,
+  sales,
+  tenants,
+  ticketTypes,
+  tickets,
+} from "../db/schema"
+import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
+import { executeClientCheckout } from "../lib/client-checkout"
+import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -36,6 +34,33 @@ async function countIssued(
     )
   return Number(row?.n ?? 0)
 }
+
+const guestCheckoutSchema = z.object({
+  eventId: z.string().min(1),
+  paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER"]),
+  clientTotal: z.string().min(1),
+  contact: z.object({
+    name: z.string().min(1).max(255),
+    email: z.string().email(),
+    phone: z.string().min(1).max(255),
+  }),
+  ticketLines: z
+    .array(
+      z.object({
+        ticketTypeId: z.string().min(1),
+        quantity: z.number().int().positive(),
+      })
+    )
+    .default([]),
+  drinkLines: z
+    .array(
+      z.object({
+        productId: z.string().min(1),
+        quantity: z.number().int().positive(),
+      })
+    )
+    .default([]),
+})
 
 export const publicRoute = new Hono()
   .get("/events", async (c) => {
@@ -97,14 +122,24 @@ export const publicRoute = new Hono()
         and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, ev.tenantId))
       )
 
-    const drinkProducts = await db
+    const consumptionRows = await db
       .select({
         id: products.id,
         name: products.name,
-        price: products.price,
+        priceOverride: eventProducts.priceOverride,
+        basePrice: products.price,
       })
-      .from(products)
-      .where(and(eq(products.tenantId, ev.tenantId), eq(products.isActive, true)))
+      .from(eventProducts)
+      .innerJoin(products, eq(eventProducts.productId, products.id))
+      .where(
+        and(
+          eq(eventProducts.eventId, eventId),
+          eq(eventProducts.tenantId, ev.tenantId),
+          eq(eventProducts.isActive, true),
+          eq(products.tenantId, ev.tenantId),
+          eq(products.isActive, true)
+        )
+      )
       .orderBy(products.name)
 
     const ticketTypesOut = []
@@ -123,6 +158,15 @@ export const publicRoute = new Hono()
       })
     }
 
+    const drinkProducts = consumptionRows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      price:
+        r.priceOverride != null && r.priceOverride !== ""
+          ? r.priceOverride
+          : r.basePrice,
+    }))
+
     return c.json({
       productora: {
         id: ev.tenantId,
@@ -133,40 +177,38 @@ export const publicRoute = new Hono()
         name: ev.name,
         date: ev.date,
         location: ev.location,
+        ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
+        consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },
       ticketTypes: ticketTypesOut,
       drinkProducts,
     })
   })
-  .post("/tickets/purchase", zValidator("json", purchaseSchema), async (c) => {
+  .post("/checkout", zValidator("json", guestCheckoutSchema), async (c) => {
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
     try {
       const result = await db.transaction(async (tx) =>
-        executeTicketPurchase(tx, {
+        executeClientCheckout(tx, {
           eventId: body.eventId,
-          ticketTypeId: body.ticketTypeId,
-          buyerName: body.buyerName.trim(),
-          buyerEmail: body.buyerEmail.trim(),
+          contact: {
+            name: body.contact.name,
+            email: body.contact.email,
+            phone: body.contact.phone,
+          },
+          paymentMethod: body.paymentMethod,
+          clientTotal: body.clientTotal.trim(),
+          ticketLines: body.ticketLines ?? [],
+          drinkLines: body.drinkLines ?? [],
         })
       )
 
-      const qrDataUrl = await qrCodeDataUrl(result.ticket.qrHash)
-
       return c.json(
         {
-          message: "Compra exitosa",
-          ticket: {
-            id: result.ticket.id,
-            qrHash: result.ticket.qrHash,
-            status: result.ticket.status,
-            buyerName: result.ticket.buyerName,
-            buyerEmail: result.ticket.buyerEmail,
-            ticketTypeName: result.ticketTypeName,
-          },
-          qrDataUrl,
-          payment: { status: "completed" as const, method: "mock" as const },
+          message: "Compra registrada",
+          receiptToken: result.receiptToken,
+          saleId: result.saleId,
         },
         201
       )
@@ -177,4 +219,92 @@ export const publicRoute = new Hono()
       }
       throw e
     }
+  })
+  .get("/receipts/:token", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const [header] = await db
+      .select({
+        sale: sales,
+        eventName: events.name,
+        eventDate: events.date,
+        eventLocation: events.location,
+        productoraName: tenants.name,
+      })
+      .from(sales)
+      .innerJoin(events, eq(sales.eventId, events.id))
+      .innerJoin(tenants, eq(sales.tenantId, tenants.id))
+      .where(eq(sales.receiptToken, token))
+      .limit(1)
+
+    if (!header) {
+      return c.json({ error: "Comprobante no encontrado" }, 404)
+    }
+
+    const saleId = header.sale.id
+
+    const [ticketRows, consumptionRows] = await Promise.all([
+      db
+        .select({
+          id: tickets.id,
+          qrHash: tickets.qrHash,
+          status: tickets.status,
+          ticketTypeName: ticketTypes.name,
+          ticketTypePrice: ticketTypes.price,
+        })
+        .from(tickets)
+        .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+        .where(
+          and(eq(tickets.saleId, saleId), eq(tickets.tenantId, header.sale.tenantId))
+        )
+        .orderBy(ticketTypes.name, tickets.createdAt),
+      db
+        .select({
+          id: digitalConsumptions.id,
+          qrHash: digitalConsumptions.qrHash,
+          status: digitalConsumptions.status,
+          productId: digitalConsumptions.productId,
+          productName: products.name,
+          productPrice: products.price,
+        })
+        .from(digitalConsumptions)
+        .innerJoin(products, eq(digitalConsumptions.productId, products.id))
+        .where(
+          and(
+            eq(digitalConsumptions.saleId, saleId),
+            eq(digitalConsumptions.tenantId, header.sale.tenantId)
+          )
+        )
+        .orderBy(products.name, digitalConsumptions.createdAt),
+    ])
+
+    return c.json({
+      receiptToken: header.sale.receiptToken,
+      sale: {
+        id: header.sale.id,
+        totalAmount: header.sale.totalAmount,
+        paymentMethod: header.sale.paymentMethod,
+        createdAt: header.sale.createdAt,
+      },
+      event: {
+        id: header.sale.eventId,
+        name: header.eventName,
+        date: header.eventDate,
+        location: header.eventLocation,
+      },
+      productora: { name: header.productoraName },
+      tickets: ticketRows.map((r) => ({
+        id: r.id,
+        qrHash: r.qrHash,
+        status: r.status,
+        ticketType: { name: r.ticketTypeName, price: r.ticketTypePrice },
+      })),
+      consumptions: consumptionRows.map((r) => ({
+        id: r.id,
+        qrHash: r.qrHash,
+        status: r.status,
+        product: { id: r.productId, name: r.productName, price: r.productPrice },
+      })),
+    })
   })
