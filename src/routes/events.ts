@@ -102,6 +102,13 @@ const createEventInsumoSchema = z.object({
       z.string().regex(/^\d+(\.\d{1,2})?$/),
     ])
     .optional(),
+  defaultContentValue: z
+    .union([
+      z.number().nonnegative(),
+      z.string().regex(/^\d+(\.\d{1,2})?$/),
+    ])
+    .optional(),
+  defaultContentUnit: z.enum(["ML", "UNIDAD", "GRAMOS"]).optional(),
 })
 
 const createBarSchema = z.object({
@@ -823,6 +830,8 @@ export const eventsRoute = new Hono()
         id: inventoryItems.id,
         name: inventoryItems.name,
         unit: inventoryItems.unit,
+        defaultContentValue: inventoryItems.defaultContentValue,
+        defaultContentUnit: inventoryItems.defaultContentUnit,
         eventInventoryId: eventInventory.id,
         stockAllocated: eventInventory.stockAllocated,
       })
@@ -843,6 +852,8 @@ export const eventsRoute = new Hono()
         id: r.id,
         name: r.name,
         unit: r.unit,
+        defaultContentValue: r.defaultContentValue,
+        defaultContentUnit: r.defaultContentUnit,
         eventInventoryId: r.eventInventoryId ?? null,
         stockAllocated:
           r.stockAllocated == null ? "0.00" : String(r.stockAllocated),
@@ -935,6 +946,12 @@ export const eventsRoute = new Hono()
           ? decToDb(dec(body.initialStock))
           : "0.00"
 
+      const defaultValStr =
+        body.defaultContentValue !== undefined
+          ? decToDb(dec(body.defaultContentValue))
+          : "0.00"
+      const defaultUnit = body.defaultContentUnit ?? "ML"
+
       const itemId = uuidv4()
       const evInvId = uuidv4()
 
@@ -944,6 +961,8 @@ export const eventsRoute = new Hono()
           tenantId,
           name: body.name.trim(),
           unit: body.unit,
+          defaultContentValue: defaultValStr,
+          defaultContentUnit: defaultUnit,
         })
         await tx.insert(eventInventory).values({
           id: evInvId,
@@ -961,6 +980,8 @@ export const eventsRoute = new Hono()
             id: itemId,
             name: body.name.trim(),
             unit: body.unit,
+            defaultContentValue: defaultValStr,
+            defaultContentUnit: defaultUnit,
             eventInventoryId: evInvId,
             stockAllocated: initialStr,
           },

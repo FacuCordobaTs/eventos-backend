@@ -122,6 +122,13 @@ export const inventoryItems = mysqlTable('inventory_items', {
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   name: varchar('name', { length: 255 }).notNull(),
   unit: mysqlEnum('unit', ['ML', 'UNIDAD', 'GRAMOS']).notNull(), // Para saber si descontar mililitros o latas
+  /** Tamaño estándar de una unidad física (ej. 750 ml por botella) para carga y venta por botella. */
+  defaultContentValue: decimal('default_content_value', { precision: 10, scale: 2 })
+    .notNull()
+    .default('0'),
+  defaultContentUnit: mysqlEnum('default_content_unit', ['ML', 'GRAMOS', 'UNIDAD'])
+    .notNull()
+    .default('ML'),
 });
 
 export const eventInventory = mysqlTable(
@@ -157,6 +164,8 @@ export const products = mysqlTable('products', {
   name: varchar('name', { length: 255 }).notNull(),
   price: decimal('price', { precision: 10, scale: 2 }).notNull(),
   isActive: boolean('is_active').default(true),
+  /** GLASS: la receta descuenta quantityUsed en la unidad del insumo; BOTTLE: quantityUsed es botellas × tamaño estándar. */
+  saleType: mysqlEnum('sale_type', ['BOTTLE', 'GLASS']).notNull().default('GLASS'),
 });
 
 export const eventProducts = mysqlTable(

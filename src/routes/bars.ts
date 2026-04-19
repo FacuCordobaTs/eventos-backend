@@ -21,6 +21,7 @@ import {
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import { recipeStockDeduction } from "../lib/inventory-deduction"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -457,6 +458,7 @@ export const barsRoute = new Hono()
             consumption: digitalConsumptions,
             sale: sales,
             productName: products.name,
+            productSaleType: products.saleType,
           })
           .from(digitalConsumptions)
           .innerJoin(sales, eq(digitalConsumptions.saleId, sales.id))
@@ -514,8 +516,31 @@ export const barsRoute = new Hono()
           .from(productRecipes)
           .where(eq(productRecipes.productId, row.consumption.productId))
 
+        const recipeInvIds = [...new Set(recipes.map((r) => r.inventoryItemId))]
+        const invRows =
+          recipeInvIds.length === 0
+            ? []
+            : await tx
+                .select()
+                .from(inventoryItems)
+                .where(
+                  and(
+                    inArray(inventoryItems.id, recipeInvIds),
+                    eq(inventoryItems.tenantId, tenantId)
+                  )
+                )
+        const invById = new Map(invRows.map((i) => [i.id, i]))
+        const saleType = row.productSaleType
+
         for (const r of recipes) {
-          const deduct = decFromDb(r.quantityUsed)
+          const item = invById.get(r.inventoryItemId)
+          if (!item) continue
+          const deduct = recipeStockDeduction(
+            r.quantityUsed,
+            1,
+            saleType,
+            item
+          )
           const [bRow] = await tx
             .select()
             .from(barInventory)

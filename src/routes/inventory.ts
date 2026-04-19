@@ -2,11 +2,12 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, eq, inArray } from "drizzle-orm"
+import { and, eq, inArray, ne, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import { randomUUID } from "node:crypto"
 import {
+  barInventory,
   bars,
   digitalConsumptions,
   eventInventory,
@@ -19,6 +20,10 @@ import {
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import {
+  bottleLoadStockDelta,
+  recipeStockDeduction,
+} from "../lib/inventory-deduction"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
@@ -29,11 +34,45 @@ function requireTenantId(ctx: AuthenticatedContext): string | null {
 
 const unitSchema = z.enum(["ML", "UNIDAD", "GRAMOS"])
 
+const contentUnitSchema = z.enum(["ML", "UNIDAD", "GRAMOS"])
+
 const upsertItemSchema = z.object({
   id: z.string().min(1).optional(),
   name: z.string().min(1).max(255),
   unit: unitSchema,
+  defaultContentValue: z
+    .union([
+      z.number().nonnegative(),
+      z.string().regex(/^\d+(\.\d{1,2})?$/),
+    ])
+    .optional(),
+  defaultContentUnit: contentUnitSchema.optional(),
 })
+
+const loadBottlesSchema = z
+  .object({
+    inventoryItemId: z.string().min(1),
+    quantityOfBottles: z.coerce.number().int().positive(),
+    customContentValue: z
+      .union([
+        z.coerce.number().positive(),
+        z.string().regex(/^\d+(\.\d{1,4})?$/),
+      ])
+      .optional(),
+    eventId: z.string().min(1).optional(),
+    barId: z.string().min(1).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const hasE = data.eventId != null && data.eventId !== ""
+    const hasB = data.barId != null && data.barId !== ""
+    if (hasE === hasB) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Indicá exactamente eventId o barId",
+        path: ["eventId"],
+      })
+    }
+  })
 
 const recipeLineSchema = z.object({
   inventoryItemId: z.string().min(1),
@@ -42,11 +81,14 @@ const recipeLineSchema = z.object({
     .transform((v) => (typeof v === "number" ? String(v) : v)),
 })
 
+const saleTypeSchema = z.enum(["BOTTLE", "GLASS"])
+
 const createProductSchema = z.object({
   name: z.string().min(1).max(255),
   price: z
     .union([z.string().regex(/^\d+(\.\d{1,2})?$/), z.number().nonnegative()])
     .transform((v) => (typeof v === "number" ? v.toFixed(2) : v)),
+  saleType: saleTypeSchema.optional().default("GLASS"),
   recipes: z.array(recipeLineSchema).default([]),
 })
 
@@ -68,6 +110,22 @@ const createSaleSchema = z.object({
     )
     .min(1),
 })
+
+function normalizeDefaultContent(body: z.infer<typeof upsertItemSchema>): {
+  defaultContentValue: string
+  defaultContentUnit: "ML" | "UNIDAD" | "GRAMOS"
+} {
+  const raw =
+    body.defaultContentValue === undefined
+      ? "0"
+      : typeof body.defaultContentValue === "number"
+        ? body.defaultContentValue
+        : body.defaultContentValue
+  return {
+    defaultContentValue: decToDb(dec(raw)),
+    defaultContentUnit: body.defaultContentUnit ?? "ML",
+  }
+}
 
 export class InsufficientStockError extends Error {
   constructor(
@@ -98,6 +156,8 @@ export const inventoryRoute = new Hono()
       id: r.id,
       name: r.name,
       unit: r.unit,
+      defaultContentValue: r.defaultContentValue,
+      defaultContentUnit: r.defaultContentUnit,
     }))
 
     return c.json({ items })
@@ -122,11 +182,14 @@ export const inventoryRoute = new Hono()
       if (!existing) {
         return c.json({ error: "Ítem no encontrado" }, 404)
       }
+      const dc = normalizeDefaultContent(body)
       await db
         .update(inventoryItems)
         .set({
           name: body.name,
           unit: body.unit,
+          defaultContentValue: dc.defaultContentValue,
+          defaultContentUnit: dc.defaultContentUnit,
         })
         .where(eq(inventoryItems.id, body.id))
       const [row] = await db
@@ -139,16 +202,21 @@ export const inventoryRoute = new Hono()
           id: row!.id,
           name: row!.name,
           unit: row!.unit,
+          defaultContentValue: row!.defaultContentValue,
+          defaultContentUnit: row!.defaultContentUnit,
         },
       })
     }
 
     const id = uuidv4()
+    const dc = normalizeDefaultContent(body)
     await db.insert(inventoryItems).values({
       id,
       tenantId,
       name: body.name,
       unit: body.unit,
+      defaultContentValue: dc.defaultContentValue,
+      defaultContentUnit: dc.defaultContentUnit,
     })
     const [row] = await db
       .select()
@@ -161,6 +229,8 @@ export const inventoryRoute = new Hono()
           id: row!.id,
           name: row!.name,
           unit: row!.unit,
+          defaultContentValue: row!.defaultContentValue,
+          defaultContentUnit: row!.defaultContentUnit,
         },
       },
       201
@@ -217,6 +287,7 @@ export const inventoryRoute = new Hono()
         name: p.name,
         price: p.price,
         isActive: p.isActive,
+        saleType: p.saleType,
         recipes: (byProduct.get(p.id) ?? []).map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -262,6 +333,7 @@ export const inventoryRoute = new Hono()
         name: body.name,
         price: priceStr,
         isActive: true,
+        saleType: body.saleType,
       })
       if (body.recipes.length > 0) {
         await tx.insert(productRecipes).values(
@@ -302,6 +374,7 @@ export const inventoryRoute = new Hono()
           name: p!.name,
           price: p!.price,
           isActive: p!.isActive,
+          saleType: p!.saleType,
           recipes: recipes.map((r) => ({
             id: r.id,
             inventoryItemId: r.inventoryItemId,
@@ -354,7 +427,7 @@ export const inventoryRoute = new Hono()
     await db.transaction(async (tx) => {
       await tx
         .update(products)
-        .set({ name: body.name, price: priceStr })
+        .set({ name: body.name, price: priceStr, saleType: body.saleType })
         .where(eq(products.id, productId))
       await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
       if (body.recipes.length > 0) {
@@ -395,6 +468,7 @@ export const inventoryRoute = new Hono()
         name: p!.name,
         price: p!.price,
         isActive: p!.isActive,
+        saleType: p!.saleType,
         recipes: recipes.map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -403,6 +477,189 @@ export const inventoryRoute = new Hono()
           inventoryUnit: r.inventoryUnit,
         })),
       },
+    })
+  })
+  .post("/load-bottles", zValidator("json", loadBottlesSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const [item] = await db
+      .select()
+      .from(inventoryItems)
+      .where(
+        and(
+          eq(inventoryItems.id, body.inventoryItemId),
+          eq(inventoryItems.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!item) {
+      return c.json({ error: "Ítem de inventario no encontrado" }, 404)
+    }
+
+    const customStr =
+      body.customContentValue === undefined
+        ? null
+        : typeof body.customContentValue === "number"
+          ? decToDb(dec(body.customContentValue))
+          : decToDb(dec(String(body.customContentValue).replace(",", ".")))
+
+    const { delta, error: deltaErr } = bottleLoadStockDelta(
+      item,
+      body.quantityOfBottles,
+      customStr
+    )
+    if (deltaErr) {
+      return c.json({ error: deltaErr }, 400)
+    }
+    if (!delta.gt(0)) {
+      return c.json({ error: "La cantidad a sumar debe ser mayor que 0" }, 400)
+    }
+
+    const deltaStr = decToDb(delta)
+
+    if (body.eventId) {
+      const [ev] = await db
+        .select({ id: events.id })
+        .from(events)
+        .where(and(eq(events.id, body.eventId), eq(events.tenantId, tenantId)))
+        .limit(1)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const [evInv] = await db
+        .select()
+        .from(eventInventory)
+        .where(
+          and(
+            eq(eventInventory.eventId, body.eventId),
+            eq(eventInventory.inventoryItemId, body.inventoryItemId),
+            eq(eventInventory.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      const next = (evInv ? decFromDb(evInv.stockAllocated) : dec(0)).plus(delta)
+      await db
+        .insert(eventInventory)
+        .values({
+          id: uuidv4(),
+          eventId: body.eventId,
+          inventoryItemId: body.inventoryItemId,
+          tenantId,
+          stockAllocated: decToDb(next),
+          createdAt: new Date(),
+        })
+        .onDuplicateKeyUpdate({
+          set: { stockAllocated: decToDb(next) },
+        })
+
+      void emitCommittedStockDeltas(tenantId, body.eventId, {
+        eventItemIds: [body.inventoryItemId],
+      })
+
+      return c.json({
+        ok: true,
+        stockAdded: deltaStr,
+        stockAllocated: decToDb(next),
+      })
+    }
+
+    const barId = body.barId!
+    const [bar] = await db
+      .select()
+      .from(bars)
+      .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+      .limit(1)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+
+    const [evInv] = await db
+      .select()
+      .from(eventInventory)
+      .where(
+        and(
+          eq(eventInventory.eventId, bar.eventId),
+          eq(eventInventory.inventoryItemId, body.inventoryItemId),
+          eq(eventInventory.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    const cap = evInv ? decFromDb(evInv.stockAllocated) : dec(0)
+
+    const [bRow] = await db
+      .select()
+      .from(barInventory)
+      .where(
+        and(
+          eq(barInventory.barId, barId),
+          eq(barInventory.inventoryItemId, body.inventoryItemId),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    const curBar = bRow ? decFromDb(bRow.currentStock) : dec(0)
+    const nextBar = curBar.plus(delta)
+
+    const [sumOthersRow] = await db
+      .select({
+        s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+      })
+      .from(barInventory)
+      .innerJoin(bars, eq(barInventory.barId, bars.id))
+      .where(
+        and(
+          eq(bars.eventId, bar.eventId),
+          eq(bars.tenantId, tenantId),
+          eq(barInventory.tenantId, tenantId),
+          eq(barInventory.inventoryItemId, body.inventoryItemId),
+          ne(barInventory.barId, barId)
+        )
+      )
+
+    const others = decFromDb(sumOthersRow?.s ?? "0")
+    if (others.plus(nextBar).gt(cap)) {
+      return c.json(
+        {
+          error:
+            "El stock en barras no puede superar el stock asignado al evento para este insumo.",
+        },
+        400
+      )
+    }
+
+    if (bRow) {
+      await db
+        .update(barInventory)
+        .set({ currentStock: decToDb(nextBar) })
+        .where(
+          and(eq(barInventory.id, bRow.id), eq(barInventory.tenantId, tenantId))
+        )
+    } else {
+      await db.insert(barInventory).values({
+        id: uuidv4(),
+        barId,
+        inventoryItemId: body.inventoryItemId,
+        tenantId,
+        currentStock: decToDb(nextBar),
+      })
+    }
+
+    void emitCommittedStockDeltas(tenantId, bar.eventId, {
+      barDeltas: { barId, itemIds: [body.inventoryItemId] },
+    })
+
+    return c.json({
+      ok: true,
+      stockAdded: deltaStr,
+      currentStock: decToDb(nextBar),
     })
   })
   .post("/sales", zValidator("json", createSaleSchema), async (c) => {
@@ -473,11 +730,35 @@ export const inventoryRoute = new Hono()
           .from(productRecipes)
           .where(inArray(productRecipes.productId, productIds))
 
+        const recipeInvIds = [...new Set(recipeRows.map((r) => r.inventoryItemId))]
+        const invForRecipes =
+          recipeInvIds.length === 0
+            ? []
+            : await tx
+                .select()
+                .from(inventoryItems)
+                .where(
+                  and(
+                    inArray(inventoryItems.id, recipeInvIds),
+                    eq(inventoryItems.tenantId, tenantId)
+                  )
+                )
+        const invById = new Map(invForRecipes.map((i) => [i.id, i]))
+
         const needs = new Map<string, ReturnType<typeof dec>>()
         for (const line of body.items) {
+          const p = prodRows.find((x) => x.id === line.productId)!
+          const saleType = p.saleType
           const lines = recipeRows.filter((r) => r.productId === line.productId)
           for (const r of lines) {
-            const add = decFromDb(r.quantityUsed).times(line.quantity)
+            const item = invById.get(r.inventoryItemId)
+            if (!item) continue
+            const add = recipeStockDeduction(
+              r.quantityUsed,
+              line.quantity,
+              saleType,
+              item
+            )
             const prev = needs.get(r.inventoryItemId) ?? dec(0)
             needs.set(r.inventoryItemId, prev.plus(add))
           }
