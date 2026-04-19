@@ -27,7 +27,7 @@ app.use(
       "https://totem-admin-9hw.pages.dev",
       "https://totem-client.pages.dev",
       "https://my.totem.uno",
-      "admin.totem.uno"
+      "https://admin.totem.uno"
     ],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
