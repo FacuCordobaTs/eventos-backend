@@ -25,6 +25,7 @@ app.use(
       "http://localhost:5173",
       "http://127.0.0.1:5173",
       "https://totem-admin-9hw.pages.dev",
+      "https://totem-client.pages.dev"
     ],
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
