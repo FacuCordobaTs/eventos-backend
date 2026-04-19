@@ -127,6 +127,13 @@
       "when": 1776700000000,
       "tag": "0017_inventory_base_unit_package",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "5",
+      "when": 1776800000000,
+      "tag": "0018_inventory_items_is_active",
+      "breakpoints": true
     }
   ]
 }

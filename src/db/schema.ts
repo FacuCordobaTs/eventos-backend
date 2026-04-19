@@ -125,6 +125,7 @@ export const inventoryItems = mysqlTable('inventory_items', {
   baseUnit: mysqlEnum('base_unit', ['ML', 'GRAMS', 'UNIT']).notNull(),
   /** Cantidad de `baseUnit` por envase físico (ej. 750 ml por botella). 0 = sin envase fijo. */
   packageSize: decimal('package_size', { precision: 10, scale: 2 }).notNull().default('0'),
+  isActive: boolean('is_active').notNull().default(true),
 });
 
 export const eventInventory = mysqlTable(

@@ -22,7 +22,20 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { and, asc, count, desc, eq, exists, inArray, ne, sql, sum } from "drizzle-orm"
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  exists,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+  sum,
+} from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
@@ -527,63 +540,157 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
-    const [ticketsRow] = await db
-      .select({ n: count() })
-      .from(tickets)
-      .where(
-        and(
-          eq(tickets.eventId, eventId),
-          eq(tickets.tenantId, tenantId),
-          ne(tickets.status, "CANCELLED")
-        )
-      )
+    const canViewFinancials =
+      ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER"
 
-    const [revenueRow] = await db
-      .select({
-        total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
-      })
-      .from(sales)
-      .where(
-        and(
-          eq(sales.eventId, eventId),
-          eq(sales.tenantId, tenantId),
-          eq(sales.status, "COMPLETED")
-        )
-      )
+    const ticketFilters = and(
+      eq(tickets.eventId, eventId),
+      eq(tickets.tenantId, tenantId),
+      ne(tickets.status, "CANCELLED")
+    )
 
-    /** Ingresos solo por ítems de catálogo (barras/consumos); excluye el valor de entradas en ventas mixtas. */
-    const [barProductRevenueRow] = await db
-      .select({
-        total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
-      })
-      .from(saleItems)
-      .innerJoin(sales, eq(saleItems.saleId, sales.id))
-      .where(
-        and(
-          eq(sales.eventId, eventId),
-          eq(sales.tenantId, tenantId),
-          eq(sales.status, "COMPLETED")
-        )
-      )
+    const [
+      ticketsRow,
+      ticketsUsedRow,
+      ticketRevenueRow,
+      revenueRow,
+      barProductRevenueRow,
+      consumptionsRow,
+      consumptionsRedeemedRow,
+      typeLimitRows,
+      expenseRow,
+    ] = await Promise.all([
+      db
+        .select({ n: count() })
+        .from(tickets)
+        .where(ticketFilters),
+      db
+        .select({ n: count() })
+        .from(tickets)
+        .where(
+          and(
+            eq(tickets.eventId, eventId),
+            eq(tickets.tenantId, tenantId),
+            eq(tickets.status, "USED")
+          )
+        ),
+      db
+        .select({
+          total: sql<string>`coalesce(sum(cast(${ticketTypes.price} as decimal(14,2))), 0)`,
+        })
+        .from(tickets)
+        .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+        .where(ticketFilters),
+      db
+        .select({
+          total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
+        })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.eventId, eventId),
+            eq(sales.tenantId, tenantId),
+            eq(sales.status, "COMPLETED")
+          )
+        ),
+      db
+        .select({
+          total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+        })
+        .from(saleItems)
+        .innerJoin(sales, eq(saleItems.saleId, sales.id))
+        .where(
+          and(
+            eq(sales.eventId, eventId),
+            eq(sales.tenantId, tenantId),
+            eq(sales.status, "COMPLETED")
+          )
+        ),
+      db
+        .select({ n: count() })
+        .from(digitalConsumptions)
+        .where(
+          and(
+            eq(digitalConsumptions.eventId, eventId),
+            eq(digitalConsumptions.tenantId, tenantId),
+            ne(digitalConsumptions.status, "CANCELLED")
+          )
+        ),
+      db
+        .select({ n: count() })
+        .from(digitalConsumptions)
+        .where(
+          and(
+            eq(digitalConsumptions.eventId, eventId),
+            eq(digitalConsumptions.tenantId, tenantId),
+            eq(digitalConsumptions.status, "REDEEMED")
+          )
+        ),
+      db
+        .select({ stockLimit: ticketTypes.stockLimit })
+        .from(ticketTypes)
+        .where(
+          and(
+            eq(ticketTypes.eventId, eventId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        ),
+      canViewFinancials
+        ? db
+            .select({
+              total: sql<string>`coalesce(sum(cast(${eventExpenses.amount} as decimal(14,2))), 0)`,
+            })
+            .from(eventExpenses)
+            .where(
+              and(
+                eq(eventExpenses.eventId, eventId),
+                eq(eventExpenses.tenantId, tenantId)
+              )
+            )
+        : Promise.resolve([{ total: "0" }] as { total: string }[]),
+    ])
 
-    const [consumptionsRow] = await db
-      .select({ n: count() })
-      .from(digitalConsumptions)
-      .where(
-        and(
-          eq(digitalConsumptions.eventId, eventId),
-          eq(digitalConsumptions.tenantId, tenantId),
-          ne(digitalConsumptions.status, "CANCELLED")
+    const ticketsSold = Number(ticketsRow?.n ?? 0)
+    const ticketsCheckedIn = Number(ticketsUsedRow?.n ?? 0)
+    const ticketRevenueDec = decFromDb(ticketRevenueRow?.total ?? "0")
+    const barSalesDec = decFromDb(revenueRow?.total ?? "0")
+    const grossDec = ticketRevenueDec.plus(barSalesDec)
+    const expensesDec = canViewFinancials
+      ? decFromDb(expenseRow[0]?.total ?? "0")
+      : dec(0)
+    const netDec = canViewFinancials ? grossDec.minus(expensesDec) : dec(0)
+
+    let ticketCapacity: number | null = null
+    if (typeLimitRows.length > 0) {
+      const unlimited = typeLimitRows.some((r) => r.stockLimit == null)
+      if (!unlimited) {
+        ticketCapacity = typeLimitRows.reduce(
+          (s, r) => s + (r.stockLimit ?? 0),
+          0
         )
-      )
+      }
+    }
+
+    const digitalGenerated = Number(consumptionsRow?.n ?? 0)
+    const digitalRedeemed = Number(consumptionsRedeemedRow?.n ?? 0)
 
     return c.json({
-      ticketsSold: Number(ticketsRow?.n ?? 0),
+      canViewFinancials,
+      ticketsSold,
+      ticketsCheckedIn,
+      ticketCapacity,
+      ticketRevenue: decToDb(ticketRevenueDec),
+      barSalesRevenue: decToDb(barSalesDec),
+      grossRevenue: decToDb(grossDec),
+      totalExpenses: canViewFinancials ? decToDb(expensesDec) : null,
+      netProfit: canViewFinancials ? decToDb(netDec) : null,
       totalRevenue: revenueRow?.total ?? "0.00",
       barProductRevenue: decToDb(
         decFromDb(barProductRevenueRow?.total ?? "0")
       ),
-      digitalConsumptionsSold: Number(consumptionsRow?.n ?? 0),
+      digitalConsumptionsSold: digitalGenerated,
+      digitalConsumptionsGenerated: digitalGenerated,
+      digitalConsumptionsRedeemed: digitalRedeemed,
     })
   })
   .get("/:id/bar-sales", async (c) => {
@@ -686,17 +793,6 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
-    const catalog = await db
-      .select({
-        id: products.id,
-        name: products.name,
-        price: products.price,
-        catalogIsActive: products.isActive,
-      })
-      .from(products)
-      .where(eq(products.tenantId, tenantId))
-      .orderBy(asc(products.name))
-
     const links = await db
       .select({
         productId: eventProducts.productId,
@@ -710,6 +806,27 @@ export const eventsRoute = new Hono()
           eq(eventProducts.tenantId, tenantId)
         )
       )
+
+    const linkedIds = [...new Set(links.map((l) => l.productId))]
+    const catalogListed = or(eq(products.isActive, true), isNull(products.isActive))
+    const catalogWhere =
+      linkedIds.length === 0
+        ? and(eq(products.tenantId, tenantId), catalogListed)
+        : and(
+            eq(products.tenantId, tenantId),
+            or(catalogListed, inArray(products.id, linkedIds))
+          )
+
+    const catalog = await db
+      .select({
+        id: products.id,
+        name: products.name,
+        price: products.price,
+        catalogIsActive: products.isActive,
+      })
+      .from(products)
+      .where(catalogWhere)
+      .orderBy(asc(products.name))
 
     const byProduct = new Map(
       links.map((r) => [
@@ -865,7 +982,12 @@ export const eventsRoute = new Hono()
           eq(eventInventory.tenantId, tenantId)
         )
       )
-      .where(eq(inventoryItems.tenantId, tenantId))
+      .where(
+        and(
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
+        )
+      )
       .orderBy(asc(inventoryItems.name))
 
     return c.json({
@@ -904,7 +1026,8 @@ export const eventsRoute = new Hono()
         .where(
           and(
             eq(inventoryItems.id, body.inventoryItemId),
-            eq(inventoryItems.tenantId, tenantId)
+            eq(inventoryItems.tenantId, tenantId),
+            eq(inventoryItems.isActive, true)
           )
         )
         .limit(1)
@@ -1002,6 +1125,7 @@ export const eventsRoute = new Hono()
           name: body.name.trim(),
           baseUnit: body.baseUnit,
           packageSize: pkgStr,
+          isActive: true,
         })
         await tx.insert(eventInventory).values({
           id: evInvId,
@@ -1774,7 +1898,8 @@ export const eventsRoute = new Hono()
         and(
           eq(eventInventory.eventId, eventId),
           eq(eventInventory.tenantId, tenantId),
-          eq(inventoryItems.tenantId, tenantId)
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
         )
       )
 
@@ -1800,6 +1925,7 @@ export const eventsRoute = new Hono()
               and(
                 eq(barInventory.tenantId, tenantId),
                 eq(inventoryItems.tenantId, tenantId),
+                eq(inventoryItems.isActive, true),
                 eq(bars.eventId, eventId),
                 eq(bars.tenantId, tenantId),
                 inArray(bars.id, barIds)

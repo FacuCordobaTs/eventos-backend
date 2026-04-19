@@ -2,17 +2,15 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, count, eq, inArray, ne, sql } from "drizzle-orm"
+import { and, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import { randomUUID } from "node:crypto"
 import {
   barInventory,
-  barProducts,
   bars,
   digitalConsumptions,
   eventInventory,
-  eventProducts,
   events,
   inventoryItems,
   productRecipes,
@@ -110,6 +108,8 @@ const createSaleSchema = z.object({
     .min(1),
 })
 
+const productListed = or(eq(products.isActive, true), isNull(products.isActive))
+
 function normalizePackageSize(body: z.infer<typeof upsertItemSchema>): string {
   const raw =
     body.packageSize === undefined
@@ -143,7 +143,9 @@ export const inventoryRoute = new Hono()
     const rows = await db
       .select()
       .from(inventoryItems)
-      .where(eq(inventoryItems.tenantId, tenantId))
+      .where(
+        and(eq(inventoryItems.tenantId, tenantId), eq(inventoryItems.isActive, true))
+      )
 
     const items = rows.map((r) => ({
       id: r.id,
@@ -173,6 +175,9 @@ export const inventoryRoute = new Hono()
         .limit(1)
       if (!existing) {
         return c.json({ error: "Ítem no encontrado" }, 404)
+      }
+      if (existing.isActive === false) {
+        return c.json({ error: "El insumo está desactivado." }, 400)
       }
       const pkg = normalizePackageSize(body)
       await db
@@ -206,6 +211,7 @@ export const inventoryRoute = new Hono()
       name: body.name,
       baseUnit: body.baseUnit,
       packageSize: pkg,
+      isActive: true,
     })
     const [row] = await db
       .select()
@@ -234,7 +240,7 @@ export const inventoryRoute = new Hono()
     const db = drizzle(pool)
 
     const [item] = await db
-      .select({ id: inventoryItems.id })
+      .select()
       .from(inventoryItems)
       .where(
         and(eq(inventoryItems.id, itemId), eq(inventoryItems.tenantId, tenantId))
@@ -242,6 +248,9 @@ export const inventoryRoute = new Hono()
       .limit(1)
     if (!item) {
       return c.json({ error: "Ítem no encontrado" }, 404)
+    }
+    if (item.isActive === false) {
+      return c.json({ ok: true, deactivated: true })
     }
 
     const [recipeRow] = await db
@@ -251,69 +260,31 @@ export const inventoryRoute = new Hono()
       .where(
         and(
           eq(productRecipes.inventoryItemId, itemId),
-          eq(products.tenantId, tenantId)
-        )
-      )
-
-    const [evRow] = await db
-      .select({ n: count() })
-      .from(eventInventory)
-      .where(
-        and(
-          eq(eventInventory.inventoryItemId, itemId),
-          eq(eventInventory.tenantId, tenantId)
-        )
-      )
-
-    const [barRow] = await db
-      .select({ n: count() })
-      .from(barInventory)
-      .where(
-        and(
-          eq(barInventory.inventoryItemId, itemId),
-          eq(barInventory.tenantId, tenantId)
+          eq(products.tenantId, tenantId),
+          productListed
         )
       )
 
     const nRecipes = Number(recipeRow?.n ?? 0)
-    const nEvents = Number(evRow?.n ?? 0)
-    const nBars = Number(barRow?.n ?? 0)
 
     if (nRecipes > 0) {
       return c.json(
         {
           error:
-            "No se puede eliminar: el insumo está en una o más recetas. Quitá esas líneas primero.",
-        },
-        400
-      )
-    }
-    if (nEvents > 0) {
-      return c.json(
-        {
-          error:
-            "No se puede eliminar: el insumo está asignado a uno o más eventos. Sacalo del inventario de cada evento primero.",
-        },
-        400
-      )
-    }
-    if (nBars > 0) {
-      return c.json(
-        {
-          error:
-            "No se puede eliminar: el insumo tiene stock en una o más barras. Ajustá el inventario primero.",
+            "No se puede desactivar: el insumo está en la receta de uno o más productos activos. Desactivá esos productos primero.",
         },
         400
       )
     }
 
     await db
-      .delete(inventoryItems)
+      .update(inventoryItems)
+      .set({ isActive: false })
       .where(
         and(eq(inventoryItems.id, itemId), eq(inventoryItems.tenantId, tenantId))
       )
 
-    return c.json({ ok: true })
+    return c.json({ ok: true, deactivated: true })
   })
   .get("/products", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -325,7 +296,7 @@ export const inventoryRoute = new Hono()
     const prods = await db
       .select()
       .from(products)
-      .where(eq(products.tenantId, tenantId))
+      .where(and(eq(products.tenantId, tenantId), productListed))
 
     if (prods.length === 0) {
       return c.json({ products: [] })
@@ -350,7 +321,8 @@ export const inventoryRoute = new Hono()
       .where(
         and(
           inArray(productRecipes.productId, pids),
-          eq(inventoryItems.tenantId, tenantId)
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
         )
       )
 
@@ -396,11 +368,15 @@ export const inventoryRoute = new Hono()
         .where(
           and(
             inArray(inventoryItems.id, invIds),
-            eq(inventoryItems.tenantId, tenantId)
+            eq(inventoryItems.tenantId, tenantId),
+            eq(inventoryItems.isActive, true)
           )
         )
       if (invRows.length !== invIds.length) {
-        return c.json({ error: "Una o más materias primas no existen." }, 400)
+        return c.json(
+          { error: "Una o más materias primas no existen o están desactivadas." },
+          400
+        )
       }
     }
 
@@ -497,11 +473,15 @@ export const inventoryRoute = new Hono()
         .where(
           and(
             inArray(inventoryItems.id, invIds),
-            eq(inventoryItems.tenantId, tenantId)
+            eq(inventoryItems.tenantId, tenantId),
+            eq(inventoryItems.isActive, true)
           )
         )
       if (invRows.length !== invIds.length) {
-        return c.json({ error: "Una o más materias primas no existen." }, 400)
+        return c.json(
+          { error: "Una o más materias primas no existen o están desactivadas." },
+          400
+        )
       }
     }
 
@@ -582,55 +562,16 @@ export const inventoryRoute = new Hono()
       return c.json({ error: "Producto no encontrado" }, 404)
     }
 
-    const [saleRow] = await db
-      .select({ n: count() })
-      .from(saleItems)
-      .where(eq(saleItems.productId, productId))
-    const [consRow] = await db
-      .select({ n: count() })
-      .from(digitalConsumptions)
-      .where(eq(digitalConsumptions.productId, productId))
+    await db
+      .update(products)
+      .set({ isActive: false })
+      .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
 
-    const saleCount = Number(saleRow?.n ?? 0)
-    const consCount = Number(consRow?.n ?? 0)
-
-    if (saleCount > 0 || consCount > 0) {
-      await db
-        .update(products)
-        .set({ isActive: false })
-        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
-      return c.json({
-        ok: true,
-        deactivated: true,
-        message:
-          "El producto tiene ventas o consumos asociados; se desactivó en lugar de eliminarlo.",
-      })
-    }
-
-    await db.transaction(async (tx) => {
-      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
-      await tx
-        .delete(eventProducts)
-        .where(
-          and(
-            eq(eventProducts.productId, productId),
-            eq(eventProducts.tenantId, tenantId)
-          )
-        )
-      await tx
-        .delete(barProducts)
-        .where(
-          and(
-            eq(barProducts.productId, productId),
-            eq(barProducts.tenantId, tenantId)
-          )
-        )
-      await tx
-        .delete(products)
-        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+    return c.json({
+      ok: true,
+      deactivated: true,
+      message: "Producto desactivado.",
     })
-
-    return c.json({ ok: true, deleted: true })
   })
   .post("/load-bottles", zValidator("json", loadBottlesSchema), async (c) => {
     const ctx = c as AuthenticatedContext
@@ -653,6 +594,9 @@ export const inventoryRoute = new Hono()
       .limit(1)
     if (!item) {
       return c.json({ error: "Ítem de inventario no encontrado" }, 404)
+    }
+    if (item.isActive === false) {
+      return c.json({ error: "El insumo está desactivado." }, 400)
     }
 
     const customStr =

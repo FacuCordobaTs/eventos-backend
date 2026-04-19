@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, eq, inArray, ne, sql } from "drizzle-orm"
+import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
@@ -133,7 +133,12 @@ export const barsRoute = new Hono()
           eq(barProducts.tenantId, tenantId)
         )
       )
-      .where(eq(products.tenantId, tenantId))
+      .where(
+        and(
+          eq(products.tenantId, tenantId),
+          or(eq(products.isActive, true), isNull(products.isActive))
+        )
+      )
       .orderBy(asc(products.name))
 
     const productIds = rows.map((r) => r.id)
@@ -304,7 +309,12 @@ export const barsRoute = new Hono()
           eq(barInventory.tenantId, tenantId)
         )
       )
-      .where(eq(inventoryItems.tenantId, tenantId))
+      .where(
+        and(
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
+        )
+      )
       .orderBy(asc(inventoryItems.name))
 
     return c.json({
@@ -347,7 +357,8 @@ export const barsRoute = new Hono()
         .where(
           and(
             eq(inventoryItems.id, body.inventoryItemId),
-            eq(inventoryItems.tenantId, tenantId)
+            eq(inventoryItems.tenantId, tenantId),
+            eq(inventoryItems.isActive, true)
           )
         )
         .limit(1)

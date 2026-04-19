@@ -133,7 +133,8 @@ export const analyticsRoute = new Hono()
           and(
             eq(eventInventory.eventId, focusEvent.id),
             eq(eventInventory.tenantId, tenantId),
-            eq(inventoryItems.tenantId, tenantId)
+            eq(inventoryItems.tenantId, tenantId),
+            eq(inventoryItems.isActive, true)
           )
         )
 
