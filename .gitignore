@@ -1,6 +1,6 @@
 # deps
 node_modules/
 .env
-
+bun.lock
 # Accidental Windows artifact (e.g. `bun build --outfile NUL` in repo root)
 NUL
