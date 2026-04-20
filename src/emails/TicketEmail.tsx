@@ -6,21 +6,29 @@ import {
   Head,
   Heading,
   Html,
+  Img,
   Preview,
   Section,
   Text,
 } from "@react-email/components"
 
+export type TicketEmailItem = {
+  id: string
+  name: string
+}
+
 export type TicketEmailProps = {
   userName: string
   eventName: string
   receiptUrl: string
+  items: TicketEmailItem[]
 }
 
 export function TicketEmail({
   userName,
   eventName,
   receiptUrl,
+  items,
 }: TicketEmailProps) {
   const preview = `Compra confirmada: ${eventName}`
   return (
@@ -119,10 +127,42 @@ export function TicketEmail({
               paddingTop: "20px",
             }}
           >
-            Los códigos QR para el ingreso y, si corresponde, para canjear consumos
-            en barra, van adjuntos a este correo para que puedas mostrarlos sin
-            conexión.
+            {items.length > 0
+              ? "Debajo tenés cada código QR con su nombre. También van incrustados en el mensaje para que los tengas sin conexión al llegar a puerta o a la barra."
+              : "Abrí el enlace de la billetera para ver tu comprobante y los códigos cuando estén disponibles."}
           </Text>
+
+          {items.map((item) => (
+            <Section
+              key={item.id}
+              style={{
+                marginTop: "30px",
+                textAlign: "center",
+                backgroundColor: "#111111",
+                padding: "20px",
+                borderRadius: "8px",
+              }}
+            >
+              <Text
+                style={{
+                  fontSize: "18px",
+                  fontWeight: "bold",
+                  color: "#ffffff",
+                  marginBottom: "15px",
+                  marginTop: 0,
+                }}
+              >
+                {item.name}
+              </Text>
+              <Img
+                src={`cid:${item.id}`}
+                width={200}
+                height={200}
+                alt={`QR ${item.name}`}
+                style={{ margin: "0 auto", borderRadius: "4px" }}
+              />
+            </Section>
+          ))}
         </Container>
       </Body>
     </Html>
