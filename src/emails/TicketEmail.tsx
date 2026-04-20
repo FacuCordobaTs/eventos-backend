@@ -114,7 +114,7 @@ export function TicketEmail({
                 letterSpacing: "0.12em",
               }}
             >
-              Abrir billetera
+              Abrir app
             </Button>
           </Section>
           <Text
@@ -129,7 +129,7 @@ export function TicketEmail({
           >
             {items.length > 0
               ? "Debajo tenés cada código QR con su nombre. También van incrustados en el mensaje para que los tengas sin conexión al llegar a puerta o a la barra."
-              : "Abrí el enlace de la billetera para ver tu comprobante y los códigos cuando estén disponibles."}
+              : "Abrí el enlace de la app para ver tu comprobante y los códigos cuando estén disponibles."}
           </Text>
 
           {items.map((item) => (
