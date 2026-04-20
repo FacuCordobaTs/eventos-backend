@@ -686,10 +686,10 @@ export const eventsRoute = new Hono()
         : Promise.resolve([{ total: "0" }] as { total: string }[]),
     ])
 
-    const ticketsSold = Number(ticketsRow?.n ?? 0)
-    const ticketsCheckedIn = Number(ticketsUsedRow?.n ?? 0)
-    const ticketRevenueDec = decFromDb(ticketRevenueRow?.total ?? "0")
-    const barSalesDec = decFromDb(revenueRow?.total ?? "0")
+    const ticketsSold = Number(ticketsRow[0]?.n ?? 0)
+    const ticketsCheckedIn = Number(ticketsUsedRow[0]?.n ?? 0)
+    const ticketRevenueDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
+    const barSalesDec = decFromDb(revenueRow[0]?.total ?? "0")
     const grossDec = ticketRevenueDec.plus(barSalesDec)
     const expensesDec = canViewFinancials
       ? decFromDb(expenseRow[0]?.total ?? "0")
@@ -707,8 +707,10 @@ export const eventsRoute = new Hono()
       }
     }
 
-    const digitalGenerated = Number(consumptionsRow?.n ?? 0)
-    const digitalRedeemed = Number(consumptionsRedeemedRow?.n ?? 0)
+    const digitalGenerated = Number(consumptionsRow[0]?.n ?? 0)
+    const digitalRedeemed = Number(consumptionsRedeemedRow[0]?.n ?? 0)
+
+    const barProductDec = decFromDb(barProductRevenueRow[0]?.total ?? "0")
 
     return c.json({
       canViewFinancials,
@@ -720,10 +722,8 @@ export const eventsRoute = new Hono()
       grossRevenue: decToDb(grossDec),
       totalExpenses: canViewFinancials ? decToDb(expensesDec) : null,
       netProfit: canViewFinancials ? decToDb(netDec) : null,
-      totalRevenue: revenueRow?.total ?? "0.00",
-      barProductRevenue: decToDb(
-        decFromDb(barProductRevenueRow?.total ?? "0")
-      ),
+      totalRevenue: decToDb(barSalesDec),
+      barProductRevenue: decToDb(barProductDec),
       digitalConsumptionsSold: digitalGenerated,
       digitalConsumptionsGenerated: digitalGenerated,
       digitalConsumptionsRedeemed: digitalRedeemed,
