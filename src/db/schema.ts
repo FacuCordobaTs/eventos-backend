@@ -66,6 +66,7 @@ export const events = mysqlTable(
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
+    imageUrl: varchar('image_url', { length: 512 }),
   },
   (table) => ({
     tenantIdIdx: index('events_tenant_id_idx').on(table.tenantId),

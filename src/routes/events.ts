@@ -40,6 +40,12 @@ import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { stockAllocatedToBaseUnits } from "../lib/inventory-deduction"
+import {
+  deleteFileByKey,
+  keyFromPublicUrl,
+  publicUrlForKey,
+  uploadFile,
+} from "../lib/s3-client"
 
 function requireTenantId(c: AuthenticatedContext): string | null {
   const id = c.staff.tenantId
@@ -193,6 +199,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     location: row.location,
     isActive: row.isActive,
     createdAt: row.createdAt,
+    imageUrl: row.imageUrl ?? null,
     ticketsAvailableFrom: row.ticketsAvailableFrom
       ? row.ticketsAvailableFrom.toISOString()
       : null,
@@ -200,6 +207,32 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
       ? row.consumptionsAvailableFrom.toISOString()
       : null,
   }
+}
+
+const EVENT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+const EVENT_IMAGE_ALLOWED_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+])
+
+function safeEventUploadFilename(name: string): string {
+  const base = name
+    .replace(/^.*[/\\]/, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+  return (base || "image").slice(0, 120)
+}
+
+function guessImageContentType(file: File, filename: string): string | null {
+  const t = file.type?.trim()
+  if (t && EVENT_IMAGE_ALLOWED_TYPES.has(t)) return t
+  const lower = filename.toLowerCase()
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg"
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".webp")) return "image/webp"
+  if (lower.endsWith(".gif")) return "image/gif"
+  return null
 }
 
 async function requireEventForTenant(
@@ -2032,6 +2065,140 @@ export const eventsRoute = new Hono()
     await db
       .update(events)
       .set(setPayload)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+
+    const [row] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    return c.json({ event: sanitizeEvent(row) })
+  })
+  .post("/:id/image", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    let body: Record<string, string | File>
+    try {
+      body = (await c.req.parseBody()) as Record<string, string | File>
+    } catch {
+      return c.json({ error: "No se pudo leer el formulario." }, 400)
+    }
+
+    const raw = body.image ?? body.file
+    if (!(raw instanceof File)) {
+      return c.json(
+        { error: "Adjuntá una imagen en el campo «image» (multipart/form-data)." },
+        400
+      )
+    }
+
+    if (raw.size > EVENT_IMAGE_MAX_BYTES) {
+      return c.json({ error: "La imagen no puede superar los 5 MB." }, 400)
+    }
+
+    const contentType = guessImageContentType(raw, raw.name)
+    if (!contentType) {
+      return c.json(
+        { error: "Formato no permitido. Usá JPEG, PNG, WebP o GIF." },
+        400
+      )
+    }
+
+    const segment = safeEventUploadFilename(raw.name)
+    const key = `events/${eventId}/${Date.now()}-${segment}`
+
+    let publicUrl: string
+    try {
+      const buf = Buffer.from(await raw.arrayBuffer())
+      await uploadFile(buf, key, contentType)
+      publicUrl = publicUrlForKey(key)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error al subir la imagen"
+      if (msg.includes("Missing required environment variable")) {
+        return c.json(
+          { error: "Almacenamiento no configurado (variables R2)." },
+          503
+        )
+      }
+      return c.json({ error: "No se pudo subir la imagen al almacenamiento." }, 502)
+    }
+
+    if (publicUrl.length > 512) {
+      return c.json({ error: "La URL pública generada supera el límite permitido." }, 400)
+    }
+
+    if (ev.imageUrl) {
+      const oldKey = keyFromPublicUrl(ev.imageUrl)
+      if (oldKey) {
+        try {
+          await deleteFileByKey(oldKey)
+        } catch {
+          /* reemplazo best-effort */
+        }
+      }
+    }
+
+    await db
+      .update(events)
+      .set({ imageUrl: publicUrl })
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+
+    const [row] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    return c.json({ event: sanitizeEvent(row) })
+  })
+  .delete("/:id/image", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [ev] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    if (ev.imageUrl) {
+      const oldKey = keyFromPublicUrl(ev.imageUrl)
+      if (oldKey) {
+        try {
+          await deleteFileByKey(oldKey)
+        } catch {
+          /* seguimos limpiando la DB */
+        }
+      }
+    }
+
+    await db
+      .update(events)
+      .set({ imageUrl: null })
       .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
 
     const [row] = await db
