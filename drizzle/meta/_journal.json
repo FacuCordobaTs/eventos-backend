@@ -141,6 +141,20 @@
       "when": 1776900000000,
       "tag": "0019_events_image_url",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "5",
+      "when": 1777000000000,
+      "tag": "0020_tenants_mp_oauth",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "5",
+      "when": 1777100000000,
+      "tag": "0021_sales_mp_guest_checkout",
+      "breakpoints": true
     }
   ]
 }

@@ -8,6 +8,7 @@ import {
     mysqlEnum,
     index,
     uniqueIndex,
+    json,
   } from 'drizzle-orm/mysql-core';
 import { relations } from 'drizzle-orm';
 
@@ -17,6 +18,11 @@ export const tenants = mysqlTable('tenants', {
   isActive: boolean('is_active').default(true),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').onUpdateNow(),
+  mpAccessToken: varchar('mp_access_token', { length: 512 }),
+  mpRefreshToken: varchar('mp_refresh_token', { length: 512 }),
+  mpPublicKey: varchar('mp_public_key', { length: 255 }),
+  mpUserId: varchar('mp_user_id', { length: 255 }),
+  mpConnected: boolean('mp_connected').default(false),
 });
 
 export const staff = mysqlTable(
@@ -340,6 +346,12 @@ export const productRecipes = mysqlTable('product_recipes', {
 // 4. VENTAS (El POS y la caja)
 // -----------------------------------------------------------------------------
 
+export type GuestCheckoutSnapshotJson = {
+  ticketLines: { ticketTypeId: string; quantity: number }[]
+  drinkLines: { productId: string; quantity: number }[]
+  contact: { name: string; email: string; phone: string }
+}
+
 export const sales = mysqlTable(
   'sales',
   {
@@ -353,13 +365,28 @@ export const sales = mysqlTable(
     source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
     totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
     paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),
-    status: mysqlEnum('status', ['COMPLETED', 'REFUNDED']).default('COMPLETED'),
+    status: mysqlEnum('status', [
+      'PENDING',
+      'PAYMENT_FAILED',
+      'COMPLETED',
+      'REFUNDED',
+    ]).default('COMPLETED'),
+    /** Carrito + contacto para completar la venta tras pago MP (Checkout Pro). */
+    guestCheckoutSnapshot: json('guest_checkout_snapshot').$type<GuestCheckoutSnapshotJson | null>(),
+    mpPreferenceId: varchar('mp_preference_id', { length: 64 }),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({
     barIdx: index('sales_bar_id_idx').on(table.barId),
+    mpPreferenceIdx: index('sales_mp_preference_id_idx').on(table.mpPreferenceId),
   })
 );
+
+export const mpProcessedPayments = mysqlTable('mp_processed_payments', {
+  paymentId: varchar('payment_id', { length: 64 }).primaryKey(),
+  saleId: varchar('sale_id', { length: 36 }).notNull(),
+  processedAt: timestamp('processed_at').defaultNow(),
+})
 
 export const saleItems = mysqlTable('sale_items', {
   id: varchar('id', { length: 36 }).primaryKey(),

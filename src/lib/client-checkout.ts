@@ -1,6 +1,7 @@
 import { and, count, eq, ne } from "drizzle-orm"
 import type { MySql2Transaction } from "drizzle-orm/mysql2"
 import * as schema from "../db/schema"
+import type { GuestCheckoutSnapshotJson } from "../db/schema"
 import {
   customers,
   digitalConsumptions,
@@ -43,6 +44,9 @@ export type ClientCheckoutResult = {
   receiptToken: string
   ticketIds: string[]
   consumptionIds: string[]
+  tenantId: string
+  /** Solo Mercado Pago: la venta queda PENDING hasta el webhook. */
+  pendingMercadoPago?: boolean
 }
 
 function assertWindow(
@@ -122,10 +126,23 @@ async function findOrCreateCustomer(
   return id
 }
 
-export async function executeClientCheckout(
+type PricedDrink = { productId: string; unit: ReturnType<typeof dec> }
+
+type PreparedGuestCheckout = {
+  ev: typeof events.$inferSelect
+  tenantId: string
+  customerId: string
+  total: ReturnType<typeof dec>
+  serverTotalStr: string
+  normalizedTickets: ClientCheckoutTicketLine[]
+  normalizedDrinks: ClientCheckoutDrinkLine[]
+  drinkPrices: Map<string, PricedDrink>
+}
+
+async function prepareGuestCheckout(
   tx: Tx,
   params: ClientCheckoutParams
-): Promise<ClientCheckoutResult> {
+): Promise<PreparedGuestCheckout> {
   const normalizedTickets = params.ticketLines.filter((l) => l.quantity > 0)
   const normalizedDrinks = params.drinkLines.filter((l) => l.quantity > 0)
 
@@ -157,7 +174,6 @@ export async function executeClientCheckout(
 
   const customerId = await findOrCreateCustomer(tx, params.contact)
 
-  type PricedDrink = { productId: string; unit: ReturnType<typeof dec> }
   const drinkPrices = new Map<string, PricedDrink>()
 
   let total = dec(0)
@@ -226,24 +242,97 @@ export async function executeClientCheckout(
     throw new PurchaseError("CHECKOUT_TOTAL_MISMATCH")
   }
 
+  return {
+    ev,
+    tenantId,
+    customerId,
+    total,
+    serverTotalStr,
+    normalizedTickets,
+    normalizedDrinks,
+    drinkPrices,
+  }
+}
+
+export async function executeClientCheckout(
+  tx: Tx,
+  params: ClientCheckoutParams
+): Promise<ClientCheckoutResult> {
+  const prep = await prepareGuestCheckout(tx, params)
+
+  if (params.paymentMethod === "MERCADOPAGO") {
+    const saleId = uuidv4()
+    const receiptToken = randomUUID()
+
+    const snapshot: GuestCheckoutSnapshotJson = {
+      ticketLines: prep.normalizedTickets.map((l) => ({
+        ticketTypeId: l.ticketTypeId,
+        quantity: l.quantity,
+      })),
+      drinkLines: prep.normalizedDrinks.map((l) => ({
+        productId: l.productId,
+        quantity: l.quantity,
+      })),
+      contact: {
+        name: params.contact.name.trim(),
+        email: params.contact.email.toLowerCase().trim(),
+        phone: params.contact.phone.trim(),
+      },
+    }
+
+    await tx.insert(sales).values({
+      id: saleId,
+      eventId: params.eventId,
+      tenantId: prep.tenantId,
+      customerId: prep.customerId,
+      receiptToken,
+      source: "WEB",
+      totalAmount: prep.serverTotalStr,
+      paymentMethod: "MERCADOPAGO",
+      status: "PENDING",
+      guestCheckoutSnapshot: snapshot,
+      createdAt: new Date(),
+    })
+
+    for (const line of prep.normalizedDrinks) {
+      const priced = prep.drinkPrices.get(line.productId)!
+      await tx.insert(saleItems).values({
+        id: uuidv4(),
+        saleId,
+        productId: line.productId,
+        quantity: line.quantity,
+        priceAtTime: decToDb(priced.unit),
+      })
+    }
+
+    return {
+      saleId,
+      receiptToken,
+      ticketIds: [],
+      consumptionIds: [],
+      tenantId: prep.tenantId,
+      pendingMercadoPago: true,
+    }
+  }
+
   const saleId = uuidv4()
   const receiptToken = randomUUID()
 
   await tx.insert(sales).values({
     id: saleId,
     eventId: params.eventId,
-    tenantId,
-    customerId,
+    tenantId: prep.tenantId,
+    customerId: prep.customerId,
     receiptToken,
     source: "WEB",
-    totalAmount: serverTotalStr,
+    totalAmount: prep.serverTotalStr,
     paymentMethod: params.paymentMethod,
     status: "COMPLETED",
     createdAt: new Date(),
   })
 
-  for (const line of normalizedDrinks) {
-    const priced = drinkPrices.get(line.productId)!
+  for (const line of prep.normalizedDrinks) {
+    const priced = prep.drinkPrices.get(line.productId)!
     await tx.insert(saleItems).values({
       id: uuidv4(),
       saleId,
@@ -254,13 +343,156 @@ export async function executeClientCheckout(
   }
 
   const ticketIds: string[] = []
-  for (const line of normalizedTickets) {
+  for (const line of prep.normalizedTickets) {
     for (let i = 0; i < line.quantity; i++) {
       const { ticket } = await executeTicketPurchase(tx, {
         eventId: params.eventId,
         ticketTypeId: line.ticketTypeId,
         buyerName: params.contact.name.trim(),
         buyerEmail: params.contact.email.toLowerCase().trim(),
+        customerId: prep.customerId,
+        saleId,
+      })
+      ticketIds.push(ticket.id)
+    }
+  }
+
+  const consumptionIds: string[] = []
+  for (const line of prep.normalizedDrinks) {
+    for (let i = 0; i < line.quantity; i++) {
+      const id = uuidv4()
+      const qrHash = randomUUID()
+      await tx.insert(digitalConsumptions).values({
+        id,
+        customerId: prep.customerId,
+        eventId: params.eventId,
+        tenantId: prep.tenantId,
+        productId: line.productId,
+        saleId,
+        qrHash,
+        status: "PENDING",
+        createdAt: new Date(),
+      })
+      consumptionIds.push(id)
+    }
+  }
+
+  return {
+    saleId,
+    receiptToken,
+    ticketIds,
+    consumptionIds,
+    tenantId: prep.tenantId,
+  }
+}
+
+/**
+ * Completa una venta web PENDING tras pago MP aprobado (misma transacción que el webhook).
+ */
+export async function fulfillPendingGuestCheckout(
+  tx: Tx,
+  saleId: string
+): Promise<ClientCheckoutResult> {
+  const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId)).limit(1)
+  if (!sale) {
+    throw new Error("FULFILL_SALE_NOT_FOUND")
+  }
+  if (sale.status === "COMPLETED") {
+    return {
+      saleId: sale.id,
+      receiptToken: sale.receiptToken,
+      ticketIds: [],
+      consumptionIds: [],
+      tenantId: sale.tenantId,
+    }
+  }
+  if (sale.status !== "PENDING" || sale.paymentMethod !== "MERCADOPAGO") {
+    throw new Error("FULFILL_INVALID_SALE_STATE")
+  }
+
+  const snap = sale.guestCheckoutSnapshot
+  if (snap == null) {
+    throw new Error("FULFILL_NO_SNAPSHOT")
+  }
+
+  const customerId = sale.customerId
+  if (customerId == null || customerId === "") {
+    throw new Error("FULFILL_NO_CUSTOMER")
+  }
+
+  const eventId = sale.eventId
+  const tenantId = sale.tenantId
+
+  const normalizedTickets = snap.ticketLines
+  const normalizedDrinks = snap.drinkLines
+
+  const contact: ClientCheckoutContact = {
+    name: snap.contact.name,
+    email: snap.contact.email,
+    phone: snap.contact.phone,
+  }
+
+  const drinkPrices = new Map<string, PricedDrink>()
+  for (const line of normalizedDrinks) {
+    const [row] = await tx
+      .select({
+        productId: eventProducts.productId,
+        priceOverride: eventProducts.priceOverride,
+        basePrice: products.price,
+      })
+      .from(eventProducts)
+      .innerJoin(products, eq(eventProducts.productId, products.id))
+      .where(
+        and(
+          eq(eventProducts.eventId, eventId),
+          eq(eventProducts.tenantId, tenantId),
+          eq(eventProducts.productId, line.productId),
+          eq(eventProducts.isActive, true),
+          eq(products.tenantId, tenantId),
+          eq(products.isActive, true)
+        )
+      )
+      .limit(1)
+    if (!row) {
+      throw new PurchaseError("PRODUCT_NOT_FOUND")
+    }
+    const unit =
+      row.priceOverride != null && row.priceOverride !== ""
+        ? decFromDb(row.priceOverride)
+        : decFromDb(row.basePrice)
+    drinkPrices.set(line.productId, { productId: line.productId, unit })
+  }
+
+  for (const line of normalizedTickets) {
+    const [tt] = await tx
+      .select()
+      .from(ticketTypes)
+      .where(
+        and(
+          eq(ticketTypes.id, line.ticketTypeId),
+          eq(ticketTypes.tenantId, tenantId),
+          eq(ticketTypes.eventId, eventId)
+        )
+      )
+      .limit(1)
+    if (!tt) {
+      throw new PurchaseError("TICKET_TYPE_NOT_FOUND")
+    }
+    const sold = await countIssuedForType(tx, tenantId, line.ticketTypeId)
+    const limit = tt.stockLimit
+    if (limit != null && sold + line.quantity > limit) {
+      throw new PurchaseError("OUT_OF_STOCK")
+    }
+  }
+
+  const ticketIds: string[] = []
+  for (const line of normalizedTickets) {
+    for (let i = 0; i < line.quantity; i++) {
+      const { ticket } = await executeTicketPurchase(tx, {
+        eventId,
+        ticketTypeId: line.ticketTypeId,
+        buyerName: contact.name.trim(),
+        buyerEmail: contact.email.toLowerCase().trim(),
         customerId,
         saleId,
       })
@@ -276,7 +508,7 @@ export async function executeClientCheckout(
       await tx.insert(digitalConsumptions).values({
         id,
         customerId,
-        eventId: params.eventId,
+        eventId,
         tenantId,
         productId: line.productId,
         saleId,
@@ -288,5 +520,16 @@ export async function executeClientCheckout(
     }
   }
 
-  return { saleId, receiptToken, ticketIds, consumptionIds }
+  await tx
+    .update(sales)
+    .set({ status: "COMPLETED" })
+    .where(eq(sales.id, saleId))
+
+  return {
+    saleId,
+    receiptToken: sale.receiptToken,
+    ticketIds,
+    consumptionIds,
+    tenantId,
+  }
 }

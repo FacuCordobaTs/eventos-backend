@@ -15,8 +15,11 @@ import {
 } from "../db/schema"
 import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
 import { executeClientCheckout } from "../lib/client-checkout"
+import { mpCreateCheckoutPreference } from "../lib/mp-checkout-api"
+import { obtenerTokenValido } from "../lib/mercadopago-utils"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
+import { decFromDb } from "../lib/decimal-money"
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -190,6 +193,28 @@ export const publicRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
+    if (body.paymentMethod === "MERCADOPAGO") {
+      const [evRow] = await db
+        .select({ tenantId: events.tenantId })
+        .from(events)
+        .where(eq(events.id, body.eventId))
+        .limit(1)
+      if (!evRow) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      const [tenantRow] = await db
+        .select({ mpConnected: tenants.mpConnected })
+        .from(tenants)
+        .where(eq(tenants.id, evRow.tenantId))
+        .limit(1)
+      if (!tenantRow?.mpConnected) {
+        return c.json(
+          { error: "Mercado Pago no está conectado para esta productora." },
+          400
+        )
+      }
+    }
+
     try {
       const result = await db.transaction(async (tx) =>
         executeClientCheckout(tx, {
@@ -205,6 +230,92 @@ export const publicRoute = new Hono()
           drinkLines: body.drinkLines ?? [],
         })
       )
+
+      if (result.pendingMercadoPago) {
+        const accessToken = await obtenerTokenValido(result.tenantId)
+        if (!accessToken) {
+          await db
+            .update(sales)
+            .set({ status: "PAYMENT_FAILED" })
+            .where(eq(sales.id, result.saleId))
+          return c.json(
+            { error: "No se pudo iniciar el pago con Mercado Pago." },
+            502
+          )
+        }
+
+        const [evName] = await db
+          .select({ name: events.name })
+          .from(events)
+          .where(eq(events.id, body.eventId))
+          .limit(1)
+        const [saleRow] = await db
+          .select({
+            totalAmount: sales.totalAmount,
+            receiptToken: sales.receiptToken,
+          })
+          .from(sales)
+          .where(eq(sales.id, result.saleId))
+          .limit(1)
+
+        const notificationUrl =
+          process.env.MP_NOTIFICATION_URL ?? "https://api.totem.uno/api/mp/webhook"
+        const base = (
+          process.env.CLIENT_APP_URL ??
+          process.env.FRONTEND_URL ??
+          "https://totem.uno"
+        ).replace(/\/$/, "")
+        const receiptUrl = `${base}/receipt/${saleRow?.receiptToken ?? result.receiptToken}`
+
+        const unitPrice = decFromDb(saleRow?.totalAmount ?? "0").toNumber()
+        const pref = await mpCreateCheckoutPreference({
+          accessToken,
+          items: [
+            {
+              title: `Totem · ${evName?.name ?? "Evento"}`,
+              quantity: 1,
+              unit_price: unitPrice,
+              currency_id: "ARS",
+            },
+          ],
+          externalReference: `totem-sale-${result.saleId}`,
+          notificationUrl,
+          marketplaceFee: 0,
+          backUrls: {
+            success: receiptUrl,
+            failure: receiptUrl,
+            pending: receiptUrl,
+          },
+        })
+
+        if (!pref) {
+          await db
+            .update(sales)
+            .set({ status: "PAYMENT_FAILED" })
+            .where(eq(sales.id, result.saleId))
+          return c.json(
+            { error: "No se pudo crear la preferencia de pago en Mercado Pago." },
+            502
+          )
+        }
+
+        await db
+          .update(sales)
+          .set({ mpPreferenceId: pref.id })
+          .where(eq(sales.id, result.saleId))
+
+        return c.json(
+          {
+            message: "Redirigiendo a Mercado Pago",
+            receiptToken: result.receiptToken,
+            saleId: result.saleId,
+            initPoint: pref.init_point,
+            preferenceId: pref.id,
+            mercadoPago: true,
+          },
+          201
+        )
+      }
 
       void sendGuestCheckoutReceiptEmail({
         db,
@@ -300,6 +411,7 @@ export const publicRoute = new Hono()
         id: header.sale.id,
         totalAmount: header.sale.totalAmount,
         paymentMethod: header.sale.paymentMethod,
+        status: header.sale.status,
         createdAt: header.sale.createdAt,
       },
       event: {

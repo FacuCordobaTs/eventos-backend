@@ -10,6 +10,7 @@ import { analyticsRoute } from "./routes/analytics"
 import { barsRoute } from "./routes/bars"
 import { salesRoute } from "./routes/sales"
 import { mountStockWebSocket } from "./routes/ws-stock"
+import { mercadopagoRoute } from "./routes/mercadopago"
 import { cors } from "hono/cors"
 import { websocket as honoWebsocket } from "hono/bun"
 
@@ -44,6 +45,7 @@ app.route("/inventory", inventoryRoute)
 app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)
 app.route("/sales", salesRoute)
+app.route("/api/mp", mercadopagoRoute)
 
 mountStockWebSocket(app)
 
