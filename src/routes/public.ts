@@ -177,6 +177,7 @@ export const publicRoute = new Hono()
         name: ev.name,
         date: ev.date,
         location: ev.location,
+        imageUrl: ev.imageUrl ?? null,
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },
