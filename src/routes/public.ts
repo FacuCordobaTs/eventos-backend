@@ -15,6 +15,7 @@ import {
 } from "../db/schema"
 import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
 import { executeClientCheckout } from "../lib/client-checkout"
+import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
 
 async function countIssued(
@@ -204,6 +205,19 @@ export const publicRoute = new Hono()
           drinkLines: body.drinkLines ?? [],
         })
       )
+
+      void sendGuestCheckoutReceiptEmail({
+        db,
+        eventId: body.eventId,
+        saleId: result.saleId,
+        receiptToken: result.receiptToken,
+        contact: {
+          name: body.contact.name,
+          email: body.contact.email,
+        },
+      }).catch((err) => {
+        console.error("[checkout-email] Failed to send receipt email:", err)
+      })
 
       return c.json(
         {
