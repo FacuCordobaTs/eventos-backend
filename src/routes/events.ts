@@ -543,11 +543,20 @@ export const eventsRoute = new Hono()
     const canViewFinancials =
       ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER"
 
-    const ticketFilters = and(
-      eq(tickets.eventId, eventId),
-      eq(tickets.tenantId, tenantId),
-      ne(tickets.status, "CANCELLED")
-    )
+    /** Predicado nuevo por consulta: reutilizar el mismo `and(...)` en paralelo puede mutar el AST en Drizzle. */
+    const whereTicketsNonCancelled = () =>
+      and(
+        eq(tickets.eventId, eventId),
+        eq(tickets.tenantId, tenantId),
+        ne(tickets.status, "CANCELLED")
+      )
+
+    const whereSaleCountsAsRevenue = () =>
+      and(
+        eq(sales.eventId, eventId),
+        eq(sales.tenantId, tenantId),
+        or(isNull(sales.status), eq(sales.status, "COMPLETED"))
+      )
 
     const [
       ticketsRow,
@@ -563,7 +572,7 @@ export const eventsRoute = new Hono()
       db
         .select({ n: count() })
         .from(tickets)
-        .where(ticketFilters),
+        .where(whereTicketsNonCancelled()),
       db
         .select({ n: count() })
         .from(tickets)
@@ -580,32 +589,26 @@ export const eventsRoute = new Hono()
         })
         .from(tickets)
         .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
-        .where(ticketFilters),
+        .where(
+          and(
+            whereTicketsNonCancelled(),
+            eq(ticketTypes.eventId, eventId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        ),
       db
         .select({
           total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
         })
         .from(sales)
-        .where(
-          and(
-            eq(sales.eventId, eventId),
-            eq(sales.tenantId, tenantId),
-            eq(sales.status, "COMPLETED")
-          )
-        ),
+        .where(whereSaleCountsAsRevenue()),
       db
         .select({
           total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
         })
         .from(saleItems)
         .innerJoin(sales, eq(saleItems.saleId, sales.id))
-        .where(
-          and(
-            eq(sales.eventId, eventId),
-            eq(sales.tenantId, tenantId),
-            eq(sales.status, "COMPLETED")
-          )
-        ),
+        .where(whereSaleCountsAsRevenue()),
       db
         .select({ n: count() })
         .from(digitalConsumptions)
