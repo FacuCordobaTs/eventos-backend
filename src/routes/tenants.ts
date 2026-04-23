@@ -8,9 +8,15 @@ import { eq } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff } from "../lib/staff-dto"
+import { configurarWebhookTenant } from "../lib/cucuru-service"
 
 const setupSchema = z.object({
   name: z.string().min(1).max(255),
+})
+
+const cucuruPutSchema = z.object({
+  cucuruApiKey: z.string().min(1).max(255),
+  cucuruCollectorId: z.string().min(1).max(255),
 })
 
 export const tenantsRoute = new Hono()
@@ -87,4 +93,67 @@ export const tenantsRoute = new Hono()
       }
       throw e
     }
+  })
+  .get("/me/cucuru", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ hasCucuruConfigured: false as const })
+    }
+
+    const db = drizzle(pool)
+    const [row] = await db
+      .select({
+        cucuruEnabled: tenants.cucuruEnabled,
+        cucuruApiKey: tenants.cucuruApiKey,
+        cucuruCollectorId: tenants.cucuruCollectorId,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .limit(1)
+
+    const hasCucuruConfigured = Boolean(
+      row?.cucuruEnabled &&
+        row.cucuruApiKey != null &&
+        row.cucuruApiKey.trim() !== "" &&
+        row.cucuruCollectorId != null &&
+        row.cucuruCollectorId.trim() !== ""
+    )
+
+    return c.json({ hasCucuruConfigured })
+  })
+  .put("/me/cucuru", authMiddleware, zValidator("json", cucuruPutSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ error: "Productora no configurada" }, 400)
+    }
+
+    const body = c.req.valid("json")
+    const apiKey = body.cucuruApiKey.trim()
+    const collectorId = body.cucuruCollectorId.trim()
+
+    const webhookResult = await configurarWebhookTenant(apiKey, collectorId)
+    if (!webhookResult.ok) {
+      const reason =
+        webhookResult.error === "http_401" || webhookResult.error === "http_403"
+          ? "Credenciales rechazadas por Cucuru."
+          : webhookResult.error?.startsWith("http_")
+            ? "Cucuru no aceptó la configuración del webhook."
+            : (webhookResult.error ?? "No se pudo registrar el webhook en Cucuru.")
+      return c.json({ error: reason }, 400)
+    }
+
+    const db = drizzle(pool)
+    await db
+      .update(tenants)
+      .set({
+        cucuruApiKey: apiKey,
+        cucuruCollectorId: collectorId,
+        cucuruEnabled: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(tenants.id, ctx.staff.tenantId!))
+
+    return c.json({ ok: true as const })
   })
