@@ -23,6 +23,9 @@ export const tenants = mysqlTable('tenants', {
   mpPublicKey: varchar('mp_public_key', { length: 255 }),
   mpUserId: varchar('mp_user_id', { length: 255 }),
   mpConnected: boolean('mp_connected').default(false),
+  cucuruApiKey: varchar('cucuru_api_key', { length: 255 }),
+  cucuruCollectorId: varchar('cucuru_collector_id', { length: 255 }),
+  cucuruEnabled: boolean('cucuru_enabled').default(false),
 });
 
 export const staff = mysqlTable(
@@ -374,7 +377,12 @@ export const sales = mysqlTable(
     /** Carrito + contacto para completar la venta tras pago MP (Checkout Pro). */
     guestCheckoutSnapshot: json('guest_checkout_snapshot').$type<GuestCheckoutSnapshotJson | null>(),
     mpPreferenceId: varchar('mp_preference_id', { length: 64 }),
+    cucuruAlias: varchar('cucuru_alias', { length: 100 }),
+    cucuruCvu: varchar('cucuru_cvu', { length: 22 }),
+    cucuruPaymentId: varchar('cucuru_payment_id', { length: 100 }),
     createdAt: timestamp('created_at').defaultNow(),
+    paid: boolean('paid').default(false),
+    paidAt: timestamp('paid_at')
   },
   (table) => ({
     barIdx: index('sales_bar_id_idx').on(table.barId),
@@ -409,6 +417,16 @@ export const digitalConsumptions = mysqlTable('digital_consumptions', {
   redeemedAt: timestamp('redeemed_at'),
   redeemedBy: varchar('redeemed_by', { length: 36 }).references(() => staff.id),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const accountPool = mysqlTable("account_pool", {
+  id: int("id").primaryKey().autoincrement(),
+  tenantId: varchar("tenant_id", { length: 36 }).references(() => tenants.id),
+  accountNumber: varchar("account_number", { length: 255 }),
+  alias: varchar("alias", { length: 255 }),
+  status: mysqlEnum("status", ["available", "assigned"]).default("available"),
+  saleIdAssigned: varchar("sale_id_assigned", { length: 36 }),
+  updatedAt: timestamp("updated_at").defaultNow(),
 });
 
 // -----------------------------------------------------------------------------

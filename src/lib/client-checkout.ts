@@ -45,8 +45,10 @@ export type ClientCheckoutResult = {
   ticketIds: string[]
   consumptionIds: string[]
   tenantId: string
-  /** Solo Mercado Pago: la venta queda PENDING hasta el webhook. */
+  /** Checkout Pro: preferencia MP + redirect. */
   pendingMercadoPago?: boolean
+  /** Tarjeta (Brick): venta PENDING hasta pagar en `/receipt`. */
+  payOnReceipt?: boolean
 }
 
 function assertWindow(
@@ -260,9 +262,10 @@ export async function executeClientCheckout(
 ): Promise<ClientCheckoutResult> {
   const prep = await prepareGuestCheckout(tx, params)
 
-  if (params.paymentMethod === "MERCADOPAGO") {
+  if (params.paymentMethod === "MERCADOPAGO" || params.paymentMethod === "CARD") {
     const saleId = uuidv4()
     const receiptToken = randomUUID()
+    const method = params.paymentMethod
 
     const snapshot: GuestCheckoutSnapshotJson = {
       ticketLines: prep.normalizedTickets.map((l) => ({
@@ -288,7 +291,7 @@ export async function executeClientCheckout(
       receiptToken,
       source: "WEB",
       totalAmount: prep.serverTotalStr,
-      paymentMethod: "MERCADOPAGO",
+      paymentMethod: method,
       status: "PENDING",
       guestCheckoutSnapshot: snapshot,
       createdAt: new Date(),
@@ -311,7 +314,8 @@ export async function executeClientCheckout(
       ticketIds: [],
       consumptionIds: [],
       tenantId: prep.tenantId,
-      pendingMercadoPago: true,
+      pendingMercadoPago: method === "MERCADOPAGO",
+      payOnReceipt: method === "CARD",
     }
   }
 
@@ -406,7 +410,10 @@ export async function fulfillPendingGuestCheckout(
       tenantId: sale.tenantId,
     }
   }
-  if (sale.status !== "PENDING" || sale.paymentMethod !== "MERCADOPAGO") {
+  if (
+    sale.status !== "PENDING" ||
+    (sale.paymentMethod !== "MERCADOPAGO" && sale.paymentMethod !== "CARD")
+  ) {
     throw new Error("FULFILL_INVALID_SALE_STATE")
   }
 

@@ -1,4 +1,4 @@
-import { and, eq, gte } from "drizzle-orm"
+import { and, eq, gte, inArray } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import { mpProcessedPayments, sales } from "../db/schema"
@@ -38,7 +38,7 @@ export async function resolveMercadoPagoPayment(
     .where(
       and(
         eq(sales.status, "PENDING"),
-        eq(sales.paymentMethod, "MERCADOPAGO"),
+        inArray(sales.paymentMethod, ["MERCADOPAGO", "CARD"]),
         gte(sales.createdAt, since)
       )
     )

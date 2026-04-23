@@ -193,7 +193,7 @@ export const publicRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
-    if (body.paymentMethod === "MERCADOPAGO") {
+    if (body.paymentMethod === "MERCADOPAGO" || body.paymentMethod === "CARD") {
       const [evRow] = await db
         .select({ tenantId: events.tenantId })
         .from(events)
@@ -230,6 +230,18 @@ export const publicRoute = new Hono()
           drinkLines: body.drinkLines ?? [],
         })
       )
+
+      if (result.payOnReceipt) {
+        return c.json(
+          {
+            message: "Pendiente de pago",
+            receiptToken: result.receiptToken,
+            saleId: result.saleId,
+            payOnReceipt: true,
+          },
+          201
+        )
+      }
 
       if (result.pendingMercadoPago) {
         const accessToken = await obtenerTokenValido(result.tenantId)
@@ -357,6 +369,7 @@ export const publicRoute = new Hono()
         eventDate: events.date,
         eventLocation: events.location,
         productoraName: tenants.name,
+        mpPublicKey: tenants.mpPublicKey,
       })
       .from(sales)
       .innerJoin(events, eq(sales.eventId, events.id))
@@ -420,7 +433,10 @@ export const publicRoute = new Hono()
         date: header.eventDate,
         location: header.eventLocation,
       },
-      productora: { name: header.productoraName },
+      productora: {
+        name: header.productoraName,
+        mpPublicKey: header.mpPublicKey ?? null,
+      },
       tickets: ticketRows.map((r) => ({
         id: r.id,
         qrHash: r.qrHash,
