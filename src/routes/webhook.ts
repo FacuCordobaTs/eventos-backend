@@ -5,7 +5,7 @@ import { eq, and, ne, or } from 'drizzle-orm'
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
 import  { accountPool as AccountPoolTable, sales as SalesTable, customers as CustomersTable } from '../db/schema'
 
-const webhookRoute = new Hono()
+export const webhookRoute = new Hono()
 
 
 webhookRoute.get('/', async (c) => {
