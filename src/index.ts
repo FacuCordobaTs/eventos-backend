@@ -11,6 +11,7 @@ import { barsRoute } from "./routes/bars"
 import { salesRoute } from "./routes/sales"
 import { mountStockWebSocket } from "./routes/ws-stock"
 import { mercadopagoRoute } from "./routes/mercadopago"
+import { webhookRoute } from "./routes/webhook"
 import { cors } from "hono/cors"
 import { websocket as honoWebsocket } from "hono/bun"
 
@@ -46,7 +47,7 @@ app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)
 app.route("/sales", salesRoute)
 app.route("/api/mp", mercadopagoRoute)
-
+app.route("/api/webhook", webhookRoute)
 mountStockWebSocket(app)
 
 const port = Number(process.env.PORT ?? 3000)
