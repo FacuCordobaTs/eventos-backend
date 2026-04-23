@@ -9,7 +9,7 @@ export async function configurarWebhookTenant(
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const url = "https://api.cucuru.com/app/v1/Collection/webhooks/endpoint";
-    const body = { url: "https://api.tote.app/api/webhook/cucuru/collection_received" };
+    const body = { url: "https://api.totem.uno/api/webhook/cucuru/collection_received" };
 
     const response = await fetch(url, {
       method: "POST",
