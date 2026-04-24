@@ -15,11 +15,8 @@ import {
 } from "../db/schema"
 import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
 import { executeClientCheckout } from "../lib/client-checkout"
-import { mpCreateCheckoutPreference } from "../lib/mp-checkout-api"
-import { obtenerTokenValido } from "../lib/mercadopago-utils"
-import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
+import { asignarAliasASale } from "../lib/cucuru-service"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
-import { decFromDb } from "../lib/decimal-money"
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -41,7 +38,7 @@ async function countIssued(
 
 const guestCheckoutSchema = z.object({
   eventId: z.string().min(1),
-  paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER"]),
+  paymentMethod: z.literal("TRANSFER"),
   clientTotal: z.string().min(1),
   contact: z.object({
     name: z.string().min(1).max(255),
@@ -65,6 +62,30 @@ const guestCheckoutSchema = z.object({
     )
     .default([]),
 })
+
+/** Segment for Cucuru alias (`totem.${slug}.${seq}`): ASCII a-z0-9 only, max 12 chars. */
+function slugifyForCucuruAliasSegment(raw: string): string {
+  const base = raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 12)
+  return base.length > 0 ? base : "x"
+}
+
+function mapAsignarAliasError(reason: string): string {
+  switch (reason) {
+    case "cucuru_disabled":
+      return "Los cobros por transferencia no están habilitados para esta productora."
+    case "missing_credentials":
+      return "La productora no tiene configurado Cucuru."
+    case "tenant_or_sale_not_found":
+      return "No se pudo vincular la venta con Cucuru."
+    default:
+      return "No se pudo generar el alias de cobro. Intentá de nuevo más tarde."
+  }
+}
 
 export const publicRoute = new Hono()
   .get("/events", async (c) => {
@@ -193,26 +214,24 @@ export const publicRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
-    if (body.paymentMethod === "MERCADOPAGO" || body.paymentMethod === "CARD") {
-      const [evRow] = await db
-        .select({ tenantId: events.tenantId })
-        .from(events)
-        .where(eq(events.id, body.eventId))
-        .limit(1)
-      if (!evRow) {
-        return c.json({ error: "Evento no encontrado" }, 404)
-      }
-      const [tenantRow] = await db
-        .select({ mpConnected: tenants.mpConnected })
-        .from(tenants)
-        .where(eq(tenants.id, evRow.tenantId))
-        .limit(1)
-      if (!tenantRow?.mpConnected) {
-        return c.json(
-          { error: "Mercado Pago no está conectado para esta productora." },
-          400
-        )
-      }
+    const [cucuruCtx] = await db
+      .select({
+        tenantId: events.tenantId,
+        cucuruEnabled: tenants.cucuruEnabled,
+      })
+      .from(events)
+      .innerJoin(tenants, eq(events.tenantId, tenants.id))
+      .where(eq(events.id, body.eventId))
+      .limit(1)
+
+    if (!cucuruCtx) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    if (!cucuruCtx.cucuruEnabled) {
+      return c.json(
+        { error: "Los cobros por transferencia no están disponibles para este evento." },
+        400
+      )
     }
 
     try {
@@ -224,129 +243,64 @@ export const publicRoute = new Hono()
             email: body.contact.email,
             phone: body.contact.phone,
           },
-          paymentMethod: body.paymentMethod,
+          paymentMethod: "TRANSFER",
           clientTotal: body.clientTotal.trim(),
           ticketLines: body.ticketLines ?? [],
           drinkLines: body.drinkLines ?? [],
         })
       )
 
-      if (result.payOnReceipt) {
-        return c.json(
-          {
-            message: "Pendiente de pago",
-            receiptToken: result.receiptToken,
-            saleId: result.saleId,
-            payOnReceipt: true,
-          },
-          201
-        )
+      if (!result.payOnReceipt) {
+        return c.json({ error: "No se pudo iniciar el checkout." }, 500)
       }
 
-      if (result.pendingMercadoPago) {
-        const accessToken = await obtenerTokenValido(result.tenantId)
-        if (!accessToken) {
-          await db
-            .update(sales)
-            .set({ status: "PAYMENT_FAILED" })
-            .where(eq(sales.id, result.saleId))
-          return c.json(
-            { error: "No se pudo iniciar el pago con Mercado Pago." },
-            502
-          )
-        }
-
-        const [evName] = await db
-          .select({ name: events.name })
-          .from(events)
-          .where(eq(events.id, body.eventId))
-          .limit(1)
-        const [saleRow] = await db
-          .select({
-            totalAmount: sales.totalAmount,
-            receiptToken: sales.receiptToken,
-          })
-          .from(sales)
-          .where(eq(sales.id, result.saleId))
-          .limit(1)
-
-        const notificationUrl =
-          process.env.MP_NOTIFICATION_URL ?? "https://api.totem.uno/api/mp/webhook"
-        const base = (
-          process.env.CLIENT_APP_URL ??
-          process.env.FRONTEND_URL ??
-          "https://totem.uno"
-        ).replace(/\/$/, "")
-        const receiptUrl = `${base}/receipt/${saleRow?.receiptToken ?? result.receiptToken}`
-
-        const unitPrice = decFromDb(saleRow?.totalAmount ?? "0").toNumber()
-        const pref = await mpCreateCheckoutPreference({
-          accessToken,
-          items: [
-            {
-              title: `Totem · ${evName?.name ?? "Evento"}`,
-              quantity: 1,
-              unit_price: unitPrice,
-              currency_id: "ARS",
-            },
-          ],
-          externalReference: `totem-sale-${result.saleId}`,
-          notificationUrl,
-          marketplaceFee: 0,
-          backUrls: {
-            success: receiptUrl,
-            failure: receiptUrl,
-            pending: receiptUrl,
-          },
+      const [slugCtx] = await db
+        .select({
+          productoraName: tenants.name,
+          eventName: events.name,
         })
+        .from(events)
+        .innerJoin(tenants, eq(events.tenantId, tenants.id))
+        .where(
+          and(eq(events.id, body.eventId), eq(tenants.id, result.tenantId))
+        )
+        .limit(1)
 
-        if (!pref) {
-          await db
-            .update(sales)
-            .set({ status: "PAYMENT_FAILED" })
-            .where(eq(sales.id, result.saleId))
-          return c.json(
-            { error: "No se pudo crear la preferencia de pago en Mercado Pago." },
-            502
-          )
-        }
+      const slugSource = (slugCtx?.productoraName ?? slugCtx?.eventName ?? "tenant").trim()
+      const tenantSlug = slugifyForCucuruAliasSegment(slugSource)
 
+      const aliasRes = await asignarAliasASale(result.saleId, result.tenantId, tenantSlug)
+      if ("ok" in aliasRes && aliasRes.ok === false) {
         await db
           .update(sales)
-          .set({ mpPreferenceId: pref.id })
-          .where(eq(sales.id, result.saleId))
-
+          .set({ status: "PAYMENT_FAILED" })
+          .where(
+            and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+          )
         return c.json(
-          {
-            message: "Redirigiendo a Mercado Pago",
-            receiptToken: result.receiptToken,
-            saleId: result.saleId,
-            initPoint: pref.init_point,
-            preferenceId: pref.id,
-            mercadoPago: true,
-          },
-          201
+          { error: mapAsignarAliasError(aliasRes.reason) },
+          502
         )
       }
 
-      void sendGuestCheckoutReceiptEmail({
-        db,
-        eventId: body.eventId,
-        saleId: result.saleId,
-        receiptToken: result.receiptToken,
-        contact: {
-          name: body.contact.name,
-          email: body.contact.email,
-        },
-      }).catch((err) => {
-        console.error("[checkout-email] Failed to send receipt email:", err)
-      })
+      const { alias, accountNumber } = aliasRes
+
+      await db
+        .update(sales)
+        .set({
+          cucuruAlias: alias,
+          cucuruCvu: accountNumber,
+        })
+        .where(
+          and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+        )
 
       return c.json(
         {
-          message: "Compra registrada",
+          message: "Pendiente de pago",
           receiptToken: result.receiptToken,
           saleId: result.saleId,
+          payOnReceipt: true,
         },
         201
       )
@@ -426,6 +380,10 @@ export const publicRoute = new Hono()
         paymentMethod: header.sale.paymentMethod,
         status: header.sale.status,
         createdAt: header.sale.createdAt,
+        paid: Boolean(header.sale.paid),
+        paidAt: header.sale.paidAt ?? null,
+        cucuruAlias: header.sale.cucuruAlias ?? null,
+        cucuruCvu: header.sale.cucuruCvu ?? null,
       },
       event: {
         id: header.sale.eventId,

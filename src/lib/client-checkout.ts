@@ -262,7 +262,11 @@ export async function executeClientCheckout(
 ): Promise<ClientCheckoutResult> {
   const prep = await prepareGuestCheckout(tx, params)
 
-  if (params.paymentMethod === "MERCADOPAGO" || params.paymentMethod === "CARD") {
+  if (
+    params.paymentMethod === "MERCADOPAGO" ||
+    params.paymentMethod === "CARD" ||
+    params.paymentMethod === "TRANSFER"
+  ) {
     const saleId = uuidv4()
     const receiptToken = randomUUID()
     const method = params.paymentMethod
@@ -315,7 +319,7 @@ export async function executeClientCheckout(
       consumptionIds: [],
       tenantId: prep.tenantId,
       pendingMercadoPago: method === "MERCADOPAGO",
-      payOnReceipt: method === "CARD",
+      payOnReceipt: method === "CARD" || method === "TRANSFER",
     }
   }
 
@@ -412,7 +416,9 @@ export async function fulfillPendingGuestCheckout(
   }
   if (
     sale.status !== "PENDING" ||
-    (sale.paymentMethod !== "MERCADOPAGO" && sale.paymentMethod !== "CARD")
+    (sale.paymentMethod !== "MERCADOPAGO" &&
+      sale.paymentMethod !== "CARD" &&
+      sale.paymentMethod !== "TRANSFER")
   ) {
     throw new Error("FULFILL_INVALID_SALE_STATE")
   }
@@ -529,7 +535,11 @@ export async function fulfillPendingGuestCheckout(
 
   await tx
     .update(sales)
-    .set({ status: "COMPLETED" })
+    .set({
+      status: "COMPLETED",
+      paid: true,
+      paidAt: new Date(),
+    })
     .where(eq(sales.id, saleId))
 
   return {

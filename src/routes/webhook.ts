@@ -1,9 +1,15 @@
-import { Hono } from 'hono'
-import { pool } from '../db'
-import { drizzle } from 'drizzle-orm/mysql2'
-import { eq, and, ne, or } from 'drizzle-orm'
+import { Hono } from "hono"
+import { pool } from "../db"
+import { drizzle } from "drizzle-orm/mysql2"
+import { eq, and, or } from "drizzle-orm"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
-import  { accountPool as AccountPoolTable, sales as SalesTable, customers as CustomersTable } from '../db/schema'
+import { fulfillPendingGuestCheckout } from "../lib/client-checkout"
+import { dec, decFromDb } from "../lib/decimal-money"
+import {
+  accountPool as AccountPoolTable,
+  sales as SalesTable,
+  customers as CustomersTable,
+} from "../db/schema"
 
 export const webhookRoute = new Hono()
 
@@ -16,102 +22,150 @@ webhookRoute.post('/', async (c) => {
   return c.json({ message: 'Webhook received' }, 200)
 })
 
-const cucuruWebhookHandler = async (c: any) => {
+const cucuruWebhookHandler = async (c: {
+  req: { json: () => Promise<unknown> }
+  json: (body: unknown, status?: number) => Response
+}) => {
   try {
-    let body;
+    let body: Record<string, unknown>
     try {
-      body = await c.req.json();
-    } catch (err) {
-      return c.json({ status: 'ok' }, 200);
+      body = (await c.req.json()) as Record<string, unknown>
+    } catch {
+      return c.json({ status: "ok" }, 200)
     }
 
+    const amount = body.amount
+    const customerIdStr = body.customer_id
+    const collectionAccount = body.collection_account
 
-    const amount = body.amount;
-    const customerIdStr = body.customer_id;
-    const collectionId = body.collection_id;
-    const collectionAccount = body.collection_account;
-
-    if (amount === 0) {
-      return c.json({ status: 'ok' }, 200);
+    if (!customerIdStr || amount === undefined || amount === null) {
+      return c.json({ status: "ignored" }, 200)
     }
 
-    if (!customerIdStr || amount === undefined) {
-      return c.json({ status: 'ignored' }, 200);
+    const paidAmtProbe = dec(String(amount))
+    if (paidAmtProbe.lte(0)) {
+      return c.json({ status: "ok" }, 200)
     }
 
-    const tenantId = customerIdStr;
-    const db = drizzle(pool);
+    const db = drizzle(pool)
 
-    let assignedSaleId: string | null = null;
-    let poolTenantId: string | null = null;
+    let assignedSaleId: string | null = null
+    let poolTenantId: string | null = null
 
-    // Cucuru puede enviar collection_account como account_number (22 dígitos) o como alias (ej: piru.alfajor.171)
-    if (collectionAccount) {
-      const poolRecords = await db.select()
+    if (collectionAccount != null && String(collectionAccount) !== "") {
+      const acct = String(collectionAccount)
+      const poolRecords = await db
+        .select()
         .from(AccountPoolTable)
-        .where(or(
-          eq(AccountPoolTable.accountNumber, collectionAccount),
-          eq(AccountPoolTable.alias, collectionAccount)
-        ))
-        .limit(1);
+        .where(
+          or(
+            eq(AccountPoolTable.accountNumber, acct),
+            eq(AccountPoolTable.alias, acct)
+          )
+        )
+        .limit(1)
 
       if (poolRecords.length > 0 && poolRecords[0].saleIdAssigned) {
-        assignedSaleId = poolRecords[0].saleIdAssigned;
-        poolTenantId = poolRecords[0].tenantId;
+        assignedSaleId = poolRecords[0].saleIdAssigned
+        poolTenantId = poolRecords[0].tenantId ?? null
       }
     }
 
-    if (!assignedSaleId) {
-      return c.json({ status: 'ignored_no_sale_assigned' }, 200);
+    if (!assignedSaleId || !poolTenantId) {
+      return c.json({ status: "ignored_no_sale_assigned" }, 200)
     }
 
-    const sales = await db.select()
+    const paidAmt = paidAmtProbe
+    const [sale] = await db
+      .select()
       .from(SalesTable)
-      .where(eq(SalesTable.id, assignedSaleId));
+      .where(
+        and(eq(SalesTable.id, assignedSaleId), eq(SalesTable.tenantId, poolTenantId))
+      )
+      .limit(1)
 
-    if (sales.length > 0) {
-      const sale = sales[0];
-
-      if (Number(amount) < Number(sale.totalAmount)) {
-        console.warn(`⚠️ [Cucuru] Pago insuficiente para ${sale.id}. Pagado: $${amount}, Esperado: $${sale.totalAmount}`);
-        return c.json({ status: 'ignored_insufficient' }, 200);
-      }
-
-      await db.update(SalesTable).set({
-        paid: true,
-        paidAt: new Date(),
-      }).where(eq(SalesTable.id, sale.id));
-
-      const customer = await db.select()
-        .from(CustomersTable)
-        .where(eq(CustomersTable.id, sale.customerId ?? ''))
-        .limit(1);
-
-
-      if (customer.length > 0) {
-        try {
-          await sendGuestCheckoutReceiptEmail({
-            db,
-            eventId: sale.eventId,
-            saleId: sale.id,
-            receiptToken: sale.receiptToken,
-            contact: {
-              name: customer[0].name,
-              email: customer[0].email,
-            },
-          });
-        } catch (error) {
-          console.error("❌ Error enviando email de recepción de pago:", error);
-        }
-      }
-
-      return c.json({ status: 'received' }, 200);
+    if (!sale) {
+      return c.json({ status: "ignored_no_sale" }, 200)
     }
 
- } catch (error) {
-  console.error("❌ Error procesando webhook:", error);
-  return c.json({ status: 'error' }, 500);
- }
+    if (sale.paid) {
+      return c.json({ status: "ok" }, 200)
+    }
+
+    const expected = decFromDb(sale.totalAmount)
+    if (paidAmt.lt(expected)) {
+      console.warn(
+        `[Cucuru] Pago insuficiente para ${sale.id}. Pagado: ${paidAmt.toFixed(2)}, Esperado: ${expected.toFixed(2)}`
+      )
+      return c.json({ status: "ignored_insufficient" }, 200)
+    }
+
+    await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select()
+        .from(SalesTable)
+        .where(
+          and(eq(SalesTable.id, assignedSaleId), eq(SalesTable.tenantId, poolTenantId))
+        )
+        .limit(1)
+
+      if (!current || current.paid) {
+        return
+      }
+
+      if (current.status === "PENDING" && current.guestCheckoutSnapshot != null) {
+        await fulfillPendingGuestCheckout(tx, current.id)
+      } else {
+        await tx
+          .update(SalesTable)
+          .set({ paid: true, paidAt: new Date() })
+          .where(
+            and(eq(SalesTable.id, current.id), eq(SalesTable.tenantId, poolTenantId))
+          )
+      }
+    })
+
+    const [after] = await db
+      .select()
+      .from(SalesTable)
+      .where(eq(SalesTable.id, sale.id))
+      .limit(1)
+
+    if (!after?.paid) {
+      return c.json({ status: "ignored_not_marked_paid" }, 200)
+    }
+
+    const customer =
+      after.customerId != null && after.customerId !== ""
+        ? await db
+            .select()
+            .from(CustomersTable)
+            .where(eq(CustomersTable.id, after.customerId))
+            .limit(1)
+        : []
+
+    if (customer.length > 0) {
+      try {
+        await sendGuestCheckoutReceiptEmail({
+          db,
+          eventId: after.eventId,
+          saleId: after.id,
+          receiptToken: after.receiptToken,
+          contact: {
+            name: customer[0].name,
+            email: customer[0].email,
+          },
+        })
+      } catch (error) {
+        console.error("Error enviando email de recepción de pago:", error)
+      }
+    }
+
+    return c.json({ status: "received" }, 200)
+  } catch (error) {
+    console.error("Error procesando webhook:", error)
+    return c.json({ status: "error" }, 500)
+  }
 }
 
 // Rutas para abarcar todas las posibles URL's a las que puede estar pegando el PING de Cucuru:
