@@ -1,18 +1,21 @@
 import { Hono } from "hono"
 import type { Context } from "hono"
 import { z } from "zod"
-import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { eq } from "drizzle-orm"
 import { pool } from "../db"
-import { events, sales, tenants } from "../db/schema"
+import { sales, tenants, customers } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { fulfillPendingGuestCheckout } from "../lib/client-checkout"
-import { dec, decFromDb } from "../lib/decimal-money"
 import { intercambiarCodigoPorTokens, obtenerTokenValido } from "../lib/mercadopago-utils"
-import { processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
-import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
+
+const MP_MARKETPLACE_FEE_RATE = 0.01;
+
+function marketplaceFeeFromAmount(amount: number): number {
+  const n = Number(amount)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return Math.round(n * MP_MARKETPLACE_FEE_RATE * 100) / 100
+}
 
 async function extractMercadoPagoPaymentId(c: Context): Promise<string | null> {
   const qTopic = c.req.query("topic") ?? c.req.query("type")
@@ -144,176 +147,152 @@ export const mercadopagoRoute = new Hono()
 
     return c.json({ ok: true })
   })
-  .post("/process-brick", zValidator("json", processBrickSchema), async (c) => {
-    const body = c.req.valid("json")
+  .post("/crear-preferencia-externo", async (c) => {
     const db = drizzle(pool)
-
-    const [row] = await db
-      .select({ sale: sales })
-      .from(sales)
-      .innerJoin(events, eq(sales.eventId, events.id))
-      .innerJoin(tenants, eq(sales.tenantId, tenants.id))
-      .where(eq(sales.receiptToken, body.receiptToken))
-      .limit(1)
-
-    if (!row) {
-      return c.json({ error: "Venta no encontrada" }, 404)
-    }
-
-    if (
-      row.sale.status !== "PENDING" ||
-      (row.sale.paymentMethod !== "MERCADOPAGO" &&
-        row.sale.paymentMethod !== "CARD")
-    ) {
-      return c.json(
-        { error: "La venta no está pendiente de pago con Mercado Pago." },
-        400
-      )
-    }
-
-    const mpAccessToken = await obtenerTokenValido(row.sale.tenantId)
-    if (!mpAccessToken) {
-      return c.json(
-        { error: "No se pudo validar Mercado Pago para esta productora." },
-        502
-      )
-    }
-
-    const transactionAmount = decFromDb(row.sale.totalAmount).toNumber()
-
-    const paymentBody: Record<string, unknown> = {
-      transaction_amount: transactionAmount,
-      token: body.token,
-      description: "Compra en Totem",
-      installments: body.installments,
-      payment_method_id: body.payment_method_id,
-      payer: body.payer,
-      external_reference: `totem-sale-${row.sale.id}`,
-      currency_id: "ARS",
-    }
-    if (body.issuer_id !== undefined && body.issuer_id !== "") {
-      paymentBody.issuer_id = String(body.issuer_id)
-    }
-
-    const idempotencyKey = `${row.sale.id}-${Date.now()}`
-
-    const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        Authorization: `Bearer ${mpAccessToken}`,
-        "X-Idempotency-Key": idempotencyKey,
-      },
-      body: JSON.stringify(paymentBody),
-    })
-
-    let paymentData: MpPaymentCreateResponse
     try {
-      paymentData = (await mpRes.json()) as MpPaymentCreateResponse
-    } catch {
-      return c.json(
-        { success: false, status: "rejected", message: "Respuesta inválida de Mercado Pago" },
-        502
-      )
-    }
+      const { saleId } = await c.req.json()
+      if (!saleId) {
+        return c.json({ success: false, error: 'saleId es requerido' }, 400)
+      }
 
-    if (!mpRes.ok) {
-      const msg =
-        typeof paymentData.message === "string"
-          ? paymentData.message
-          : typeof paymentData.status_detail === "string"
-            ? paymentData.status_detail
-            : `Error ${mpRes.status}`
-      return c.json(
-        {
-          success: false,
-          status: "rejected",
-          message: msg,
+      const [sale] = await db.select().from(sales).where(eq(sales.id, saleId)).limit(1)
+      if (!sale) {
+        return c.json({ success: false, error: 'Sale no encontrada' }, 404)
+      }
+      
+      const total = parseFloat(String(sale.totalAmount || '0'))
+
+      const mpAccessToken = await obtenerTokenValido(sale.tenantId)
+      if (!mpAccessToken) {
+        return c.json({ success: false, error: 'No se pudo validar Mercado Pago para esta productora.' }, 502)
+      }
+
+      const mpItems = [{
+        title: `Venta #${saleId}`,
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: total,
+      }]
+
+      const externalReference = `totem-sale-${saleId}`
+      
+      const mpResponse = await fetch('https://api.mercadopago.com/checkout/preferences', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${mpAccessToken}`,
         },
-        400
-      )
-    }
-
-    const paid = dec(String(paymentData.transaction_amount ?? 0))
-    const expected = decFromDb(row.sale.totalAmount)
-    if (!paid.eq(expected)) {
-      return c.json({
-        success: false,
-        status: "rejected",
-        message: "El monto del pago no coincide con la venta.",
+        body: JSON.stringify({
+          items: mpItems,
+          marketplace_fee: marketplaceFeeFromAmount(total),
+          back_urls: {
+            success: `https://totem.uno/receipt/${sale.receiptToken}`,
+            failure: `https://totem.uno/receipt/${sale.receiptToken}`,
+            pending: `https://totem.uno/receipt/${sale.receiptToken}`,
+          },
+          auto_return: 'approved',
+          external_reference: externalReference,
+          notification_url: `https://api.totem.uno/api/mp/webhook`,
+          statement_descriptor: 'TOTEM',
+          expires: true,
+          expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        }),
       })
+
+      const preference = await mpResponse.json()
+      if (!mpResponse.ok) {
+        return c.json({ success: false, error: 'Error al crear preferencia de Mercado Pago' }, 500)
+      }
+
+      return c.json({ success: true, url_pago: preference.init_point, preference_id: preference.id, total: total.toFixed(2) })
+    } catch (error) {
+      console.error("[crear-preferencia-externo]", error)
+      return c.json({ success: false, error: 'Error al crear preferencia de Mercado Pago' }, 500)
     }
+  })
 
-    const st = (paymentData.status ?? "").toLowerCase()
+  .post("/process-brick", async (c) => {
+    const db = drizzle(pool)
+    try {
+      const body = await c.req.json()
+      const { token, installments, payer, payment_method_id, issuer_id, receiptToken } = body
+      if (!receiptToken) {
+        return c.json({ success: false, error: 'receiptToken es requerido' }, 400)
+      }
 
-    if (st === "in_process" || st === "pending") {
-      return c.json({ success: true, status: "pending" as const })
-    }
+      if (!token || !payer?.email) {
+        return c.json({ success: false, error: 'Datos de pago incompletos' }, 400)
+      }
 
-    if (st === "approved") {
-      try {
-        const out = await db.transaction(async (tx) => {
-          return fulfillPendingGuestCheckout(tx, row.sale.id)
-        })
+      const [sale] = await db.select().from(sales).where(eq(sales.receiptToken, receiptToken)).limit(1)
+      if (!sale) {
+        return c.json({ success: false, error: 'Sale no encontrada' }, 404)
+      }
+    
+      const mpAccessToken = await obtenerTokenValido(sale.tenantId)
+      if (!mpAccessToken) {
+        return c.json({ success: false, error: 'No se pudo validar Mercado Pago para esta productora.' }, 502)
+      }
 
-        const snap = row.sale.guestCheckoutSnapshot
-        const contact =
-          snap && typeof snap === "object" && "contact" in snap
-            ? (snap as { contact?: { email?: string; name?: string } }).contact
-            : undefined
-        if (contact?.email) {
-          void sendGuestCheckoutReceiptEmail({
+      const transactionAmount = parseFloat(String(sale.totalAmount || '0'))
+      const applicationFee = marketplaceFeeFromAmount(transactionAmount)
+      
+      const mpPayload: Record<string, unknown> = {
+        transaction_amount: transactionAmount,
+        token,
+        description: `Venta #${sale.id}`,
+        installments,
+        payment_method_id,
+        payer: {
+          email: payer.email,
+          identification: payer.identification
+        },
+        external_reference: `totem-sale-${sale.id}`,
+        notification_url: `https://api.totem.uno/api/mp/webhook`
+      }
+      if (applicationFee > 0) {
+        mpPayload.application_fee = applicationFee
+      }
+      if (issuer_id != null && issuer_id !== '') {
+        mpPayload.issuer_id = Number(issuer_id)
+      }
+
+      const mpResponse = await fetch('https://api.mercadopago.com/v1/payments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${mpAccessToken}`,
+          'X-Idempotency-Key': `${sale.id}-${Date.now()}`
+        },
+        body: JSON.stringify(mpPayload),
+      })
+      
+      const payment = await mpResponse.json()
+      if (!mpResponse.ok) {
+        return c.json({ success: false, error: 'Error al procesar pago' }, 500)
+      }
+
+      if (payment.status === 'approved') {
+        await db.update(sales).set({ paid: true }).where(eq(sales.id, sale.id))
+          
+        if (sale.customerId) {  
+        const customer = await db.select().from(customers).where(eq(customers.id, sale.customerId)).limit(1)
+          await sendGuestCheckoutReceiptEmail({
             db,
-            eventId: row.sale.eventId,
-            saleId: row.sale.id,
-            receiptToken: out.receiptToken,
+            eventId: sale.eventId,
+            saleId: sale.id,
+            receiptToken: sale.receiptToken,
             contact: {
-              name: contact.name ?? "Cliente",
-              email: contact.email,
+              name: customer[0].name,
+              email: customer[0].email,
             },
-          }).catch((err) => {
-            console.error("[process-brick] Receipt email failed:", err)
           })
         }
-
-        return c.json({ success: true, status: "approved" as const })
-      } catch (e) {
-        if (e instanceof PurchaseError) {
-          const { body: errBody } = purchaseErrorStatus(e.code)
-          return c.json(
-            {
-              success: false,
-              status: "rejected",
-              message: errBody.error,
-            },
-            409
-          )
-        }
-        console.error("[process-brick] fulfill failed:", e)
-        return c.json(
-          { success: false, status: "rejected", message: "No se pudo completar la venta." },
-          500
-        )
+        return c.json({ success: true, status: 'approved' })
       }
-    }
 
-    return c.json({
-      success: false,
-      status: "rejected" as const,
-      message: paymentData.status_detail ?? st ?? "Pago no aprobado",
-    })
-  })
-  .post("/webhook", async (c) => {
-    const paymentId = await extractMercadoPagoPaymentId(c)
-    if (!paymentId) {
-      return c.text("OK", 200)
+      return c.json({ success: true, payment_id: payment.id, status: payment.status })
+    } catch (error) {
+      
     }
-    try {
-      await processMercadoPagoPaymentNotification(paymentId)
-    } catch (e) {
-      console.error("[mp-webhook]", e)
-      return c.text("Error", 500)
-    }
-    return c.text("OK", 200)
   })
