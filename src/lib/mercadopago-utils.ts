@@ -195,3 +195,51 @@ export async function intercambiarCodigoPorTokens(params: {
 
   return { accessToken, refreshToken, publicKey, userId }
 }
+
+/**
+ * Si el body de /oauth/token no trae `user_id` o `public_key`, rellenamos con GET /users/me.
+ */
+export async function enriquecerTenantConUsersMe(
+  tenantId: string,
+  accessToken: string
+): Promise<void> {
+  const res = await fetch(MP_USERS_ME_URL, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  })
+  if (!res.ok) {
+    return
+  }
+  const data = (await res.json()) as { id?: number; public_key?: string }
+  const db = drizzle(pool)
+  const [row] = await db
+    .select({ mpPublicKey: tenants.mpPublicKey, mpUserId: tenants.mpUserId })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1)
+  if (!row) {
+    return
+  }
+
+  const userId: string | undefined =
+    row.mpUserId == null && data.id != null ? String(data.id) : undefined
+  const publicKey: string | undefined =
+    row.mpPublicKey == null &&
+    typeof data.public_key === "string" &&
+    data.public_key.length > 0
+      ? data.public_key
+      : undefined
+  if (userId === undefined && publicKey == undefined) {
+    return
+  }
+  await db
+    .update(tenants)
+    .set({
+      ...(userId != null ? { mpUserId: userId } : {}),
+      ...(publicKey != null ? { mpPublicKey: publicKey } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(tenants.id, tenantId))
+}

@@ -6,7 +6,11 @@ import { eq } from "drizzle-orm"
 import { pool } from "../db"
 import { sales, tenants, customers } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { intercambiarCodigoPorTokens, obtenerTokenValido } from "../lib/mercadopago-utils"
+import {
+  enriquecerTenantConUsersMe,
+  intercambiarCodigoPorTokens,
+  obtenerTokenValido,
+} from "../lib/mercadopago-utils"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
 
 const MP_MARKETPLACE_FEE_RATE = 0.01;
@@ -31,57 +35,48 @@ function parseSaleIdFromExternalReference(externalReference: string): string | n
 
 export const mercadopagoRoute = new Hono()
   .get("/callback", async (c) => {
-    const db = drizzle(pool)
     const code = c.req.query("code")
-    const rawState = c.req.query("state") || ''
+    const rawState = c.req.query("state") || ""
 
-    const stateParts = rawState.split('_')
+    const stateParts = rawState.split("_")
     const tenantId = stateParts[0]
-    const source = stateParts[1] || 'perfil'
-    const basePath = source === 'onboarding' ? '/onboarding' : '/dashboard/perfil'
+    const source = stateParts[1] || "perfil"
+    const basePath = source === "onboarding" ? "/onboarding" : "/dashboard/perfil"
 
     if (!code || !tenantId) {
-      console.error('❌ MP Callback: Faltan code o state')
-      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=missing_params`)
+      console.error("❌ MP Callback: Faltan code o state")
+      return c.redirect(
+        `${ADMIN_URL}${basePath}?mp_status=error&mp_error=missing_params`
+      )
     }
 
-    if (!MP_CLIENT_ID || !MP_CLIENT_SECRET) {
-      console.error('❌ MP Callback: Faltan credenciales de MercadoPago')
-      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=config_error`)
+    if (!MP_CLIENT_ID || !MP_CLIENT_SECRET || !MP_REDIRECT_URI) {
+      console.error("❌ MP Callback: Faltan credenciales o MP_REDIRECT_URI de MercadoPago")
+      return c.redirect(
+        `${ADMIN_URL}${basePath}?mp_status=error&mp_error=config_error`
+      )
     }
 
     try {
-      const response = await fetch('https://api.mercadopago.com/oauth/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: MP_CLIENT_ID,
-          client_secret: MP_CLIENT_SECRET,
-          code: code,
-          grant_type: 'authorization_code',
-          redirect_uri: MP_REDIRECT_URI,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        console.error('❌ MP Callback: Error al intercambiar código con MP:', data)
-        return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`)
+      const result = await intercambiarCodigoPorTokens({ code, tenantId })
+      if (!result) {
+        console.error("❌ MP Callback: intercambio de código inválido o vacío")
+        return c.redirect(
+          `${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`
+        )
       }
+      await enriquecerTenantConUsersMe(tenantId, result.accessToken)
 
-      await db.update(tenants).set({
-        mpAccessToken: data.access_token,
-        mpRefreshToken: data.refresh_token,
-        mpConnected: true,
-      }).where(eq(tenants.id, tenantId))
-
-      console.log(`✅ MP Callback: Productora ${tenantId} vinculada con MercadoPago exitosamente`)
+      console.log(
+        `✅ MP Callback: Productora ${tenantId} vinculada con MercadoPago exitosamente`
+      )
 
       return c.redirect(`${ADMIN_URL}${basePath}?mp_status=success`)
     } catch (error) {
-      console.error('❌ MP Callback: Error al intercambiar código con MP:', error)
-      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`)
+      console.error("❌ MP Callback: Error al intercambiar código con MP:", error)
+      return c.redirect(
+        `${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`
+      )
     }
   })
   .get("/status", authMiddleware, async (c) => {
@@ -101,15 +96,19 @@ export const mercadopagoRoute = new Hono()
       .select({
         mpPublicKey: tenants.mpPublicKey,
         mpUserId: tenants.mpUserId,
+        mpAccessToken: tenants.mpAccessToken,
+        mpConnected: tenants.mpConnected,
       })
       .from(tenants)
       .where(eq(tenants.id, tenantId))
       .limit(1)
 
-      console.log('✅ MP Status: Productora configurada')
-      console.log(row)
+    const connected =
+      row != null &&
+      (row.mpPublicKey != null ||
+        (row.mpAccessToken != null && row.mpConnected === true))
     return c.json({
-      mpConnected: row?.mpPublicKey != null ? true : false,
+      mpConnected: connected,
       mpPublicKey: row?.mpPublicKey ?? null,
       mpUserId: row?.mpUserId ?? null,
     })
