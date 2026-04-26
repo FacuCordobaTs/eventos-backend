@@ -12,9 +12,9 @@ import {
   obtenerTokenValido,
 } from "../lib/mercadopago-utils"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
+import { processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
 
-const MP_MARKETPLACE_FEE_RATE = 0.01;
-const MP_PLATFORM_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN
+const MP_MARKETPLACE_FEE_RATE = 0.01
 const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.totem.uno'
 const MP_CLIENT_ID = process.env.MP_CLIENT_ID
 const MP_CLIENT_SECRET = process.env.MP_CLIENT_SECRET
@@ -25,13 +25,6 @@ function marketplaceFeeFromAmount(amount: number): number {
   if (!Number.isFinite(n) || n <= 0) return 0
   return Math.round(n * MP_MARKETPLACE_FEE_RATE * 100) / 100
 }
-
-function parseSaleIdFromExternalReference(externalReference: string): string | null {
-  const unified = externalReference.match(/^totem-sale-(\d+)$/)
-  if (unified) return unified[1]
-  return null
-}
-
 
 export const mercadopagoRoute = new Hono()
   .get("/callback", async (c) => {
@@ -137,97 +130,48 @@ export const mercadopagoRoute = new Hono()
   })
 
   .post("/webhook", async (c) => {
-    const db = drizzle(pool)
-
     try {
-      const query = c.req.query()
-      let body: any = {}
+      const query = c.req.query() as Record<string, string>
+      let body: { data?: { id?: string }; type?: string; topic?: string } = {}
 
       try {
-       body = await c.req.json()
-      } catch (error) {
-        
+        body = (await c.req.json()) as typeof body
+      } catch {
+        // MP sometimes POSTs with empty or non-JSON body
       }
 
-      const paymentId = query['data.id'] || query['id'] || body?.data?.id
-      const type = query['type'] || body?.type
-      const topic = query['topic'] || body?.topic
+      const paymentId =
+        query["data.id"] || query["id"] || body?.data?.id
+      const type = query["type"] || body?.type
+      const topic = query["topic"] || body?.topic
 
-      if ((type !== 'payment' && topic !== 'payment') || !paymentId) {
-        console.log(`⏭️ [Webhook] Ignorando notificación: type=${type}, topic=${topic}`)
-        return c.json({ status: 'ignored' })
-      }
+      const isPayment =
+        type === "payment" ||
+        topic === "payment" ||
+        body?.type === "payment" ||
+        body?.topic === "payment"
 
-      if (!MP_PLATFORM_ACCESS_TOKEN) {
-        console.error('❌ [Webhook] Falta MP_ACCESS_TOKEN para consultar pagos')
-        return c.json({ status: 'error', message: 'Missing platform token' }, 500)
-      }
-
-      const paymentResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-        headers: {
-          'Authorization': `Bearer ${MP_PLATFORM_ACCESS_TOKEN}`
+      if (!isPayment) {
+        if (topic === "merchant_order" || type === "merchant_order") {
+          return c.json({ status: "ignored", reason: "merchant_order" })
         }
-      })
-
-      if (!paymentResponse.ok) {
-        console.error(`❌ [Webhook] Error consultando pago ${paymentId}: ${paymentResponse.status}`)
-        return c.json({ status: 'error', message: 'Payment not found' })
+        console.log(
+          `⏭️ [Webhook] Ignorando notificación: type=${String(type)}, topic=${String(topic)}`
+        )
+        return c.json({ status: "ignored" })
       }
 
-      const paymentData = await paymentResponse.json()
-
-      const externalReference = paymentData.external_reference
-      const status = paymentData.status
-
-      if (!externalReference || typeof externalReference !== 'string') {
-        console.log(`⏭️ [Webhook] Sin external_reference`)
-        return c.json({ status: 'ignored' })
+      if (!paymentId) {
+        console.log("⏭️ [Webhook] Notificación de pago sin id")
+        return c.json({ status: "ignored" })
       }
 
-      const saleId = parseSaleIdFromExternalReference(externalReference)
-
-      if (saleId == null) {
-        console.log(`⏭️ [Webhook] Referencia no es venta TOTEM: ${externalReference}`)
-        return c.json({ status: 'ignored' })
-      }
-
-      const saleWhere = eq(sales.id, saleId)
-
-      const [sale] = await db.select().from(sales).where(saleWhere).limit(1)
-      if (!sale) {
-        console.log(`⏭️ [Webhook] Venta no encontrada: ${saleId}`)
-        return c.json({ status: 'ignored' })
-      }
-      if (status === 'approved') {
-        if (sale.paid) {
-          console.log(`⏭️ [Webhook] Venta ${saleId} ya figuraba como pagada.`)
-          return c.json({ status: 'already_processed' })
-        }
-        if (sale.customerId == null) {
-          console.log(`⏭️ [Webhook] Venta ${saleId} no tiene customerId.`)
-          return c.json({ status: 'ignored' })
-        }
-        await db.update(sales).set({ paid: true }).where(saleWhere)
-
-        const customer = await db.select().from(customers).where(eq(customers.id, sale.customerId)).limit(1)
-
-        await sendGuestCheckoutReceiptEmail({
-          db,
-          eventId: sale.eventId,
-          saleId: sale.id,
-          receiptToken: sale.receiptToken,
-          contact: {
-            name: customer[0].name,
-            email: customer[0].email,
-          },
-        })
-      }
-
-
-    } catch (error) {
-      
+      await processMercadoPagoPaymentNotification(String(paymentId))
+      return c.json({ status: "ok" })
+    } catch (e) {
+      console.error("❌ [Webhook]", e)
+      return c.json({ status: "error" }, 500)
     }
-
   })
   .post("/crear-preferencia-externo", async (c) => {
     const db = drizzle(pool)
