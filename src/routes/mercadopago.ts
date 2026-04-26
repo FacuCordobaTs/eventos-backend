@@ -88,6 +88,7 @@ export const mercadopagoRoute = new Hono()
     const ctx = c as unknown as AuthenticatedContext
     const tenantId = ctx.staff.tenantId
     if (tenantId == null || tenantId === "") {
+      console.log('❌ MP Status: Productora no configurada')
       return c.json({
         mpConnected: false,
         mpPublicKey: null as string | null,
@@ -105,6 +106,7 @@ export const mercadopagoRoute = new Hono()
       .where(eq(tenants.id, tenantId))
       .limit(1)
 
+      console.log('✅ MP Status: Productora configurada')
     return c.json({
       mpConnected: row?.mpPublicKey != null ? true : false,
       mpPublicKey: row?.mpPublicKey ?? null,
