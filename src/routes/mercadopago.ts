@@ -11,6 +11,10 @@ import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-emai
 
 const MP_MARKETPLACE_FEE_RATE = 0.01;
 const MP_PLATFORM_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN
+const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.totem.uno'
+const MP_CLIENT_ID = process.env.MP_CLIENT_ID
+const MP_CLIENT_SECRET = process.env.MP_CLIENT_SECRET
+const MP_REDIRECT_URI = process.env.MP_REDIRECT_URI
 
 function marketplaceFeeFromAmount(amount: number): number {
   const n = Number(amount)
@@ -24,34 +28,59 @@ function parseSaleIdFromExternalReference(externalReference: string): string | n
   return null
 }
 
-function adminUrl(): string {
-  const u = process.env.ADMIN_URL
-  if (!u) throw new Error("ADMIN_URL no configurado")
-  return u.replace(/\/$/, "")
-}
-
 
 export const mercadopagoRoute = new Hono()
   .get("/callback", async (c) => {
+    const db = drizzle(pool)
     const code = c.req.query("code")
-    const state = c.req.query("state")
-    const base = adminUrl()
+    const rawState = c.req.query("state") || ''
 
-    if (!code || !state) {
-      return c.redirect(`${base}/settings?tab=finances&mp_status=error`, 302)
+    const stateParts = rawState.split('_')
+    const tenantId = stateParts[0]
+    const source = stateParts[1] || 'perfil'
+    const basePath = source === 'onboarding' ? '/onboarding' : '/dashboard/perfil'
+
+    if (!code || !tenantId) {
+      console.error('❌ MP Callback: Faltan code o state')
+      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=missing_params`)
+    }
+
+    if (!MP_CLIENT_ID || !MP_CLIENT_SECRET) {
+      console.error('❌ MP Callback: Faltan credenciales de MercadoPago')
+      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=config_error`)
     }
 
     try {
-      const ok = await intercambiarCodigoPorTokens({
-        code,
-        tenantId: state,
+      const response = await fetch('https://api.mercadopago.com/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: MP_CLIENT_ID,
+          client_secret: MP_CLIENT_SECRET,
+          code: code,
+          grant_type: 'authorization_code',
+          redirect_uri: MP_REDIRECT_URI,
+        }),
       })
-      if (!ok) {
-        return c.redirect(`${base}/settings?tab=finances&mp_status=error`, 302)
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        console.error('❌ MP Callback: Error al intercambiar código con MP:', data)
+        return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`)
       }
-      return c.redirect(`${base}/settings?tab=finances&mp_status=success`, 302)
-    } catch {
-      return c.redirect(`${base}/settings?tab=finances&mp_status=error`, 302)
+
+      await db.update(tenants).set({
+        mpAccessToken: data.access_token,
+        mpRefreshToken: data.refresh_token,
+      }).where(eq(tenants.id, tenantId))
+
+      console.log(`✅ MP Callback: Productora ${tenantId} vinculada con MercadoPago exitosamente`)
+
+      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=success`)
+    } catch (error) {
+      console.error('❌ MP Callback: Error al intercambiar código con MP:', error)
+      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=oauth_failed`)
     }
   })
   .get("/status", authMiddleware, async (c) => {
