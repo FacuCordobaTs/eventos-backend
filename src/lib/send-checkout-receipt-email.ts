@@ -1,6 +1,6 @@
 import { and, asc, eq } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
-import QRCode from "qrcode"
+import { toBuffer } from "qrcode"
 import * as React from "react"
 import { Resend } from "resend"
 import {
@@ -12,7 +12,6 @@ import {
 } from "../db/schema"
 import { TicketEmail } from "../emails/TicketEmail"
 
-type Db = ReturnType<typeof drizzle>
 
 type CheckoutContact = {
   name: string
@@ -40,7 +39,7 @@ function receiptEmailSubject(eventName: string, ticketCount: number): string {
  * Throws on failure — callers should catch and log; do not block HTTP responses on this.
  */
 export async function sendGuestCheckoutReceiptEmail(input: {
-  db: Db
+  db: any
   eventId: string
   saleId: string
   receiptToken: string
@@ -100,7 +99,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
 
   for (const row of ticketRows) {
     if (row.qrHash == null || row.qrHash === "") continue
-    const qrBuffer = await QRCode.toBuffer(row.qrHash, {
+    const qrBuffer = await toBuffer(row.qrHash, {
       type: "png",
       width: 512,
       margin: 2,
@@ -115,7 +114,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
 
   for (const row of consumptionRows) {
     if (row.qrHash == null || row.qrHash === "") continue
-    const qrBuffer = await QRCode.toBuffer(row.qrHash, {
+    const qrBuffer = await toBuffer(row.qrHash, {
       type: "png",
       width: 512,
       margin: 2,
@@ -129,7 +128,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
   }
 
   const ticketCount = ticketRows.filter(
-    (r) => r.qrHash != null && r.qrHash !== ""
+    (r: any) => r.qrHash != null && r.qrHash !== ""
   ).length
 
   const resend = new Resend(apiKey)

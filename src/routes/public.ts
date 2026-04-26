@@ -38,7 +38,7 @@ async function countIssued(
 
 const guestCheckoutSchema = z.object({
   eventId: z.string().min(1),
-  paymentMethod: z.literal("TRANSFER"),
+  paymentMethod: z.enum(["TRANSFER", "CARD", "MERCADOPAGO"]),
   clientTotal: z.string().min(1),
   contact: z.object({
     name: z.string().min(1).max(255),
@@ -214,22 +214,32 @@ export const publicRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
-    const [cucuruCtx] = await db
+    const [paymentCtx] = await db
       .select({
         tenantId: events.tenantId,
         cucuruEnabled: tenants.cucuruEnabled,
+        mpConnected: tenants.mpConnected,
       })
       .from(events)
       .innerJoin(tenants, eq(events.tenantId, tenants.id))
       .where(eq(events.id, body.eventId))
       .limit(1)
 
-    if (!cucuruCtx) {
+    if (!paymentCtx) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
-    if (!cucuruCtx.cucuruEnabled) {
+    if (body.paymentMethod === "TRANSFER" && !paymentCtx.cucuruEnabled) {
       return c.json(
         { error: "Los cobros por transferencia no están disponibles para este evento." },
+        400
+      )
+    }
+    if (
+      (body.paymentMethod === "CARD" || body.paymentMethod === "MERCADOPAGO") &&
+      !paymentCtx.mpConnected
+    ) {
+      return c.json(
+        { error: "Mercado Pago no está habilitado para este evento" },
         400
       )
     }
@@ -243,12 +253,24 @@ export const publicRoute = new Hono()
             email: body.contact.email,
             phone: body.contact.phone,
           },
-          paymentMethod: "TRANSFER",
+          paymentMethod: body.paymentMethod,
           clientTotal: body.clientTotal.trim(),
           ticketLines: body.ticketLines ?? [],
           drinkLines: body.drinkLines ?? [],
         })
       )
+
+      if (body.paymentMethod === "CARD" || body.paymentMethod === "MERCADOPAGO") {
+        return c.json(
+          {
+            message: "Pendiente de pago",
+            receiptToken: result.receiptToken,
+            saleId: result.saleId,
+            payOnReceipt: true,
+          },
+          201
+        )
+      }
 
       if (!result.payOnReceipt) {
         return c.json({ error: "No se pudo iniciar el checkout." }, 500)
