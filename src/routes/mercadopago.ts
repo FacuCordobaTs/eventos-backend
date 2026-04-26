@@ -107,6 +107,7 @@ export const mercadopagoRoute = new Hono()
       .limit(1)
 
       console.log('✅ MP Status: Productora configurada')
+      console.log(row)
     return c.json({
       mpConnected: row?.mpPublicKey != null ? true : false,
       mpPublicKey: row?.mpPublicKey ?? null,
