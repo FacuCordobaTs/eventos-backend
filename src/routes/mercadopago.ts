@@ -73,6 +73,7 @@ export const mercadopagoRoute = new Hono()
       await db.update(tenants).set({
         mpAccessToken: data.access_token,
         mpRefreshToken: data.refresh_token,
+        mpConnected: true,
       }).where(eq(tenants.id, tenantId))
 
       console.log(`✅ MP Callback: Productora ${tenantId} vinculada con MercadoPago exitosamente`)
@@ -97,7 +98,6 @@ export const mercadopagoRoute = new Hono()
     const db = drizzle(pool)
     const [row] = await db
       .select({
-        mpConnected: tenants.mpConnected,
         mpPublicKey: tenants.mpPublicKey,
         mpUserId: tenants.mpUserId,
       })
@@ -106,7 +106,7 @@ export const mercadopagoRoute = new Hono()
       .limit(1)
 
     return c.json({
-      mpConnected: row?.mpConnected ?? false,
+      mpConnected: row?.mpPublicKey != null ? true : false,
       mpPublicKey: row?.mpPublicKey ?? null,
       mpUserId: row?.mpUserId ?? null,
     })
