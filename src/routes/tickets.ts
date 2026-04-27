@@ -12,6 +12,7 @@ import {
   purchaseErrorStatus,
 } from "../lib/ticket-purchase"
 import { qrCodeDataUrl } from "../lib/qr"
+import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
 
 const sellTicketSchema = z.object({
   eventId: z.string().min(1),
@@ -181,6 +182,9 @@ export const ticketsRoute = new Hono()
     }
 
     const ticketId = c.req.param("id")
+    if (ticketId == null || ticketId === "") {
+      return c.json({ error: "Falta el id de entrada" }, 400)
+    }
     const db = drizzle(pool)
 
     const [row] = await db
@@ -199,4 +203,99 @@ export const ticketsRoute = new Hono()
       qrDataUrl,
       qrHash: row.qrHash,
     })
+  })
+  .post("/:id/cancel", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const ticketId = c.req.param("id")
+    if (ticketId == null || ticketId === "") {
+      return c.json({ error: "Falta el id de entrada" }, 400)
+    }
+    const db = drizzle(pool)
+
+    const [row] = await db
+      .select({ id: tickets.id, status: tickets.status })
+      .from(tickets)
+      .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
+      .limit(1)
+
+    if (!row) {
+      return c.json({ error: "Entrada no encontrada" }, 404)
+    }
+    if (row.status !== "PENDING") {
+      return c.json(
+        {
+          error: "Solo se pueden anular entradas pendientes (no usadas ni ya anuladas).",
+        },
+        409
+      )
+    }
+
+    await db
+      .update(tickets)
+      .set({ status: "CANCELLED" })
+      .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
+
+    return c.json({ message: "Entrada anulada" })
+  })
+  .post("/:id/send-email", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const ticketId = c.req.param("id")
+    if (ticketId == null || ticketId === "") {
+      return c.json({ error: "Falta el id de entrada" }, 400)
+    }
+    const db = drizzle(pool)
+
+    const [row] = await db
+      .select({
+        id: tickets.id,
+        status: tickets.status,
+        buyerEmail: tickets.buyerEmail,
+      })
+      .from(tickets)
+      .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
+      .limit(1)
+
+    if (!row) {
+      return c.json({ error: "Entrada no encontrada" }, 404)
+    }
+    if (row.status === "CANCELLED") {
+      return c.json(
+        { error: "No se puede enviar el email de una entrada anulada." },
+        400
+      )
+    }
+    if (row.buyerEmail == null || row.buyerEmail.trim() === "") {
+      return c.json(
+        { error: "No email associated with this ticket" },
+        400
+      )
+    }
+
+    try {
+      await sendManualTicketQrEmail({ db, ticketId, tenantId })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error al enviar el email"
+      if (msg === "Entrada no encontrada") {
+        return c.json({ error: "Entrada no encontrada" }, 404)
+      }
+      if (msg.includes("RESEND_API_KEY")) {
+        return c.json({ error: msg }, 503)
+      }
+      return c.json({ error: msg }, 500)
+    }
+
+    await db
+      .update(tickets)
+      .set({ emailSentAt: new Date() })
+      .where(and(eq(tickets.id, ticketId), eq(tickets.tenantId, tenantId)))
+
+    return c.json({ message: "Email enviado" })
   })

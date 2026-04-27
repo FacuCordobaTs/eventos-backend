@@ -1,0 +1,9 @@
+[21:44:39 2026-04-26] FETCHING Version 2.43.2
+[21:44:39 2026-04-26] CREATING /home/facu/.spicetify
+[21:44:39 2026-04-26] DOWNLOADING https://github.com/spicetify/cli/releases/download/v2.43.2/spicetify-2.43.2-linux-amd64.tar.gz
+[21:44:41 2026-04-26] EXTRACTING /home/facu/.spicetify/spicetify.tar.gz
+[21:44:41 2026-04-26] SETTING EXECUTABLE PERMISSIONS TO /home/facu/.spicetify/spicetify
+[21:44:41 2026-04-26] REMOVING /home/facu/.spicetify/spicetify.tar.gz
+[21:44:41 2026-04-26] APPENDING /home/facu/.spicetify to PATH in /home/facu/.bashrc
+[21:44:41 2026-04-26] spicetify v2.43.2 was installed successfully to /home/facu/.spicetify
+[21:44:41 2026-04-26] Run 'spicetify --help' to get started

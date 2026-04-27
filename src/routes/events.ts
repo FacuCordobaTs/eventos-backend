@@ -537,6 +537,7 @@ export const eventsRoute = new Hono()
         buyerEmail: tickets.buyerEmail,
         createdAt: tickets.createdAt,
         scannedAt: tickets.scannedAt,
+        emailSentAt: tickets.emailSentAt,
         ticketTypeId: tickets.ticketTypeId,
         ticketTypeName: ticketTypes.name,
       })
@@ -554,6 +555,7 @@ export const eventsRoute = new Hono()
         buyerEmail: r.buyerEmail,
         createdAt: r.createdAt,
         scannedAt: r.scannedAt,
+        emailSentAt: r.emailSentAt,
         ticketTypeId: r.ticketTypeId,
         ticketTypeName: r.ticketTypeName,
       })),

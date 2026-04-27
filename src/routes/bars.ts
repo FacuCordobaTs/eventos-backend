@@ -21,6 +21,7 @@ import {
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import { InsufficientStockError } from "./inventory"
 import {
   recipeStockDeduction,
   stockAllocatedToBaseUnits,
@@ -317,20 +318,49 @@ export const barsRoute = new Hono()
       )
       .orderBy(asc(inventoryItems.name))
 
+    const sumByItem = new Map<string, string>()
+    const sumRows = await db
+      .select({
+        iid: barInventory.inventoryItemId,
+        s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+      })
+      .from(barInventory)
+      .innerJoin(bars, eq(barInventory.barId, bars.id))
+      .where(
+        and(
+          eq(bars.eventId, bar.eventId),
+          eq(bars.tenantId, tenantId),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+      .groupBy(barInventory.inventoryItemId)
+
+    for (const sr of sumRows) {
+      sumByItem.set(sr.iid, sr.s)
+    }
+
     return c.json({
-      items: rows.map((r) => ({
-        inventoryItemId: r.inventoryItemId,
-        name: r.name,
-        baseUnit: r.baseUnit,
-        packageSize: r.packageSize,
-        eventStockAllocated:
-          r.eventStockAllocated == null
-            ? "0.00"
-            : String(r.eventStockAllocated),
-        barInventoryRowId: r.barRowId,
-        barCurrentStock:
-          r.barStock == null ? "0.00" : String(r.barStock),
-      })),
+      items: rows.map((r) => {
+        const cap = decFromDb(
+          r.eventStockAllocated == null ? "0" : String(r.eventStockAllocated)
+        )
+        const sumBars = decFromDb(sumByItem.get(r.inventoryItemId) ?? "0")
+        const unallocRaw = cap.minus(sumBars)
+        const unalloc = unallocRaw.lt(dec(0)) ? dec(0) : unallocRaw
+        return {
+          inventoryItemId: r.inventoryItemId,
+          name: r.name,
+          baseUnit: r.baseUnit,
+          packageSize: r.packageSize,
+          eventStockAllocated:
+            r.eventStockAllocated == null
+              ? "0.00"
+              : String(r.eventStockAllocated),
+          unallocatedEventStock: decToDb(unalloc),
+          barInventoryRowId: r.barRowId,
+          barCurrentStock: r.barStock == null ? "0.00" : String(r.barStock),
+        }
+      }),
     })
   })
   .patch(
@@ -455,6 +485,52 @@ export const barsRoute = new Hono()
       return c.json({ ok: true, currentStock: stockStr }, 201)
     }
   )
+  .delete("/:barId/inventory/:inventoryItemId", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const inventoryItemId = c.req.param("inventoryItemId")
+    if (inventoryItemId == null || inventoryItemId === "") {
+      return c.json({ error: "Falta el ítem" }, 400)
+    }
+    const db = drizzle(pool)
+    const bar = await requireBarForTenant(db, barId, tenantId)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+
+    const [row] = await db
+      .select({ id: barInventory.id })
+      .from(barInventory)
+      .where(
+        and(
+          eq(barInventory.barId, barId),
+          eq(barInventory.inventoryItemId, inventoryItemId),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!row) {
+      return c.json({ ok: true, removed: false })
+    }
+
+    await db
+      .delete(barInventory)
+      .where(
+        and(
+          eq(barInventory.id, row.id),
+          eq(barInventory.tenantId, tenantId)
+        )
+      )
+
+    void emitCommittedStockDeltas(tenantId, bar.eventId, {
+      barDeltas: { barId, itemIds: [inventoryItemId] },
+    })
+    return c.json({ ok: true, removed: true })
+  })
   .post(
     "/:barId/redeem",
     zValidator("json", redeemQrSchema),
@@ -468,7 +544,14 @@ export const barsRoute = new Hono()
       const qrHash = c.req.valid("json").qrHash.trim()
       const db = drizzle(pool)
 
-      const result = await db.transaction(async (tx) => {
+      let result: {
+        kind: "no_bar" | "invalid_qr" | "used" | "wrong_event" | "wrong_bar" | "race_used" | "ok"
+        productName?: string
+        eventId?: string
+        inventoryItemIds?: string[]
+      }
+      try {
+        result = await db.transaction(async (tx) => {
         const [bar] = await tx
           .select()
           .from(bars)
@@ -566,6 +649,37 @@ export const barsRoute = new Hono()
             saleType,
             item
           )
+          if (!deduct.gt(dec(0))) continue
+
+          const [evRow] = await tx
+            .select()
+            .from(eventInventory)
+            .where(
+              and(
+                eq(eventInventory.eventId, bar.eventId),
+                eq(eventInventory.inventoryItemId, r.inventoryItemId),
+                eq(eventInventory.tenantId, tenantId)
+              )
+            )
+            .limit(1)
+          const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
+
+          const [sumR] = await tx
+            .select({
+              s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+            })
+            .from(barInventory)
+            .innerJoin(bars, eq(barInventory.barId, bars.id))
+            .where(
+              and(
+                eq(bars.eventId, bar.eventId),
+                eq(bars.tenantId, tenantId),
+                eq(barInventory.tenantId, tenantId),
+                eq(barInventory.inventoryItemId, r.inventoryItemId)
+              )
+            )
+
+          const sumAll = decFromDb(sumR?.s ?? "0")
           const [bRow] = await tx
             .select()
             .from(barInventory)
@@ -577,27 +691,62 @@ export const barsRoute = new Hono()
               )
             )
             .limit(1)
+          const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
 
-          if (bRow) {
-            const next = decFromDb(bRow.currentStock).minus(deduct)
+          if (!evRow) {
+            if (deduct.gt(barAvail)) {
+              throw new InsufficientStockError(
+                "Stock insuficiente",
+                r.inventoryItemId,
+                item.name
+              )
+            }
+            if (bRow) {
+              await tx
+                .update(barInventory)
+                .set({ currentStock: decToDb(barAvail.minus(deduct)) })
+                .where(
+                  and(
+                    eq(barInventory.id, bRow.id),
+                    eq(barInventory.tenantId, tenantId)
+                  )
+                )
+            }
+            continue
+          }
+
+          const unalloc = cap.minus(sumAll)
+          if (deduct.gt(barAvail.plus(unalloc))) {
+            throw new InsufficientStockError(
+              "Stock insuficiente",
+              r.inventoryItemId,
+              item.name
+            )
+          }
+
+          const fromBar = deduct.lte(barAvail) ? deduct : barAvail
+          const newCap = cap.minus(deduct)
+          await tx
+            .update(eventInventory)
+            .set({ stockAllocated: decToDb(newCap) })
+            .where(
+              and(
+                eq(eventInventory.id, evRow.id),
+                eq(eventInventory.tenantId, tenantId)
+              )
+            )
+
+          if (bRow && fromBar.gt(0)) {
+            const newBar = barAvail.minus(fromBar)
             await tx
               .update(barInventory)
-              .set({ currentStock: decToDb(next) })
+              .set({ currentStock: decToDb(newBar) })
               .where(
                 and(
                   eq(barInventory.id, bRow.id),
                   eq(barInventory.tenantId, tenantId)
                 )
               )
-          } else {
-            const next = dec(0).minus(deduct)
-            await tx.insert(barInventory).values({
-              id: uuidv4(),
-              barId,
-              inventoryItemId: r.inventoryItemId,
-              tenantId,
-              currentStock: decToDb(next),
-            })
           }
         }
 
@@ -607,7 +756,19 @@ export const barsRoute = new Hono()
           eventId: bar.eventId,
           inventoryItemIds: recipes.map((r) => r.inventoryItemId),
         }
-      })
+        })
+      } catch (e) {
+        if (e instanceof InsufficientStockError) {
+          return c.json(
+            {
+              error: `Stock insuficiente: ${e.inventoryItemName}`,
+              inventoryItemId: e.inventoryItemId,
+            },
+            409
+          )
+        }
+        throw e
+      }
 
       if (result.kind === "no_bar") {
         return c.json({ error: "Barra no encontrada" }, 404)
@@ -627,9 +788,11 @@ export const barsRoute = new Hono()
 
       if (
         result.kind === "ok" &&
+        result.inventoryItemIds &&
         result.inventoryItemIds.length > 0
       ) {
-        void emitCommittedStockDeltas(tenantId, result.eventId, {
+        void emitCommittedStockDeltas(tenantId, result.eventId!, {
+          eventItemIds: result.inventoryItemIds,
           barDeltas: { barId, itemIds: result.inventoryItemIds },
         })
       }

@@ -114,6 +114,8 @@ export const tickets = mysqlTable(
     scannedAt: timestamp('scanned_at'),
     scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
     createdAt: timestamp('created_at').defaultNow(),
+    /** Set when staff or checkout flow sends the ticket QR by email. */
+    emailSentAt: timestamp('email_sent_at'),
   },
   (table) => ({
     tenantIdIdx: index('tickets_tenant_id_idx').on(table.tenantId),
