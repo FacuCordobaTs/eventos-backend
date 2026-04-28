@@ -292,18 +292,35 @@ async function requireBarForEventTenant(
 }
 
 const EMPTY_BAR_STATS = {
-  staffCount: 0,
-  productCount: 0,
-  totalStock: "0.00",
+  staffList: [] as string[],
+  productList: [] as string[],
+  inventoryList: [] as { name: string; bottles: number }[],
   totalSales: "0.00",
 } as const
+
+/** Bottle-equivalent units for bar inventory row (aligned with admin display logic). */
+function bottlesForBarInventoryRow(
+  baseUnit: (typeof inventoryItems.$inferSelect)["baseUnit"],
+  packageSize: string | null | undefined,
+  currentStock: string
+): number {
+  const stock = decFromDb(currentStock)
+  if (baseUnit === "UNIT") {
+    return Math.max(0, Math.floor(stock.toNumber() + 1e-9))
+  }
+  const per = decFromDb(packageSize ?? "0")
+  if (!per.gt(0)) {
+    return Math.max(0, Math.floor(stock.toNumber() + 1e-9))
+  }
+  return Math.max(0, Math.floor(stock.div(per).toNumber() + 1e-9))
+}
 
 function sanitizeBar(
   row: typeof bars.$inferSelect,
   stats?: {
-    staffCount: number
-    productCount: number
-    totalStock: string
+    staffList: string[]
+    productList: string[]
+    inventoryList: { name: string; bottles: number }[]
     totalSales: string
   }
 ) {
@@ -321,9 +338,9 @@ function sanitizeBar(
   }
   return {
     ...base,
-    staffCount: stats.staffCount,
-    productCount: stats.productCount,
-    totalStock: stats.totalStock,
+    staffList: stats.staffList,
+    productList: stats.productList,
+    inventoryList: stats.inventoryList,
     totalSales: stats.totalSales,
   }
 }
@@ -1374,48 +1391,60 @@ export const eventsRoute = new Hono()
 
     const barIds = rows.map((r) => r.id)
 
-    const [staffAgg, prodAgg, invAgg, salesAgg] = await Promise.all([
+    const [staffRows, productRows, invRows, salesAgg] = await Promise.all([
       db
         .select({
           barId: eventStaff.barId,
-          n: count(),
+          staffName: staff.name,
         })
         .from(eventStaff)
+        .innerJoin(staff, eq(eventStaff.staffId, staff.id))
         .where(
           and(
             eq(eventStaff.eventId, eventId),
             eq(eventStaff.tenantId, tenantId),
+            eq(staff.tenantId, tenantId),
             inArray(eventStaff.barId, barIds)
           )
         )
-        .groupBy(eventStaff.barId),
+        .orderBy(asc(staff.name)),
       db
         .select({
           barId: barProducts.barId,
-          n: count(),
+          productName: products.name,
         })
         .from(barProducts)
+        .innerJoin(products, eq(barProducts.productId, products.id))
         .where(
           and(
             eq(barProducts.tenantId, tenantId),
+            eq(products.tenantId, tenantId),
             eq(barProducts.isActive, true),
             inArray(barProducts.barId, barIds)
           )
         )
-        .groupBy(barProducts.barId),
+        .orderBy(asc(products.name)),
       db
         .select({
           barId: barInventory.barId,
-          total: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,4))), 0)`,
+          itemName: inventoryItems.name,
+          baseUnit: inventoryItems.baseUnit,
+          packageSize: inventoryItems.packageSize,
+          currentStock: barInventory.currentStock,
         })
         .from(barInventory)
+        .innerJoin(
+          inventoryItems,
+          eq(barInventory.inventoryItemId, inventoryItems.id)
+        )
         .where(
           and(
             eq(barInventory.tenantId, tenantId),
+            eq(inventoryItems.tenantId, tenantId),
             inArray(barInventory.barId, barIds)
           )
         )
-        .groupBy(barInventory.barId),
+        .orderBy(asc(inventoryItems.name)),
       db
         .select({
           barId: sales.barId,
@@ -1433,25 +1462,33 @@ export const eventsRoute = new Hono()
         .groupBy(sales.barId),
     ])
 
-    const staffByBar = new Map<string, number>()
-    for (const r of staffAgg) {
-      if (r.barId != null) {
-        staffByBar.set(r.barId, Number(r.n ?? 0))
-      }
+    const staffListByBar = new Map<string, string[]>()
+    for (const r of staffRows) {
+      if (r.barId == null) continue
+      const list = staffListByBar.get(r.barId) ?? []
+      list.push(r.staffName)
+      staffListByBar.set(r.barId, list)
     }
 
-    const productsByBar = new Map<string, number>()
-    for (const r of prodAgg) {
-      if (r.barId != null) {
-        productsByBar.set(r.barId, Number(r.n ?? 0))
-      }
+    const productListByBar = new Map<string, string[]>()
+    for (const r of productRows) {
+      if (r.barId == null) continue
+      const list = productListByBar.get(r.barId) ?? []
+      list.push(r.productName)
+      productListByBar.set(r.barId, list)
     }
 
-    const stockByBar = new Map<string, string>()
-    for (const r of invAgg) {
-      if (r.barId != null) {
-        stockByBar.set(r.barId, String(r.total ?? "0"))
-      }
+    const inventoryListByBar = new Map<string, { name: string; bottles: number }[]>()
+    for (const r of invRows) {
+      if (r.barId == null) continue
+      const bottles = bottlesForBarInventoryRow(
+        r.baseUnit,
+        r.packageSize,
+        String(r.currentStock)
+      )
+      const list = inventoryListByBar.get(r.barId) ?? []
+      list.push({ name: r.itemName, bottles })
+      inventoryListByBar.set(r.barId, list)
     }
 
     const salesByBar = new Map<string, string>()
@@ -1467,19 +1504,13 @@ export const eventsRoute = new Hono()
       return n.toFixed(2)
     }
 
-    function stock2(raw: string): string {
-      const n = Number.parseFloat(raw)
-      if (Number.isNaN(n)) return "0.00"
-      return n.toFixed(2)
-    }
-
     return c.json({
       bars: rows.map((row) => {
         const id = row.id
         return sanitizeBar(row, {
-          staffCount: staffByBar.get(id) ?? 0,
-          productCount: productsByBar.get(id) ?? 0,
-          totalStock: stock2(stockByBar.get(id) ?? "0"),
+          staffList: staffListByBar.get(id) ?? [],
+          productList: productListByBar.get(id) ?? [],
+          inventoryList: inventoryListByBar.get(id) ?? [],
           totalSales: money2(salesByBar.get(id) ?? "0"),
         })
       }),
