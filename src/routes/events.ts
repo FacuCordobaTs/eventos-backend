@@ -607,7 +607,7 @@ export const eventsRoute = new Hono()
       and(
         eq(sales.eventId, eventId),
         eq(sales.tenantId, tenantId),
-        or(isNull(sales.status), eq(sales.status, "COMPLETED"))
+        eq(sales.status, "COMPLETED")
       )
 
     const [
