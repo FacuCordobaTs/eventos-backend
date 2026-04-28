@@ -105,7 +105,13 @@ export const analyticsRoute = new Hono()
     const [usedCountRow] = await db
       .select({ n: count() })
       .from(tickets)
-      .where(and(eq(tickets.tenantId, tenantId), eq(tickets.status, "USED")))
+      .where(
+        and(
+          eq(tickets.tenantId, tenantId),
+          ne(tickets.status, "CANCELLED"),
+          eq(tickets.status, "USED")
+        )
+      )
 
     const th = alertThreshold()
     let stockAlerts: {

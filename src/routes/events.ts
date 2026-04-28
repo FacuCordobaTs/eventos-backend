@@ -628,13 +628,7 @@ export const eventsRoute = new Hono()
       db
         .select({ n: count() })
         .from(tickets)
-        .where(
-          and(
-            eq(tickets.eventId, eventId),
-            eq(tickets.tenantId, tenantId),
-            eq(tickets.status, "USED")
-          )
-        ),
+        .where(and(whereTicketsNonCancelled(), eq(tickets.status, "USED"))),
       db
         .select({
           total: sql<string>`coalesce(sum(cast(${ticketTypes.price} as decimal(14,2))), 0)`,
@@ -825,6 +819,7 @@ export const eventsRoute = new Hono()
         and(
           eq(tickets.eventId, eventId),
           eq(tickets.tenantId, tenantId),
+          ne(tickets.status, "CANCELLED"),
           eq(tickets.status, "USED")
         )
       )
