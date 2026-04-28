@@ -50,7 +50,7 @@ export function bottleLoadStockDelta(
     return {
       delta: dec(0),
       error:
-        "Indicá ml/g por envase o configurá el tamaño de envase del insumo.",
+        "Configurá el formato de envase del insumo en el catálogo (Inventario PRO).",
     }
   }
   return { delta: bottles.times(per) }
