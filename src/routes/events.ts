@@ -614,7 +614,6 @@ export const eventsRoute = new Hono()
       ticketsRow,
       ticketsUsedRow,
       ticketRevenueRow,
-      revenueRow,
       barProductRevenueRow,
       consumptionsRow,
       consumptionsRedeemedRow,
@@ -642,12 +641,6 @@ export const eventsRoute = new Hono()
             eq(ticketTypes.tenantId, tenantId)
           )
         ),
-      db
-        .select({
-          total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
-        })
-        .from(sales)
-        .where(whereSaleCountsAsRevenue()),
       db
         .select({
           total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
@@ -702,7 +695,7 @@ export const eventsRoute = new Hono()
     const ticketsSold = Number(ticketsRow[0]?.n ?? 0)
     const ticketsCheckedIn = Number(ticketsUsedRow[0]?.n ?? 0)
     const ticketRevenueDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
-    const barSalesDec = decFromDb(revenueRow[0]?.total ?? "0")
+    const barSalesDec = decFromDb(barProductRevenueRow[0]?.total ?? "0")
     const grossDec = ticketRevenueDec.plus(barSalesDec)
     const expensesDec = canViewFinancials
       ? decFromDb(expenseRow[0]?.total ?? "0")
@@ -723,8 +716,6 @@ export const eventsRoute = new Hono()
     const digitalGenerated = Number(consumptionsRow[0]?.n ?? 0)
     const digitalRedeemed = Number(consumptionsRedeemedRow[0]?.n ?? 0)
 
-    const barProductDec = decFromDb(barProductRevenueRow[0]?.total ?? "0")
-
     return c.json({
       canViewFinancials,
       ticketsSold,
@@ -736,7 +727,7 @@ export const eventsRoute = new Hono()
       totalExpenses: canViewFinancials ? decToDb(expensesDec) : null,
       netProfit: canViewFinancials ? decToDb(netDec) : null,
       totalRevenue: decToDb(barSalesDec),
-      barProductRevenue: decToDb(barProductDec),
+      barProductRevenue: decToDb(barSalesDec),
       digitalConsumptionsSold: digitalGenerated,
       digitalConsumptionsGenerated: digitalGenerated,
       digitalConsumptionsRedeemed: digitalRedeemed,
