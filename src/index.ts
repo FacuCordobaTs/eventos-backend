@@ -52,8 +52,12 @@ mountStockWebSocket(app)
 
 const port = Number(process.env.PORT ?? 3000)
 
+/** Larger than multipart event images (5 MB cap + boundary overhead); avoids Bun 413 before Hono/CORS runs. */
+const maxRequestBodySize = 9 * 1024 * 1024
+
 export default {
   port,
+  maxRequestBodySize,
   fetch: (req: Request, server: Bun.Server) => app.fetch(req, { server }),
   websocket: honoWebsocket,
 }
