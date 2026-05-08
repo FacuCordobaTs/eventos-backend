@@ -864,6 +864,7 @@ export const eventsRoute = new Hono()
         name: products.name,
         price: products.price,
         catalogIsActive: products.isActive,
+        imageUrl: products.imageUrl,
       })
       .from(products)
       .where(catalogWhere)
@@ -884,6 +885,7 @@ export const eventsRoute = new Hono()
           name: p.name,
           price: p.price,
           catalogIsActive: p.catalogIsActive,
+          imageUrl: p.imageUrl ?? null,
           isActiveForEvent: row?.isActive === true,
           priceOverride:
             row?.priceOverride === null || row?.priceOverride === undefined

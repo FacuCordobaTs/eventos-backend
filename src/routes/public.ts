@@ -151,6 +151,8 @@ export const publicRoute = new Hono()
       .select({
         id: products.id,
         name: products.name,
+        saleType: products.saleType,
+        productImageUrl: products.imageUrl,
         priceOverride: eventProducts.priceOverride,
         basePrice: products.price,
       })
@@ -186,6 +188,8 @@ export const publicRoute = new Hono()
     const drinkProducts = consumptionRows.map((r) => ({
       id: r.id,
       name: r.name,
+      saleType: r.saleType,
+      imageUrl: r.productImageUrl ?? null,
       price:
         r.priceOverride != null && r.priceOverride !== ""
           ? r.priceOverride

@@ -175,6 +175,7 @@ export const products = mysqlTable('products', {
   isActive: boolean('is_active').default(true),
   /** GLASS: la receta descuenta quantityUsed en la unidad del insumo; BOTTLE: quantityUsed es botellas × tamaño estándar. */
   saleType: mysqlEnum('sale_type', ['BOTTLE', 'GLASS']).notNull().default('GLASS'),
+  imageUrl: varchar('image_url', { length: 512 }),
 });
 
 export const eventProducts = mysqlTable(

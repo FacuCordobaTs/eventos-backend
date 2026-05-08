@@ -26,11 +26,56 @@ import {
   recipeStockDeduction,
 } from "../lib/inventory-deduction"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import {
+  deleteFileByKey,
+  keyFromPublicUrl,
+  publicUrlForKey,
+  uploadFile,
+} from "../lib/s3-client"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
   if (id == null || id === "") return null
   return id
+}
+
+const PRODUCT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+const PRODUCT_IMAGE_ALLOWED_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+])
+
+function safeProductUploadFilename(name: string): string {
+  const base = name
+    .replace(/^.*[/\\]/, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+  return (base || "image").slice(0, 120)
+}
+
+function guessProductImageContentType(file: File, filename: string): string | null {
+  const t = file.type?.trim()
+  if (t && PRODUCT_IMAGE_ALLOWED_TYPES.has(t)) return t
+  const lower = filename.toLowerCase()
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg"
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".webp")) return "image/webp"
+  if (lower.endsWith(".gif")) return "image/gif"
+  return null
+}
+
+async function requireProductForTenant(
+  db: ReturnType<typeof drizzle>,
+  productId: string,
+  tenantId: string
+): Promise<typeof products.$inferSelect | null> {
+  const [row] = await db
+    .select()
+    .from(products)
+    .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+    .limit(1)
+  return row ?? null
 }
 
 const baseUnitSchema = z.enum(["ML", "GRAMS", "UNIT"])
@@ -376,6 +421,7 @@ export const inventoryRoute = new Hono()
         price: p.price,
         isActive: p.isActive,
         saleType: p.saleType,
+        imageUrl: p.imageUrl ?? null,
         recipes: (byProduct.get(p.id) ?? []).map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -469,6 +515,7 @@ export const inventoryRoute = new Hono()
           price: p!.price,
           isActive: p!.isActive,
           saleType: p!.saleType,
+          imageUrl: p!.imageUrl ?? null,
           recipes: recipes.map((r) => ({
             id: r.id,
             inventoryItemId: r.inventoryItemId,
@@ -569,6 +616,197 @@ export const inventoryRoute = new Hono()
         price: p!.price,
         isActive: p!.isActive,
         saleType: p!.saleType,
+        imageUrl: p!.imageUrl ?? null,
+        recipes: recipes.map((r) => ({
+          id: r.id,
+          inventoryItemId: r.inventoryItemId,
+          quantityUsed: r.quantityUsed,
+          inventoryItemName: r.inventoryName,
+          inventoryBaseUnit: r.inventoryBaseUnit,
+          inventoryPackageSize: r.inventoryPackageSize,
+        })),
+      },
+    })
+  })
+  .post("/products/:id/image", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const productId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const prod = await requireProductForTenant(db, productId, tenantId)
+    if (!prod) {
+      return c.json({ error: "Producto no encontrado" }, 404)
+    }
+
+    let body: Record<string, string | File>
+    try {
+      body = (await c.req.parseBody()) as Record<string, string | File>
+    } catch {
+      return c.json({ error: "No se pudo leer el formulario." }, 400)
+    }
+
+    const raw = body.image ?? body.file
+    if (!(raw instanceof File)) {
+      return c.json(
+        { error: "Adjuntá una imagen en el campo «image» (multipart/form-data)." },
+        400
+      )
+    }
+
+    if (raw.size > PRODUCT_IMAGE_MAX_BYTES) {
+      return c.json({ error: "La imagen no puede superar los 5 MB." }, 400)
+    }
+
+    const contentType = guessProductImageContentType(raw, raw.name)
+    if (!contentType) {
+      return c.json(
+        { error: "Formato no permitido. Usá JPEG, PNG, WebP o GIF." },
+        400
+      )
+    }
+
+    const segment = safeProductUploadFilename(raw.name)
+    const key = `products/${productId}/${Date.now()}-${segment}`
+
+    let publicUrl: string
+    try {
+      const buf = Buffer.from(await raw.arrayBuffer())
+      await uploadFile(buf, key, contentType)
+      publicUrl = publicUrlForKey(key)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error al subir la imagen"
+      if (msg.includes("Missing required environment variable")) {
+        return c.json(
+          { error: "Almacenamiento no configurado (variables R2)." },
+          503
+        )
+      }
+      return c.json({ error: "No se pudo subir la imagen al almacenamiento." }, 502)
+    }
+
+    if (publicUrl.length > 512) {
+      return c.json({ error: "La URL pública generada supera el límite permitido." }, 400)
+    }
+
+    if (prod.imageUrl) {
+      const oldKey = keyFromPublicUrl(prod.imageUrl)
+      if (oldKey) {
+        try {
+          await deleteFileByKey(oldKey)
+        } catch {
+          /* reemplazo best-effort */
+        }
+      }
+    }
+
+    await db
+      .update(products)
+      .set({ imageUrl: publicUrl })
+      .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+
+    const [p] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, productId))
+      .limit(1)
+    const recipes = await db
+      .select({
+        id: productRecipes.id,
+        inventoryItemId: productRecipes.inventoryItemId,
+        quantityUsed: productRecipes.quantityUsed,
+        inventoryName: inventoryItems.name,
+        inventoryBaseUnit: inventoryItems.baseUnit,
+        inventoryPackageSize: inventoryItems.packageSize,
+      })
+      .from(productRecipes)
+      .innerJoin(
+        inventoryItems,
+        eq(productRecipes.inventoryItemId, inventoryItems.id)
+      )
+      .where(eq(productRecipes.productId, productId))
+
+    return c.json({
+      product: {
+        id: p!.id,
+        name: p!.name,
+        price: p!.price,
+        isActive: p!.isActive,
+        saleType: p!.saleType,
+        imageUrl: p!.imageUrl ?? null,
+        recipes: recipes.map((r) => ({
+          id: r.id,
+          inventoryItemId: r.inventoryItemId,
+          quantityUsed: r.quantityUsed,
+          inventoryItemName: r.inventoryName,
+          inventoryBaseUnit: r.inventoryBaseUnit,
+          inventoryPackageSize: r.inventoryPackageSize,
+        })),
+      },
+    })
+  })
+  .delete("/products/:id/image", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const productId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const prod = await requireProductForTenant(db, productId, tenantId)
+    if (!prod) {
+      return c.json({ error: "Producto no encontrado" }, 404)
+    }
+
+    if (prod.imageUrl) {
+      const oldKey = keyFromPublicUrl(prod.imageUrl)
+      if (oldKey) {
+        try {
+          await deleteFileByKey(oldKey)
+        } catch {
+          /* seguimos limpiando la DB */
+        }
+      }
+    }
+
+    await db
+      .update(products)
+      .set({ imageUrl: null })
+      .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+
+    const [p] = await db
+      .select()
+      .from(products)
+      .where(eq(products.id, productId))
+      .limit(1)
+    const recipes = await db
+      .select({
+        id: productRecipes.id,
+        inventoryItemId: productRecipes.inventoryItemId,
+        quantityUsed: productRecipes.quantityUsed,
+        inventoryName: inventoryItems.name,
+        inventoryBaseUnit: inventoryItems.baseUnit,
+        inventoryPackageSize: inventoryItems.packageSize,
+      })
+      .from(productRecipes)
+      .innerJoin(
+        inventoryItems,
+        eq(productRecipes.inventoryItemId, inventoryItems.id)
+      )
+      .where(eq(productRecipes.productId, productId))
+
+    return c.json({
+      product: {
+        id: p!.id,
+        name: p!.name,
+        price: p!.price,
+        isActive: p!.isActive,
+        saleType: p!.saleType,
+        imageUrl: p!.imageUrl ?? null,
         recipes: recipes.map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
