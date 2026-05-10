@@ -327,6 +327,7 @@ export const publicRoute = new Hono()
           receiptToken: result.receiptToken,
           saleId: result.saleId,
           payOnReceipt: true,
+          transfer: { alias, accountNumber },
         },
         201
       )
