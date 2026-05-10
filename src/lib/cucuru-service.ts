@@ -1,5 +1,5 @@
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, eq, sql } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { pool } from "../db"
 import { accountPool, sales, tenants } from "../db/schema"
 
@@ -77,22 +77,13 @@ export async function asignarAliasASale(
       return { ok: false, reason: "cucuru_disabled" }
     }
 
-    
-    const countQueryRows = await db
-    .select({ count: sql<number>`count(*)` })
-    .from(accountPool)
-    .where(eq(accountPool.tenantId, tenantId));
-    const totalAccounts = countQueryRows[0].count ?? 0;
-
     const apiKey = tenant.cucuruApiKey?.trim()
     const collectorId = tenant.cucuruCollectorId?.trim()
     if (!apiKey || !collectorId) {
       return { ok: false, reason: "missing_credentials" }
     }
 
-    
     let newAccountRes;
-
     try {
       const createCvuRequest = await fetch("https://api.cucuru.com/app/v1/Collection/accounts/account", {
         method: "PUT",
@@ -106,7 +97,6 @@ export async function asignarAliasASale(
         })
       });
 
-      
       if (!createCvuRequest.ok) {
         const err = await createCvuRequest.text();
         throw new Error(`Error creando CVU: ${createCvuRequest.status} ${err}`);
@@ -117,33 +107,42 @@ export async function asignarAliasASale(
       console.error("Error creando cuenta en Cucuru:", error);
       throw new Error("Fallo al crear cuenta CVU virtual en el proveedor.");
     }
-    
+
     const accountNumber = newAccountRes.account_number.toString();
-    // Construimos el alias con un formato secuencial: piru.[slug].[numero_secuencial]
-    const aliasSecuencial = `totem.${slug}.${totalAccounts + 1}`.slice(0, 20);
+    // slug truncado a 7 chars para dejar espacio al sufijo: totem.(7).(5) = 19 chars
+    const slugShort = slug.slice(0, 7);
 
-      // 4. Asignar el Alias al nuevo CVU
-      try {
-        const createAliasRequest = await fetch("https://api.cucuru.com/app/v1/Collection/accounts/account/alias", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Cucuru-Api-Key": apiKey,
-                "X-Cucuru-Collector-id": collectorId
-            },
-            body: JSON.stringify({
-                account_number: accountNumber,
-                alias: aliasSecuencial
-            })
-        });
+    // Reintentar hasta 3 veces con sufijo aleatorio en caso de colisión de alias
+    let aliasSecuencial: string | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const randomSuffix = Math.random().toString(36).slice(2, 7);
+      const candidate = `totem.${slugShort}.${randomSuffix}`;
 
-        if (!createAliasRequest.ok) {
-            const err = await createAliasRequest.text();
-            throw new Error(`Error asignando Alias: ${createAliasRequest.status} ${err}`);
-        }
-    } catch (error) {
-        console.error("Error asignando alias en Cucuru:", error);
-        throw new Error("Fallo al asignar alias al nuevo CVU en el proveedor.");
+      const createAliasRequest = await fetch("https://api.cucuru.com/app/v1/Collection/accounts/account/alias", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Cucuru-Api-Key": apiKey,
+          "X-Cucuru-Collector-id": collectorId,
+        },
+        body: JSON.stringify({ account_number: accountNumber, alias: candidate }),
+      });
+
+      if (createAliasRequest.ok) {
+        aliasSecuencial = candidate;
+        break;
+      }
+
+      const errBody = await createAliasRequest.text();
+      const isCollision = errBody.toLowerCase().includes("ya utilizado") || errBody.toLowerCase().includes("already");
+      if (!isCollision) {
+        throw new Error(`Error asignando Alias: ${createAliasRequest.status} ${errBody}`);
+      }
+      console.warn(`[cucuru] alias "${candidate}" ya utilizado, reintento ${attempt}/3`);
+    }
+
+    if (!aliasSecuencial) {
+      throw new Error("No se pudo generar un alias único para el CVU después de 3 intentos.");
     }
 
     await db.insert(accountPool).values({
