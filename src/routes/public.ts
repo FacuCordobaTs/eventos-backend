@@ -13,10 +13,11 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { SQL, and, asc, count, eq, gte, ne } from "drizzle-orm"
+import { SQL, and, asc, count, eq, gte, inArray, ne } from "drizzle-orm"
 import { executeClientCheckout } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
+import { obtenerTokenValido } from "../lib/mercadopago-utils"
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -364,6 +365,15 @@ export const publicRoute = new Hono()
 
     const saleId = header.sale.id
 
+    const consumptionShape = {
+      id: digitalConsumptions.id,
+      qrHash: digitalConsumptions.qrHash,
+      status: digitalConsumptions.status,
+      productId: digitalConsumptions.productId,
+      productName: products.name,
+      productPrice: products.price,
+    }
+
     const [ticketRows, consumptionRows] = await Promise.all([
       db
         .select({
@@ -380,14 +390,7 @@ export const publicRoute = new Hono()
         )
         .orderBy(ticketTypes.name, tickets.createdAt),
       db
-        .select({
-          id: digitalConsumptions.id,
-          qrHash: digitalConsumptions.qrHash,
-          status: digitalConsumptions.status,
-          productId: digitalConsumptions.productId,
-          productName: products.name,
-          productPrice: products.price,
-        })
+        .select(consumptionShape)
         .from(digitalConsumptions)
         .innerJoin(products, eq(digitalConsumptions.productId, products.id))
         .where(
@@ -398,6 +401,38 @@ export const publicRoute = new Hono()
         )
         .orderBy(products.name, digitalConsumptions.createdAt),
     ])
+
+    // Addon consumptions: other paid sales for same customer+event
+    let addonConsumptionRows: typeof consumptionRows = []
+    if (header.sale.customerId) {
+      const addonSaleIds = (
+        await db
+          .select({ id: sales.id })
+          .from(sales)
+          .where(
+            and(
+              eq(sales.customerId, header.sale.customerId),
+              eq(sales.eventId, header.sale.eventId),
+              eq(sales.status, "COMPLETED"),
+              ne(sales.id, saleId)
+            )
+          )
+      ).map((r) => r.id)
+
+      if (addonSaleIds.length > 0) {
+        addonConsumptionRows = await db
+          .select(consumptionShape)
+          .from(digitalConsumptions)
+          .innerJoin(products, eq(digitalConsumptions.productId, products.id))
+          .where(
+            and(
+              inArray(digitalConsumptions.saleId, addonSaleIds),
+              eq(digitalConsumptions.tenantId, header.sale.tenantId)
+            )
+          )
+          .orderBy(digitalConsumptions.createdAt)
+      }
+    }
 
     return c.json({
       receiptToken: header.sale.receiptToken,
@@ -428,11 +463,122 @@ export const publicRoute = new Hono()
         status: r.status,
         ticketType: { name: r.ticketTypeName, price: r.ticketTypePrice },
       })),
-      consumptions: consumptionRows.map((r) => ({
-        id: r.id,
-        qrHash: r.qrHash,
-        status: r.status,
-        product: { id: r.productId, name: r.productName, price: r.productPrice },
-      })),
+      consumptions: [
+        ...addonConsumptionRows.map((r) => ({
+          id: r.id,
+          qrHash: r.qrHash,
+          status: r.status,
+          product: { id: r.productId, name: r.productName, price: r.productPrice },
+          isAddon: true as const,
+        })),
+        ...consumptionRows.map((r) => ({
+          id: r.id,
+          qrHash: r.qrHash,
+          status: r.status,
+          product: { id: r.productId, name: r.productName, price: r.productPrice },
+          isAddon: false as const,
+        })),
+      ],
     })
+  })
+  .post("/receipts/:token/consumptions-checkout", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    let body: { drinkLines: { productId: string; quantity: number }[]; clientTotal: string }
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ error: "JSON inválido" }, 400)
+    }
+
+    if (!body.drinkLines?.length || !body.clientTotal) {
+      return c.json({ error: "Datos incompletos" }, 400)
+    }
+
+    const [saleRow] = await db
+      .select()
+      .from(sales)
+      .where(eq(sales.receiptToken, token))
+      .limit(1)
+
+    if (!saleRow) return c.json({ error: "Comprobante no encontrado" }, 404)
+    if (!saleRow.paid) return c.json({ error: "La compra original no está confirmada" }, 400)
+
+    const snap = saleRow.guestCheckoutSnapshot
+    if (!snap?.contact) {
+      return c.json({ error: "No hay datos de contacto en esta compra" }, 400)
+    }
+
+    const [tenant] = await db
+      .select({ mpConnected: tenants.mpConnected })
+      .from(tenants)
+      .where(eq(tenants.id, saleRow.tenantId))
+      .limit(1)
+
+    if (!tenant?.mpConnected) {
+      return c.json({ error: "Mercado Pago no está habilitado para este evento" }, 400)
+    }
+
+    let result: Awaited<ReturnType<typeof executeClientCheckout>>
+    try {
+      result = await db.transaction(async (tx) =>
+        executeClientCheckout(tx, {
+          eventId: saleRow.eventId,
+          contact: snap.contact,
+          paymentMethod: "MERCADOPAGO",
+          clientTotal: body.clientTotal.trim(),
+          ticketLines: [],
+          drinkLines: body.drinkLines,
+        })
+      )
+    } catch (e) {
+      if (e instanceof PurchaseError) {
+        const { status, body: errBody } = purchaseErrorStatus(e.code)
+        return c.json(errBody, status)
+      }
+      throw e
+    }
+
+    const mpAccessToken = await obtenerTokenValido(saleRow.tenantId)
+    if (!mpAccessToken) {
+      return c.json({ error: "No se pudo conectar con Mercado Pago" }, 502)
+    }
+
+    const total = parseFloat(body.clientTotal)
+    const fee = Math.round(total * 0.01 * 100) / 100
+
+    const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${mpAccessToken}`,
+      },
+      body: JSON.stringify({
+        items: [{ title: "Consumos", quantity: 1, currency_id: "ARS", unit_price: total }],
+        marketplace_fee: fee,
+        back_urls: {
+          success: `https://totem.uno/receipt/${token}`,
+          failure: `https://totem.uno/receipt/${token}`,
+          pending: `https://totem.uno/receipt/${token}`,
+        },
+        auto_return: "approved",
+        external_reference: `totem-sale-${result.saleId}`,
+        notification_url: "https://api.totem.uno/api/mp/webhook",
+        statement_descriptor: "TOTEM",
+        expires: true,
+        expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      }),
+    })
+
+    if (!mpRes.ok) {
+      return c.json({ error: "No se pudo crear la preferencia de Mercado Pago" }, 500)
+    }
+
+    const preference = (await mpRes.json()) as { init_point?: string }
+    if (!preference.init_point) {
+      return c.json({ error: "No se pudo obtener el link de pago" }, 500)
+    }
+
+    return c.json({ success: true, url_pago: preference.init_point })
   })
