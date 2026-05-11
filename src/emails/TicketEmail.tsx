@@ -5,6 +5,7 @@ import {
   Container,
   Head,
   Heading,
+  Hr,
   Html,
   Img,
   Preview,
@@ -22,134 +23,177 @@ export type TicketEmailProps = {
   eventName: string
   receiptUrl: string
   items: TicketEmailItem[]
+  /** CID opcional para el cuervo embebido. Si no se pasa, se usa el wordmark tipográfico. */
+  logoCid?: string
 }
+
+const color = {
+  ink: "#000000",
+  paper: "#F4EFE6",
+  paperMuted: "rgba(244, 239, 230, 0.55)",
+  paperDim: "rgba(244, 239, 230, 0.18)",
+}
+
+const serif = `'Tiempos Headline', 'Tiempos Text', 'GT Sectra', Georgia, 'Times New Roman', serif`
+const sans = `'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif`
 
 export function TicketEmail({
   userName,
   eventName,
   receiptUrl,
   items,
+  logoCid,
 }: TicketEmailProps) {
-  const preview = `Compra confirmada: ${eventName}`
+  const preview = `${eventName} — confirmado.`
+
   return (
     <Html>
       <Head />
       <Preview>{preview}</Preview>
       <Body
         style={{
-          backgroundColor: "#000000",
-          color: "#ffffff",
-          fontFamily:
-            'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
+          backgroundColor: color.ink,
+          color: color.paper,
+          fontFamily: sans,
           margin: 0,
-          padding: "32px 16px",
+          padding: "48px 16px",
         }}
       >
         <Container
           style={{
-            maxWidth: "520px",
+            maxWidth: "560px",
             margin: "0 auto",
-            border: "1px solid #ffffff",
-            borderRadius: 0,
-            padding: "32px 28px",
-            backgroundColor: "#000000",
+            border: `1px solid ${color.paperDim}`,
+            padding: "56px 48px",
+            backgroundColor: color.ink,
           }}
         >
-          <Section
-            style={{
-              borderBottom: "1px solid #ffffff",
-              paddingBottom: "24px",
-              marginBottom: "24px",
-            }}
-          >
-            <Text
-              style={{
-                margin: 0,
-                fontSize: "11px",
-                letterSpacing: "0.28em",
-                textTransform: "uppercase",
-                color: "#ffffff",
-              }}
-            >
-              Totem
-            </Text>
+          {/* Marca */}
+          <Section style={{ textAlign: "center", marginBottom: "48px" }}>
+            {logoCid ? (
+              <Img
+                src={`cid:${logoCid}`}
+                width={56}
+                height={56}
+                alt="CROW"
+                style={{ margin: "0 auto", display: "block" }}
+              />
+            ) : (
+              <Text
+                style={{
+                  margin: 0,
+                  fontFamily: serif,
+                  fontSize: "22px",
+                  fontWeight: 400,
+                  letterSpacing: "0.34em",
+                  textTransform: "uppercase",
+                  color: color.paper,
+                }}
+              >
+                Crow
+              </Text>
+            )}
           </Section>
+
+          {/* Título — el evento como pieza editorial */}
           <Heading
             as="h1"
             style={{
-              margin: "0 0 16px",
-              fontSize: "22px",
-              fontWeight: 700,
-              lineHeight: 1.35,
-              color: "#ffffff",
+              margin: "0 0 40px",
+              fontFamily: serif,
+              fontSize: "32px",
+              fontWeight: 400,
+              lineHeight: 1.2,
+              letterSpacing: "-0.01em",
+              color: color.paper,
+              textAlign: "center",
             }}
           >
-            Hola, {userName}
+            {eventName}
           </Heading>
+
+          {/* Cuerpo */}
           <Text
             style={{
-              margin: "0 0 20px",
-              fontSize: "16px",
-              lineHeight: 1.65,
-              color: "#ffffff",
+              margin: "0 0 16px",
+              fontFamily: serif,
+              fontSize: "17px",
+              lineHeight: 1.6,
+              color: color.paper,
             }}
           >
-            Confirmamos tu compra para{" "}
-            <strong style={{ color: "#ffffff" }}>{eventName}</strong>.
+            {userName},
           </Text>
-          <Section style={{ margin: "28px 0", textAlign: "center" }}>
+          <Text
+            style={{
+              margin: "0 0 40px",
+              fontFamily: serif,
+              fontSize: "17px",
+              lineHeight: 1.6,
+              color: color.paper,
+            }}
+          >
+            Tu lugar está confirmado. Los códigos viven en la app y también abajo.
+          </Text>
+
+          {/* CTA */}
+          <Section style={{ margin: "0 0 56px", textAlign: "center" }}>
             <Button
               href={receiptUrl}
               style={{
                 display: "inline-block",
-                backgroundColor: "#ffffff",
-                color: "#000000",
-                border: "1px solid #ffffff",
-                borderRadius: 0,
-                padding: "14px 28px",
-                fontSize: "13px",
-                fontWeight: 700,
-                textDecoration: "none",
+                backgroundColor: "transparent",
+                color: color.paper,
+                border: `1px solid ${color.paper}`,
+                padding: "14px 34px",
+                fontFamily: sans,
+                fontSize: "11px",
+                fontWeight: 500,
+                letterSpacing: "0.26em",
                 textTransform: "uppercase",
-                letterSpacing: "0.12em",
+                textDecoration: "none",
               }}
             >
-              Abrir app
+              Abrir CROW
             </Button>
           </Section>
-          <Text
-            style={{
-              margin: "24px 0 0",
-              fontSize: "13px",
-              lineHeight: 1.65,
-              color: "#ffffff",
-              borderTop: "1px solid #ffffff",
-              paddingTop: "20px",
-            }}
-          >
-            {items.length > 0
-              ? "Debajo tenés cada código QR con su nombre. También van incrustados en el mensaje para que los tengas sin conexión al llegar a puerta o a la barra."
-              : "Abrí el enlace de la app para ver tu comprobante y los códigos cuando estén disponibles."}
-          </Text>
 
-          {items.map((item) => (
+          <Hr
+            style={{
+              border: "none",
+              borderTop: `1px solid ${color.paperDim}`,
+              margin: "0 0 48px",
+            }}
+          />
+
+          {/* QRs */}
+          {items.map((item, index) => (
             <Section
               key={item.id}
               style={{
-                marginTop: "30px",
+                marginBottom: index === items.length - 1 ? 0 : "48px",
                 textAlign: "center",
-                backgroundColor: "#111111",
-                padding: "20px",
-                borderRadius: "8px",
               }}
             >
               <Text
                 style={{
+                  margin: "0 0 10px",
+                  fontFamily: sans,
+                  fontSize: "10px",
+                  letterSpacing: "0.3em",
+                  textTransform: "uppercase",
+                  color: color.paperMuted,
+                }}
+              >
+                Entrada
+              </Text>
+              <Text
+                style={{
+                  margin: "0 0 24px",
+                  fontFamily: serif,
                   fontSize: "18px",
-                  fontWeight: "bold",
-                  color: "#ffffff",
-                  marginBottom: "15px",
-                  marginTop: 0,
+                  fontWeight: 400,
+                  color: color.paper,
                 }}
               >
                 {item.name}
@@ -158,11 +202,33 @@ export function TicketEmail({
                 src={`cid:${item.id}`}
                 width={200}
                 height={200}
-                alt={`QR ${item.name}`}
-                style={{ margin: "0 auto", borderRadius: "4px" }}
+                alt={`Código ${item.name}`}
+                style={{ margin: "0 auto", display: "block" }}
               />
             </Section>
           ))}
+
+          {/* Cierre */}
+          <Hr
+            style={{
+              border: "none",
+              borderTop: `1px solid ${color.paperDim}`,
+              margin: "56px 0 28px",
+            }}
+          />
+          <Text
+            style={{
+              margin: 0,
+              fontFamily: sans,
+              fontSize: "10px",
+              letterSpacing: "0.32em",
+              textTransform: "uppercase",
+              color: color.paperMuted,
+              textAlign: "center",
+            }}
+          >
+            Te esperamos
+          </Text>
         </Container>
       </Body>
     </Html>
