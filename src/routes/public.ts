@@ -130,11 +130,18 @@ export const publicRoute = new Hono()
     const slugOrId = c.req.param("id")
     const db = drizzle(pool)
 
+    console.log("slugOrId")
+    console.log(slugOrId)
+
     const [ev] = await db
       .select()
       .from(events)
       .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
       .limit(1)
+
+    console.log("ev")
+    console.log(ev)
+
     if (!ev || ev.isActive === false) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
@@ -145,12 +152,18 @@ export const publicRoute = new Hono()
       .where(eq(tenants.id, ev.tenantId))
       .limit(1)
 
+    console.log("productoraRow")
+    console.log(productoraRow)
+
     const types = await db
       .select()
       .from(ticketTypes)
       .where(
         and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, ev.tenantId))
       )
+
+    console.log("types")
+    console.log(types)
 
     const consumptionRows = await db
       .select({
@@ -190,6 +203,9 @@ export const publicRoute = new Hono()
       })
     }
 
+    console.log("ticketTypesOut")
+    console.log(ticketTypesOut)
+
     const drinkProducts = consumptionRows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -200,6 +216,9 @@ export const publicRoute = new Hono()
           ? r.priceOverride
           : r.basePrice,
     }))
+
+    console.log("drinkProducts")
+    console.log(drinkProducts)
 
     return c.json({
       productora: {
