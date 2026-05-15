@@ -159,7 +159,7 @@ export const publicRoute = new Hono()
       .select()
       .from(ticketTypes)
       .where(
-        and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, ev.tenantId))
+        and(eq(ticketTypes.eventId, ev.id), eq(ticketTypes.tenantId, ev.tenantId))
       )
 
     console.log("types")
@@ -178,7 +178,7 @@ export const publicRoute = new Hono()
       .innerJoin(products, eq(eventProducts.productId, products.id))
       .where(
         and(
-          eq(eventProducts.eventId, eventId),
+          eq(eventProducts.eventId, ev.id),
           eq(eventProducts.tenantId, ev.tenantId),
           eq(eventProducts.isActive, true),
           eq(products.tenantId, ev.tenantId),
