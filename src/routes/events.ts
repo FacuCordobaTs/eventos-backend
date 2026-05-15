@@ -64,6 +64,16 @@ const patchEventSchema = z
   .object({
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
+    slug: z
+      .union([
+        z
+          .string()
+          .min(2)
+          .max(100)
+          .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Solo minúsculas, números y guiones"),
+        z.null(),
+      ])
+      .optional(),
   })
   .superRefine((data, ctx) => {
     const check = (key: "ticketsAvailableFrom" | "consumptionsAvailableFrom") => {
@@ -82,7 +92,8 @@ const patchEventSchema = z
     check("consumptionsAvailableFrom")
     if (
       data.ticketsAvailableFrom === undefined &&
-      data.consumptionsAvailableFrom === undefined
+      data.consumptionsAvailableFrom === undefined &&
+      data.slug === undefined
     ) {
       ctx.addIssue({
         code: "custom",
@@ -195,6 +206,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     id: row.id,
     tenantId: row.tenantId,
     name: row.name,
+    slug: row.slug ?? null,
     date: row.date,
     location: row.location,
     isActive: row.isActive,
@@ -2069,6 +2081,7 @@ export const eventsRoute = new Hono()
     const setPayload: {
       ticketsAvailableFrom?: Date | null
       consumptionsAvailableFrom?: Date | null
+      slug?: string | null
     } = {}
     if (body.ticketsAvailableFrom !== undefined) {
       setPayload.ticketsAvailableFrom =
@@ -2081,6 +2094,9 @@ export const eventsRoute = new Hono()
         body.consumptionsAvailableFrom === null
           ? null
           : new Date(body.consumptionsAvailableFrom)
+    }
+    if (body.slug !== undefined) {
+      setPayload.slug = body.slug
     }
 
     await db

@@ -69,6 +69,7 @@ export const events = mysqlTable(
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
+    slug: varchar('slug', { length: 100 }).unique(), // URL-friendly: crow.ar/e/divino
     date: timestamp('date').notNull(),
     location: varchar('location', { length: 255 }),
     ticketsAvailableFrom: timestamp('tickets_available_from'),

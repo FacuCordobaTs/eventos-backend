@@ -13,7 +13,7 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { SQL, and, asc, count, eq, gte, inArray, ne } from "drizzle-orm"
+import { SQL, and, asc, count, eq, gte, inArray, ne, or } from "drizzle-orm"
 import { executeClientCheckout } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
@@ -127,10 +127,14 @@ export const publicRoute = new Hono()
     })
   })
   .get("/events/:id", async (c) => {
-    const eventId = c.req.param("id")
+    const slugOrId = c.req.param("id")
     const db = drizzle(pool)
 
-    const [ev] = await db.select().from(events).where(eq(events.id, eventId)).limit(1)
+    const [ev] = await db
+      .select()
+      .from(events)
+      .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
+      .limit(1)
     if (!ev || ev.isActive === false) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
