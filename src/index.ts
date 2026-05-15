@@ -29,8 +29,10 @@ app.use(
       "https://totem-admin-9hw.pages.dev",
       "https://totem-client.pages.dev",
       "https://my.totem.uno",
-      "https://admin.totem.uno"
-    ],
+      "https://admin.totem.uno",
+      "https://admin.crow.ar",
+      "https://crow.ar",
+    ],  
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
     credentials: true,
