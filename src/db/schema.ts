@@ -34,7 +34,7 @@ export const staff = mysqlTable(
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).references(() => tenants.id),
     name: varchar('name', { length: 255 }).notNull(),
-    email: varchar('email', { length: 255 }).notNull().unique(),
+    email: varchar('email', { length: 255 }).notNull(),
     passwordHash: varchar('password_hash', { length: 255 }).notNull(),
     role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
@@ -43,6 +43,7 @@ export const staff = mysqlTable(
   },
   (table) => ({
     tenantIdIdx: index('staff_tenant_id_idx').on(table.tenantId),
+    emailTenantIdx: uniqueIndex('staff_email_tenant_unique').on(table.email, table.tenantId),
   })
 );
 
@@ -168,6 +169,23 @@ export const eventInventory = mysqlTable(
   })
 );
 
+/** Categorías opcionales para agrupar productos del catálogo (ej: Tragos, Cervezas, Sin alcohol). */
+export const productCategories = mysqlTable(
+  'product_categories',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    name: varchar('name', { length: 100 }).notNull(),
+    /** Orden de visualización (menor primero). */
+    sortOrder: int('sort_order').notNull().default(0),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    tenantIdx: index('product_categories_tenant_idx').on(table.tenantId),
+  })
+);
+
 export const products = mysqlTable('products', {
   id: varchar('id', { length: 36 }).primaryKey(),
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
@@ -177,6 +195,8 @@ export const products = mysqlTable('products', {
   /** GLASS: la receta descuenta quantityUsed en la unidad del insumo; BOTTLE: quantityUsed es botellas × tamaño estándar. */
   saleType: mysqlEnum('sale_type', ['BOTTLE', 'GLASS']).notNull().default('GLASS'),
   imageUrl: varchar('image_url', { length: 512 }),
+  /** Categoría opcional. Null = sin categoría. */
+  categoryId: varchar('category_id', { length: 36 }).references(() => productCategories.id),
 });
 
 export const eventProducts = mysqlTable(
@@ -195,6 +215,8 @@ export const eventProducts = mysqlTable(
     priceOverride: decimal('price_override', { precision: 10, scale: 2 }),
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
+    /** Stock directo para productos sin receta (e.g. latas). Null = ilimitado. */
+    directStock: decimal('direct_stock', { precision: 10, scale: 2 }),
   },
   (table) => ({
     eventTenantIdx: index('event_products_event_tenant_idx').on(
@@ -445,10 +467,22 @@ export const eventsRelations = relations(events, ({ many }) => ({
   expenses: many(eventExpenses),
 }));
 
-export const productsRelations = relations(products, ({ many }) => ({
+export const productsRelations = relations(products, ({ one, many }) => ({
   recipes: many(productRecipes),
   eventProducts: many(eventProducts),
   barProducts: many(barProducts),
+  category: one(productCategories, {
+    fields: [products.categoryId],
+    references: [productCategories.id],
+  }),
+}));
+
+export const productCategoriesRelations = relations(productCategories, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [productCategories.tenantId],
+    references: [tenants.id],
+  }),
+  products: many(products),
 }));
 
 export const eventProductsRelations = relations(eventProducts, ({ one }) => ({

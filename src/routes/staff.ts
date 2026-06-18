@@ -22,6 +22,7 @@ const signupStaffSchema = z.object({
 const loginStaffSchema = z.object({
   email: z.string().email(),
   password: z.string(),
+  staffId: z.string().optional(),
 })
 
 const createTeamMemberSchema = z.object({
@@ -184,17 +185,35 @@ export const staffRoute = new Hono()
       const db = drizzle(pool)
       const ctx = c as AuthenticatedContext
       const body = c.req.valid("json")
+      const currentTenantId = ctx.staff.tenantId ?? null
 
-      const existing = await db.select().from(staff).where(eq(staff.email, body.email))
-      if (existing.length) {
-        return c.json({ error: "Email ya utilizado" }, 409)
+      // Check if (email, tenantId) pair already exists
+      const alreadyMember = await db
+        .select()
+        .from(staff)
+        .where(and(eq(staff.email, body.email), staffTenantScope(currentTenantId)))
+      if (alreadyMember.length) {
+        return c.json({ error: "Este email ya está registrado en tu Productora" }, 409)
       }
 
-      const passwordHash = await bcrypt.hash(body.password, 10)
+      // Check if email exists in another tenant — reuse their password hash
+      const existingElsewhere = await db
+        .select()
+        .from(staff)
+        .where(eq(staff.email, body.email))
+        .limit(1)
+
+      const passwordHash =
+        existingElsewhere.length > 0
+          ? existingElsewhere[0].passwordHash
+          : await bcrypt.hash(body.password, 10)
+
+      const imported = existingElsewhere.length > 0
+
       const id = uuidv4()
       await db.insert(staff).values({
         id,
-        tenantId: ctx.staff.tenantId ?? null,
+        tenantId: currentTenantId,
         name: body.name,
         email: body.email,
         passwordHash,
@@ -203,8 +222,8 @@ export const staffRoute = new Hono()
         createdAt: new Date(),
       })
 
-      const inserted = await db.select().from(staff).where(eq(staff.id, id))
-      return c.json({ staff: sanitizeStaff(inserted[0]) }, 201)
+      const [inserted] = await db.select().from(staff).where(eq(staff.id, id))
+      return c.json({ staff: sanitizeStaff(inserted), imported }, 201)
     }
   )
   .patch(
@@ -310,8 +329,7 @@ export const staffRoute = new Hono()
       createdAt: new Date(),
     })
 
-    const rows = await db.select().from(staff).where(eq(staff.email, body.email))
-    const row = rows[0]
+    const [row] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
     const token = await createAccessToken(row.id, "staff")
 
     setCookie(c, "token", token, cookieOptions(c))
@@ -329,29 +347,82 @@ export const staffRoute = new Hono()
     const db = drizzle(pool)
     const body = c.req.valid("json")
 
-    const existingStaff = await db.select().from(staff).where(eq(staff.email, body.email))
-    if (!existingStaff.length) {
+    // If staffId is provided (tenant selection step), authenticate against that specific record
+    if (body.staffId) {
+      const [target] = await db
+        .select()
+        .from(staff)
+        .where(and(eq(staff.id, body.staffId), eq(staff.email, body.email)))
+        .limit(1)
+      if (!target) {
+        return c.json({ error: "Email o contraseña incorrectos" }, 401)
+      }
+      if (!target.isActive) {
+        return c.json({ error: "Cuenta desactivada. Contactá a un administrador." }, 403)
+      }
+      const passwordMatch = await bcrypt.compare(body.password, target.passwordHash)
+      if (!passwordMatch) {
+        return c.json({ error: "Email o contraseña incorrectos" }, 401)
+      }
+      const token = await createAccessToken(target.id, "staff")
+      setCookie(c, "token", token, cookieOptions(c))
+      return c.json({
+        message: "Inicio de sesión exitoso",
+        token,
+        staff: await staffPayloadForClient(db, target),
+      })
+    }
+
+    // Find all active staff records with this email
+    const candidates = await db
+      .select()
+      .from(staff)
+      .where(and(eq(staff.email, body.email), eq(staff.isActive, true)))
+
+    if (!candidates.length) {
       return c.json({ error: "Email o contraseña incorrectos" }, 401)
     }
 
-    const row = existingStaff[0]
-    if (!row.isActive) {
-      return c.json({ error: "Cuenta desactivada. Contactá a un administrador." }, 403)
+    // Verify password against all matching records
+    const matched: typeof candidates = []
+    for (const row of candidates) {
+      const ok = await bcrypt.compare(body.password, row.passwordHash)
+      if (ok) matched.push(row)
     }
 
-    const passwordMatch = await bcrypt.compare(body.password, row.passwordHash)
-    if (!passwordMatch) {
+    if (matched.length === 0) {
       return c.json({ error: "Email o contraseña incorrectos" }, 401)
     }
 
-    const token = await createAccessToken(row.id, "staff")
-    setCookie(c, "token", token, cookieOptions(c))
+    // Single match: proceed normally
+    if (matched.length === 1) {
+      const row = matched[0]
+      const token = await createAccessToken(row.id, "staff")
+      setCookie(c, "token", token, cookieOptions(c))
+      return c.json({
+        message: "Inicio de sesión exitoso",
+        token,
+        staff: await staffPayloadForClient(db, row),
+      })
+    }
 
-    return c.json({
-      message: "Inicio de sesión exitoso",
-      token,
-      staff: await staffPayloadForClient(db, row),
-    })
+    // Multiple matches: ask the client to select a tenant
+    const options = await Promise.all(
+      matched.map(async (row) => {
+        let tenantName: string | null = null
+        if (row.tenantId) {
+          const [t] = await db
+            .select({ name: tenants.name })
+            .from(tenants)
+            .where(eq(tenants.id, row.tenantId))
+            .limit(1)
+          tenantName = t?.name ?? null
+        }
+        return { staffId: row.id, tenantName: tenantName ?? "Sin productora" }
+      })
+    )
+
+    return c.json({ requiresTenantSelection: true as const, options })
   })
   .post("/logout", (c) => {
     setCookie(c, "token", "", {

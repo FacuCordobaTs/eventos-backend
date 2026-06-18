@@ -851,6 +851,7 @@ export const eventsRoute = new Hono()
         productId: eventProducts.productId,
         isActive: eventProducts.isActive,
         priceOverride: eventProducts.priceOverride,
+        directStock: eventProducts.directStock,
       })
       .from(eventProducts)
       .where(
@@ -885,7 +886,7 @@ export const eventsRoute = new Hono()
     const byProduct = new Map(
       links.map((r) => [
         r.productId,
-        { isActive: r.isActive, priceOverride: r.priceOverride },
+        { isActive: r.isActive, priceOverride: r.priceOverride, directStock: r.directStock },
       ])
     )
 
@@ -903,6 +904,8 @@ export const eventsRoute = new Hono()
             row?.priceOverride === null || row?.priceOverride === undefined
               ? null
               : String(row.priceOverride),
+          directStock:
+            row?.directStock == null ? null : String(row.directStock),
         }
       }),
     })
@@ -1003,6 +1006,137 @@ export const eventsRoute = new Hono()
         },
         201
       )
+    }
+  )
+  .patch(
+    "/:id/products/set-override",
+    zValidator(
+      "json",
+      z.object({
+        productId: z.string().min(1).max(36),
+        priceOverride: z.union([z.string(), z.null()]),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) return c.json({ error: "Evento no encontrado" }, 404)
+
+      const override =
+        body.priceOverride === null || body.priceOverride === ""
+          ? null
+          : decToDb(dec(body.priceOverride))
+
+      const [existing] = await db
+        .select({ id: eventProducts.id })
+        .from(eventProducts)
+        .where(
+          and(
+            eq(eventProducts.eventId, eventId),
+            eq(eventProducts.productId, body.productId),
+            eq(eventProducts.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (!existing) {
+        return c.json({ error: "El producto no está en el evento" }, 404)
+      }
+
+      await db
+        .update(eventProducts)
+        .set({ priceOverride: override })
+        .where(eq(eventProducts.id, existing.id))
+
+      return c.json({ ok: true })
+    }
+  )
+  .post(
+    "/:id/products/load-direct-stock",
+    zValidator(
+      "json",
+      z.object({
+        productId: z.string().min(1).max(36),
+        quantity: z.coerce.number().int().positive(),
+        costType: z.enum(["TOTAL", "UNIT"]).optional(),
+        costAmount: z
+          .union([z.string().regex(/^\d+(\.\d{1,2})?$/), z.coerce.number().nonnegative()])
+          .optional(),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) return c.json({ error: "Evento no encontrado" }, 404)
+
+      const [epRow] = await db
+        .select()
+        .from(eventProducts)
+        .where(
+          and(
+            eq(eventProducts.eventId, eventId),
+            eq(eventProducts.productId, body.productId),
+            eq(eventProducts.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (!epRow) {
+        return c.json({ error: "El producto no está en el evento" }, 404)
+      }
+
+      const current = epRow.directStock != null ? decFromDb(String(epRow.directStock)) : dec(0)
+      const next = current.plus(dec(body.quantity))
+
+      await db.transaction(async (tx) => {
+        await tx
+          .update(eventProducts)
+          .set({ directStock: decToDb(next) })
+          .where(eq(eventProducts.id, epRow.id))
+
+        const hasCost =
+          body.costType != null &&
+          body.costAmount != null &&
+          String(body.costAmount).trim() !== ""
+        if (hasCost) {
+          const amt = dec(String(body.costAmount).replace(",", "."))
+          const total = body.costType === "UNIT" ? amt.times(body.quantity) : amt
+          if (total.gt(0)) {
+            const [prod] = await tx
+              .select({ name: products.name })
+              .from(products)
+              .where(eq(products.id, body.productId))
+              .limit(1)
+            await tx.insert(eventExpenses).values({
+              id: uuidv4(),
+              eventId,
+              tenantId,
+              description: `Compra de stock: ${body.quantity} u. de ${prod?.name ?? body.productId}`.slice(0, 255),
+              category: "FOOD",
+              amount: decToDb(total),
+              date: new Date(),
+            })
+          }
+        }
+      })
+
+      return c.json({ ok: true, directStock: decToDb(next) })
     }
   )
   .get("/:id/inventory", async (c) => {

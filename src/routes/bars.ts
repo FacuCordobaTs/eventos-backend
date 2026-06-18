@@ -14,6 +14,7 @@ import {
   eventProducts,
   events,
   inventoryItems,
+  productCategories,
   productRecipes,
   products,
   sales,
@@ -115,6 +116,9 @@ export const barsRoute = new Hono()
         price: products.price,
         barProductId: barProducts.id,
         barIsActive: barProducts.isActive,
+        categoryId: products.categoryId,
+        categoryName: productCategories.name,
+        categorySortOrder: productCategories.sortOrder,
       })
       .from(products)
       .innerJoin(
@@ -132,6 +136,13 @@ export const barsRoute = new Hono()
           eq(barProducts.productId, products.id),
           eq(barProducts.barId, barId),
           eq(barProducts.tenantId, tenantId)
+        )
+      )
+      .leftJoin(
+        productCategories,
+        and(
+          eq(productCategories.id, products.categoryId),
+          eq(productCategories.isActive, true)
         )
       )
       .where(
@@ -175,6 +186,9 @@ export const barsRoute = new Hono()
         price: String(r.price),
         isActiveForBar:
           r.barProductId != null && r.barIsActive === true,
+        categoryId: r.categoryId ?? null,
+        categoryName: r.categoryName ?? null,
+        categorySortOrder: r.categorySortOrder ?? null,
         recipes: recipesByProduct.get(r.id) ?? [],
       })),
     })

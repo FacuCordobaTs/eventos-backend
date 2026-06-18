@@ -7,6 +7,7 @@ import {
   digitalConsumptions,
   eventProducts,
   events,
+  productCategories,
   products,
   sales,
   tenants,
@@ -173,9 +174,19 @@ export const publicRoute = new Hono()
         productImageUrl: products.imageUrl,
         priceOverride: eventProducts.priceOverride,
         basePrice: products.price,
+        categoryId: products.categoryId,
+        categoryName: productCategories.name,
+        categorySortOrder: productCategories.sortOrder,
       })
       .from(eventProducts)
       .innerJoin(products, eq(eventProducts.productId, products.id))
+      .leftJoin(
+        productCategories,
+        and(
+          eq(productCategories.id, products.categoryId),
+          eq(productCategories.isActive, true)
+        )
+      )
       .where(
         and(
           eq(eventProducts.eventId, ev.id),
@@ -211,11 +222,31 @@ export const publicRoute = new Hono()
       name: r.name,
       saleType: r.saleType,
       imageUrl: r.productImageUrl ?? null,
+      categoryId: r.categoryId ?? null,
+      categoryName: r.categoryName ?? null,
       price:
         r.priceOverride != null && r.priceOverride !== ""
           ? r.priceOverride
           : r.basePrice,
     }))
+
+    // Categorías presentes entre los productos del evento, ordenadas.
+    const categoryMap = new Map<
+      string,
+      { id: string; name: string; sortOrder: number }
+    >()
+    for (const r of consumptionRows) {
+      if (r.categoryId && r.categoryName && !categoryMap.has(r.categoryId)) {
+        categoryMap.set(r.categoryId, {
+          id: r.categoryId,
+          name: r.categoryName,
+          sortOrder: r.categorySortOrder ?? 0,
+        })
+      }
+    }
+    const productCategoriesOut = [...categoryMap.values()].sort(
+      (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name)
+    )
 
     console.log("drinkProducts")
     console.log(drinkProducts)
@@ -236,6 +267,7 @@ export const publicRoute = new Hono()
       },
       ticketTypes: ticketTypesOut,
       drinkProducts,
+      productCategories: productCategoriesOut,
     })
   })
   .post("/checkout", zValidator("json", guestCheckoutSchema), async (c) => {

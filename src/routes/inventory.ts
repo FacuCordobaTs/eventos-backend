@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
+import { and, asc, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import { randomUUID } from "node:crypto"
@@ -12,8 +12,10 @@ import {
   digitalConsumptions,
   eventExpenses,
   eventInventory,
+  eventProducts,
   events,
   inventoryItems,
+  productCategories,
   productRecipes,
   products,
   saleItems,
@@ -76,6 +78,25 @@ async function requireProductForTenant(
     .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
     .limit(1)
   return row ?? null
+}
+
+async function categoryBelongsToTenant(
+  db: ReturnType<typeof drizzle>,
+  categoryId: string,
+  tenantId: string
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: productCategories.id })
+    .from(productCategories)
+    .where(
+      and(
+        eq(productCategories.id, categoryId),
+        eq(productCategories.tenantId, tenantId),
+        eq(productCategories.isActive, true)
+      )
+    )
+    .limit(1)
+  return row != null
 }
 
 const baseUnitSchema = z.enum(["ML", "GRAMS", "UNIT"])
@@ -167,7 +188,15 @@ const createProductSchema = z.object({
     .union([z.string().regex(/^\d+(\.\d{1,2})?$/), z.number().nonnegative()])
     .transform((v) => (typeof v === "number" ? v.toFixed(2) : v)),
   saleType: saleTypeSchema.optional().default("GLASS"),
+  categoryId: z
+    .union([z.string().min(1).max(36), z.null()])
+    .optional(),
   recipes: z.array(recipeLineSchema).default([]),
+})
+
+const categorySchema = z.object({
+  name: z.string().min(1).max(100),
+  sortOrder: z.coerce.number().int().optional(),
 })
 
 const updateProductSchema = createProductSchema
@@ -367,6 +396,147 @@ export const inventoryRoute = new Hono()
 
     return c.json({ ok: true, deactivated: true })
   })
+  .get("/categories", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const db = drizzle(pool)
+    const rows = await db
+      .select()
+      .from(productCategories)
+      .where(
+        and(
+          eq(productCategories.tenantId, tenantId),
+          eq(productCategories.isActive, true)
+        )
+      )
+      .orderBy(asc(productCategories.sortOrder), asc(productCategories.name))
+
+    return c.json({
+      categories: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        sortOrder: r.sortOrder,
+      })),
+    })
+  })
+  .post("/categories", zValidator("json", categorySchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    let sortOrder = body.sortOrder
+    if (sortOrder == null) {
+      const [maxRow] = await db
+        .select({ m: sql<number>`coalesce(max(${productCategories.sortOrder}), 0)` })
+        .from(productCategories)
+        .where(eq(productCategories.tenantId, tenantId))
+      sortOrder = Number(maxRow?.m ?? 0) + 1
+    }
+
+    const id = uuidv4()
+    await db.insert(productCategories).values({
+      id,
+      tenantId,
+      name: body.name.trim(),
+      sortOrder,
+      isActive: true,
+      createdAt: new Date(),
+    })
+
+    return c.json(
+      { category: { id, name: body.name.trim(), sortOrder } },
+      201
+    )
+  })
+  .put("/categories/:id", zValidator("json", categorySchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const categoryId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const [existing] = await db
+      .select()
+      .from(productCategories)
+      .where(
+        and(
+          eq(productCategories.id, categoryId),
+          eq(productCategories.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Categoría no encontrada" }, 404)
+    }
+
+    await db
+      .update(productCategories)
+      .set({
+        name: body.name.trim(),
+        ...(body.sortOrder == null ? {} : { sortOrder: body.sortOrder }),
+      })
+      .where(eq(productCategories.id, categoryId))
+
+    return c.json({
+      category: {
+        id: categoryId,
+        name: body.name.trim(),
+        sortOrder: body.sortOrder ?? existing.sortOrder,
+      },
+    })
+  })
+  .delete("/categories/:id", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const categoryId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [existing] = await db
+      .select()
+      .from(productCategories)
+      .where(
+        and(
+          eq(productCategories.id, categoryId),
+          eq(productCategories.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Categoría no encontrada" }, 404)
+    }
+
+    // Desvincular productos y desactivar la categoría (sin borrar productos).
+    await db.transaction(async (tx) => {
+      await tx
+        .update(products)
+        .set({ categoryId: null })
+        .where(
+          and(
+            eq(products.categoryId, categoryId),
+            eq(products.tenantId, tenantId)
+          )
+        )
+      await tx
+        .update(productCategories)
+        .set({ isActive: false })
+        .where(eq(productCategories.id, categoryId))
+    })
+
+    return c.json({ ok: true })
+  })
   .get("/products", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -422,6 +592,7 @@ export const inventoryRoute = new Hono()
         isActive: p.isActive,
         saleType: p.saleType,
         imageUrl: p.imageUrl ?? null,
+        categoryId: p.categoryId ?? null,
         recipes: (byProduct.get(p.id) ?? []).map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -462,6 +633,10 @@ export const inventoryRoute = new Hono()
       }
     }
 
+    if (body.categoryId != null && !(await categoryBelongsToTenant(db, body.categoryId, tenantId))) {
+      return c.json({ error: "La categoría no existe." }, 400)
+    }
+
     const productId = uuidv4()
     const priceStr = decToDb(dec(body.price))
 
@@ -473,6 +648,7 @@ export const inventoryRoute = new Hono()
         price: priceStr,
         isActive: true,
         saleType: body.saleType,
+        categoryId: body.categoryId ?? null,
       })
       if (body.recipes.length > 0) {
         await tx.insert(productRecipes).values(
@@ -516,6 +692,7 @@ export const inventoryRoute = new Hono()
           isActive: p!.isActive,
           saleType: p!.saleType,
           imageUrl: p!.imageUrl ?? null,
+          categoryId: p!.categoryId ?? null,
           recipes: recipes.map((r) => ({
             id: r.id,
             inventoryItemId: r.inventoryItemId,
@@ -568,12 +745,21 @@ export const inventoryRoute = new Hono()
       }
     }
 
+    if (body.categoryId != null && !(await categoryBelongsToTenant(db, body.categoryId, tenantId))) {
+      return c.json({ error: "La categoría no existe." }, 400)
+    }
+
     const priceStr = decToDb(dec(body.price))
 
     await db.transaction(async (tx) => {
       await tx
         .update(products)
-        .set({ name: body.name, price: priceStr, saleType: body.saleType })
+        .set({
+          name: body.name,
+          price: priceStr,
+          saleType: body.saleType,
+          categoryId: body.categoryId ?? null,
+        })
         .where(eq(products.id, productId))
       await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
       if (body.recipes.length > 0) {
@@ -617,6 +803,7 @@ export const inventoryRoute = new Hono()
         isActive: p!.isActive,
         saleType: p!.saleType,
         imageUrl: p!.imageUrl ?? null,
+        categoryId: p!.categoryId ?? null,
         recipes: recipes.map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -737,6 +924,7 @@ export const inventoryRoute = new Hono()
         isActive: p!.isActive,
         saleType: p!.saleType,
         imageUrl: p!.imageUrl ?? null,
+        categoryId: p!.categoryId ?? null,
         recipes: recipes.map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -807,6 +995,7 @@ export const inventoryRoute = new Hono()
         isActive: p!.isActive,
         saleType: p!.saleType,
         imageUrl: p!.imageUrl ?? null,
+        categoryId: p!.categoryId ?? null,
         recipes: recipes.map((r) => ({
           id: r.id,
           inventoryItemId: r.inventoryItemId,
@@ -1189,6 +1378,50 @@ export const inventoryRoute = new Hono()
           }
         }
 
+        // Products without recipes: check directStock if set on eventProducts
+        const productsWithRecipes = new Set(recipeRows.map((r) => r.productId))
+        const directNeeds = new Map<string, number>()
+        for (const line of body.items) {
+          if (!productsWithRecipes.has(line.productId)) {
+            directNeeds.set(line.productId, (directNeeds.get(line.productId) ?? 0) + line.quantity)
+          }
+        }
+
+        type EpStockEntry = { rowId: string; stock: string }
+        const epStockByProductId = new Map<string, EpStockEntry>()
+        if (directNeeds.size > 0) {
+          const epRows = await tx
+            .select({
+              id: eventProducts.id,
+              productId: eventProducts.productId,
+              directStock: eventProducts.directStock,
+            })
+            .from(eventProducts)
+            .where(
+              and(
+                eq(eventProducts.eventId, body.eventId),
+                eq(eventProducts.tenantId, tenantId),
+                inArray(eventProducts.productId, [...directNeeds.keys()])
+              )
+            )
+
+          for (const ep of epRows) {
+            if (ep.directStock != null) {
+              epStockByProductId.set(ep.productId, { rowId: ep.id, stock: String(ep.directStock) })
+            }
+          }
+
+          for (const [productId, qty] of directNeeds.entries()) {
+            const entry = epStockByProductId.get(productId)
+            if (!entry) continue // null directStock = unlimited
+            const avail = decFromDb(entry.stock)
+            if (avail.lt(dec(qty))) {
+              const prod = prodRows.find((p) => p.id === productId)!
+              return { kind: "insufficient_direct_stock" as const, productName: prod.name }
+            }
+          }
+        }
+
         let evInvByItem = new Map<string, typeof eventInventory.$inferSelect>()
         let invMetaById = new Map<
           string,
@@ -1372,6 +1605,17 @@ export const inventoryRoute = new Hono()
           }
         }
 
+        // Deduct directStock for products without recipes
+        for (const [productId, qty] of directNeeds.entries()) {
+          const entry = epStockByProductId.get(productId)
+          if (!entry) continue
+          const newStock = decFromDb(entry.stock).minus(dec(qty))
+          await tx
+            .update(eventProducts)
+            .set({ directStock: decToDb(newStock) })
+            .where(eq(eventProducts.id, entry.rowId))
+        }
+
         return {
           kind: "ok" as const,
           saleId,
@@ -1400,6 +1644,12 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_inventory") {
         return c.json({ error: "Error al verificar inventario." }, 400)
+      }
+      if (result.kind === "insufficient_direct_stock") {
+        return c.json(
+          { error: `Stock insuficiente: ${result.productName}` },
+          409
+        )
       }
 
       if (
