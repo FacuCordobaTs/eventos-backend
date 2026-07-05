@@ -74,6 +74,7 @@ const patchEventSchema = z
         z.null(),
       ])
       .optional(),
+    designType: z.enum(["GLASS", "MINIMAL"]).optional(),
   })
   .superRefine((data, ctx) => {
     const check = (key: "ticketsAvailableFrom" | "consumptionsAvailableFrom") => {
@@ -93,7 +94,8 @@ const patchEventSchema = z
     if (
       data.ticketsAvailableFrom === undefined &&
       data.consumptionsAvailableFrom === undefined &&
-      data.slug === undefined
+      data.slug === undefined &&
+      data.designType === undefined
     ) {
       ctx.addIssue({
         code: "custom",
@@ -212,6 +214,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     isActive: row.isActive,
     createdAt: row.createdAt,
     imageUrl: row.imageUrl ?? null,
+    designType: row.designType ?? "GLASS",
     ticketsAvailableFrom: row.ticketsAvailableFrom
       ? row.ticketsAvailableFrom.toISOString()
       : null,
@@ -2216,6 +2219,7 @@ export const eventsRoute = new Hono()
       ticketsAvailableFrom?: Date | null
       consumptionsAvailableFrom?: Date | null
       slug?: string | null
+      designType?: "GLASS" | "MINIMAL"
     } = {}
     if (body.ticketsAvailableFrom !== undefined) {
       setPayload.ticketsAvailableFrom =
@@ -2231,6 +2235,9 @@ export const eventsRoute = new Hono()
     }
     if (body.slug !== undefined) {
       setPayload.slug = body.slug
+    }
+    if (body.designType !== undefined) {
+      setPayload.designType = body.designType
     }
 
     await db

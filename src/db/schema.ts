@@ -78,6 +78,8 @@ export const events = mysqlTable(
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
     imageUrl: varchar('image_url', { length: 512 }),
+    /** Diseño de la página pública del evento. GLASS = glassmorphism (default), MINIMAL = plano/minimalista. */
+    designType: mysqlEnum('design_type', ['GLASS', 'MINIMAL']).notNull().default('GLASS'),
   },
   (table) => ({
     tenantIdIdx: index('events_tenant_id_idx').on(table.tenantId),

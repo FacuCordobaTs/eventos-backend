@@ -262,6 +262,7 @@ export const publicRoute = new Hono()
         date: ev.date,
         location: ev.location,
         imageUrl: ev.imageUrl ?? null,
+        designType: ev.designType ?? "GLASS",
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },

@@ -1,0 +1,1 @@
+ALTER TABLE `events` ADD COLUMN `design_type` enum('GLASS','MINIMAL') NOT NULL DEFAULT 'GLASS';
