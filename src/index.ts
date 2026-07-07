@@ -13,7 +13,7 @@ import { mountStockWebSocket } from "./routes/ws-stock"
 import { mercadopagoRoute } from "./routes/mercadopago"
 import { webhookRoute } from "./routes/webhook"
 import { cors } from "hono/cors"
-import { websocket as honoWebsocket } from "hono/bun"
+import { websocket as honoWebsocket, serveStatic } from "hono/bun"
 
 const app = new Hono()
 
@@ -38,6 +38,12 @@ app.use(
     credentials: true,
   })
 )
+
+// Archivos estáticos del updater de Tauri (manifiesto + instaladores).
+// Sirve backend/public/updates/ en https://api.crow.ar/public/updates/*
+// Va antes de la ruta /public para que capture /public/updates/* primero;
+// si el archivo no existe hace next() y cae en publicRoute.
+app.use("/public/updates/*", serveStatic({ root: "./" }))
 
 app.route("/tenants", tenantsRoute)
 app.route("/staff", staffRoute)
