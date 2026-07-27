@@ -4,6 +4,7 @@ import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
+  courtesies,
   digitalConsumptions,
   eventProducts,
   events,
@@ -19,6 +20,9 @@ import { executeClientCheckout } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
 import { obtenerTokenValido } from "../lib/mercadopago-utils"
+import { qrCodeDataUrl } from "../lib/qr"
+import { v4 as uuidv4 } from "uuid"
+import { randomUUID } from "node:crypto"
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -637,4 +641,146 @@ export const publicRoute = new Hono()
     }
 
     return c.json({ success: true, url_pago: preference.init_point })
+  })
+  // Cortesía / invitación (spec §4.2): el invitado abre su link nominado.
+  // Sin auth — el token ES la credencial.
+  .get("/courtesies/:token", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+    const [row] = await db
+      .select({
+        courtesy: courtesies,
+        eventName: events.name,
+        eventDate: events.date,
+        eventLocation: events.location,
+        eventIsActive: events.isActive,
+        ticketTypeName: ticketTypes.name,
+      })
+      .from(courtesies)
+      .innerJoin(events, eq(courtesies.eventId, events.id))
+      .innerJoin(ticketTypes, eq(courtesies.ticketTypeId, ticketTypes.id))
+      .where(eq(courtesies.token, token))
+      .limit(1)
+
+    if (!row) {
+      return c.json({ error: "Invitación no encontrada" }, 404)
+    }
+    if (row.courtesy.status === "REVOKED") {
+      return c.json({ error: "Esta invitación fue anulada" }, 410)
+    }
+
+    return c.json({
+      guestName: row.courtesy.guestName,
+      status: row.courtesy.status,
+      event: {
+        id: row.courtesy.eventId,
+        name: row.eventName,
+        date: row.eventDate,
+        location: row.eventLocation,
+      },
+      ticketTypeName: row.ticketTypeName,
+      // Si ya se canjeó, exponemos el QR para que pueda volver a verlo.
+      ticketId: row.courtesy.ticketId ?? null,
+    })
+  })
+  // Canje: emite UNA entrada real y la enlaza a la cortesía. Idempotente: si ya
+  // está canjeada, devuelve la misma entrada. La cortesía NO consume cupo pago
+  // (es un regalo "aparte" del productor), por eso emite sin chequear stockLimit.
+  .post("/courtesies/:token/redeem", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const outcome = await db.transaction(async (tx) => {
+      const [cty] = await tx
+        .select()
+        .from(courtesies)
+        .where(eq(courtesies.token, token))
+        .limit(1)
+
+      if (!cty) {
+        return { kind: "err" as const, status: 404 as const, error: "Invitación no encontrada" }
+      }
+      if (cty.status === "REVOKED") {
+        return { kind: "err" as const, status: 410 as const, error: "Esta invitación fue anulada" }
+      }
+      if (cty.status === "REDEEMED" && cty.ticketId != null) {
+        // Ya canjeada: devolvemos la entrada existente (idempotente).
+        const [existing] = await tx
+          .select()
+          .from(tickets)
+          .where(eq(tickets.id, cty.ticketId))
+          .limit(1)
+        if (existing) {
+          return { kind: "ok" as const, ticket: existing, alreadyRedeemed: true }
+        }
+      }
+
+      const [ev] = await tx
+        .select()
+        .from(events)
+        .where(eq(events.id, cty.eventId))
+        .limit(1)
+      if (!ev || ev.isActive === false) {
+        return { kind: "err" as const, status: 404 as const, error: "Evento no disponible" }
+      }
+
+      const [tt] = await tx
+        .select()
+        .from(ticketTypes)
+        .where(
+          and(
+            eq(ticketTypes.id, cty.ticketTypeId),
+            eq(ticketTypes.tenantId, cty.tenantId)
+          )
+        )
+        .limit(1)
+      if (!tt) {
+        return { kind: "err" as const, status: 404 as const, error: "Tipo de entrada no disponible" }
+      }
+
+      const ticketId = uuidv4()
+      const qrHash = randomUUID()
+      await tx.insert(tickets).values({
+        id: ticketId,
+        ticketTypeId: cty.ticketTypeId,
+        eventId: cty.eventId,
+        tenantId: cty.tenantId,
+        qrHash,
+        status: "PENDING",
+        buyerName: cty.guestName,
+        buyerEmail: cty.guestEmail ?? null,
+        createdAt: new Date(),
+      })
+
+      await tx
+        .update(courtesies)
+        .set({ status: "REDEEMED", ticketId, redeemedAt: new Date() })
+        .where(eq(courtesies.id, cty.id))
+
+      const [row] = await tx
+        .select()
+        .from(tickets)
+        .where(eq(tickets.id, ticketId))
+        .limit(1)
+
+      return { kind: "ok" as const, ticket: row!, alreadyRedeemed: false }
+    })
+
+    if (outcome.kind === "err") {
+      return c.json({ error: outcome.error }, outcome.status)
+    }
+
+    const qrDataUrl = await qrCodeDataUrl(outcome.ticket.qrHash)
+    return c.json({
+      message: outcome.alreadyRedeemed ? "Invitación ya canjeada" : "Invitación canjeada",
+      alreadyRedeemed: outcome.alreadyRedeemed,
+      ticket: {
+        id: outcome.ticket.id,
+        eventId: outcome.ticket.eventId,
+        qrHash: outcome.ticket.qrHash,
+        status: outcome.ticket.status,
+        buyerName: outcome.ticket.buyerName,
+      },
+      qrDataUrl,
+    })
   })

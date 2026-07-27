@@ -26,6 +26,8 @@ import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import {
   bottleLoadStockDelta,
   recipeStockDeduction,
+  baseUnitsPerServingFromYield,
+  yieldPerPackageFromQuantityUsed,
 } from "../lib/inventory-deduction"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
@@ -104,7 +106,10 @@ const baseUnitSchema = z.enum(["ML", "GRAMS", "UNIT"])
 const upsertItemSchema = z.object({
   id: z.string().min(1).optional(),
   name: z.string().min(1).max(255),
-  baseUnit: baseUnitSchema,
+  /** Unidad contable de la spec 1.4 (botella/lata/bolsa). Es lo único que se pide del insumo nuevo. */
+  countingUnit: z.string().min(1).max(50).optional(),
+  /** @deprecated modelo viejo; opcional para poder crear insumos "implícitos" solo con nombre+unidad. */
+  baseUnit: baseUnitSchema.optional().default("UNIT"),
   packageSize: z
     .union([
       z.number().nonnegative(),
@@ -173,12 +178,65 @@ function totalExpenseFromLoadBottles(
   return amt
 }
 
-const recipeLineSchema = z.object({
-  inventoryItemId: z.string().min(1),
-  quantityUsed: z
-    .union([z.string().regex(/^\d+(\.\d{1,4})?$/), z.number().positive()])
-    .transform((v) => (typeof v === "number" ? String(v) : v)),
-})
+const recipeLineSchema = z
+  .object({
+    inventoryItemId: z.string().min(1),
+    /**
+     * @deprecated Modelo viejo (base units por porción). Opcional: si viene `yieldPerPackage`
+     * se deriva solo. Se mantiene para compatibilidad con clientes que aún mandan quantityUsed.
+     */
+    quantityUsed: z
+      .union([z.string().regex(/^\d+(\.\d{1,4})?$/), z.number().positive()])
+      .transform((v) => (typeof v === "number" ? String(v) : v))
+      .optional(),
+    /** Modelo 1.5: cuántas porciones salen de un envase ("10 tragos por botella"). */
+    yieldPerPackage: z
+      .union([z.string().regex(/^\d+(\.\d{1,3})?$/), z.number().positive()])
+      .transform((v) => (typeof v === "number" ? String(v) : v))
+      .optional(),
+  })
+  .refine((r) => r.quantityUsed != null || r.yieldPerPackage != null, {
+    message: "La receta necesita quantityUsed o yieldPerPackage.",
+  })
+
+type RecipeItemFields = { baseUnit: "ML" | "GRAMS" | "UNIT"; packageSize: string }
+
+/**
+ * Compute the two stored recipe values from a submitted line. Keeps legacy `quantityUsed` (used
+ * by the runtime stock deduction) and the new `yieldPerPackage` in sync: whichever the client
+ * omits is derived from the other using the insumo's counting-unit config.
+ */
+function resolveRecipeStorage(
+  line: { quantityUsed?: string; yieldPerPackage?: string },
+  item: RecipeItemFields
+): { quantityUsed: string; yieldPerPackage: string } {
+  if (line.yieldPerPackage != null) {
+    const yld = dec(line.yieldPerPackage)
+    const qu =
+      line.quantityUsed != null
+        ? dec(line.quantityUsed)
+        : baseUnitsPerServingFromYield(item, yld)
+    return { quantityUsed: decToDb(qu), yieldPerPackage: yld.toFixed(3) }
+  }
+  const qu = dec(line.quantityUsed!)
+  const yld = yieldPerPackageFromQuantityUsed(item, qu)
+  return { quantityUsed: decToDb(qu), yieldPerPackage: yld.toFixed(3) }
+}
+
+/** yieldPerPackage to expose on read: stored column if present, else derived from quantityUsed. */
+function recipeYieldOut(row: {
+  quantityUsed: string
+  yieldPerPackage: string | null
+  inventoryBaseUnit: "ML" | "GRAMS" | "UNIT"
+  inventoryPackageSize: string
+}): string | null {
+  if (row.yieldPerPackage != null) return row.yieldPerPackage
+  const yld = yieldPerPackageFromQuantityUsed(
+    { baseUnit: row.inventoryBaseUnit, packageSize: row.inventoryPackageSize },
+    dec(row.quantityUsed)
+  )
+  return yld.gt(0) ? yld.toFixed(3) : null
+}
 
 const saleTypeSchema = z.enum(["BOTTLE", "GLASS"])
 
@@ -230,6 +288,59 @@ function normalizePackageSize(body: z.infer<typeof upsertItemSchema>): string {
   return decToDb(dec(raw))
 }
 
+/**
+ * Insumos IMPLÍCITOS (spec §2/§4.3, tarea 1.4): un insumo no es una entidad que el usuario
+ * administre aparte; nace la primera vez que se lo menciona (en un rendimiento o una compra).
+ * Busca por nombre (case-insensitive) dentro del tenant y, si no existe, lo crea con el modelo
+ * nuevo: unidad contable + `baseUnit='UNIT'`. Devuelve la fila del insumo. Pensado para reusar
+ * desde las rutas de recetas (1.5) y compra de mercadería (1.6).
+ */
+export async function findOrCreateInventoryItemByName(
+  db: ReturnType<typeof drizzle>,
+  tenantId: string,
+  name: string,
+  countingUnit = "unidad"
+): Promise<typeof inventoryItems.$inferSelect> {
+  const trimmed = name.trim()
+  const [existing] = await db
+    .select()
+    .from(inventoryItems)
+    .where(
+      and(
+        eq(inventoryItems.tenantId, tenantId),
+        sql`LOWER(${inventoryItems.name}) = LOWER(${trimmed})`
+      )
+    )
+    .limit(1)
+  if (existing) {
+    // Un insumo desactivado que se vuelve a mencionar se reactiva (vuelve a existir).
+    if (existing.isActive === false) {
+      await db
+        .update(inventoryItems)
+        .set({ isActive: true })
+        .where(eq(inventoryItems.id, existing.id))
+      return { ...existing, isActive: true }
+    }
+    return existing
+  }
+  const id = uuidv4()
+  await db.insert(inventoryItems).values({
+    id,
+    tenantId,
+    name: trimmed,
+    countingUnit,
+    baseUnit: "UNIT",
+    packageSize: "0",
+    isActive: true,
+  })
+  const [row] = await db
+    .select()
+    .from(inventoryItems)
+    .where(eq(inventoryItems.id, id))
+    .limit(1)
+  return row!
+}
+
 export class InsufficientStockError extends Error {
   constructor(
     message: string,
@@ -260,6 +371,7 @@ export const inventoryRoute = new Hono()
     const items = rows.map((r) => ({
       id: r.id,
       name: r.name,
+      countingUnit: r.countingUnit,
       baseUnit: r.baseUnit,
       packageSize: r.packageSize,
     }))
@@ -296,6 +408,7 @@ export const inventoryRoute = new Hono()
           name: body.name,
           baseUnit: body.baseUnit,
           packageSize: pkg,
+          ...(body.countingUnit ? { countingUnit: body.countingUnit } : {}),
         })
         .where(eq(inventoryItems.id, body.id))
       const [row] = await db
@@ -307,6 +420,7 @@ export const inventoryRoute = new Hono()
         item: {
           id: row!.id,
           name: row!.name,
+          countingUnit: row!.countingUnit,
           baseUnit: row!.baseUnit,
           packageSize: row!.packageSize,
         },
@@ -319,6 +433,7 @@ export const inventoryRoute = new Hono()
       id,
       tenantId,
       name: body.name,
+      countingUnit: body.countingUnit ?? "unidad",
       baseUnit: body.baseUnit,
       packageSize: pkg,
       isActive: true,
@@ -333,6 +448,7 @@ export const inventoryRoute = new Hono()
         item: {
           id: row!.id,
           name: row!.name,
+          countingUnit: row!.countingUnit,
           baseUnit: row!.baseUnit,
           packageSize: row!.packageSize,
         },
@@ -560,6 +676,7 @@ export const inventoryRoute = new Hono()
         productId: productRecipes.productId,
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
+        yieldPerPackage: productRecipes.yieldPerPackage,
         inventoryName: inventoryItems.name,
         inventoryBaseUnit: inventoryItems.baseUnit,
         inventoryPackageSize: inventoryItems.packageSize,
@@ -597,6 +714,7 @@ export const inventoryRoute = new Hono()
           id: r.id,
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
+          yieldPerPackage: recipeYieldOut(r),
           inventoryItemName: r.inventoryName,
           inventoryBaseUnit: r.inventoryBaseUnit,
           inventoryPackageSize: r.inventoryPackageSize,
@@ -614,9 +732,14 @@ export const inventoryRoute = new Hono()
     const db = drizzle(pool)
 
     const invIds = [...new Set(body.recipes.map((r) => r.inventoryItemId))]
+    const itemFieldsById = new Map<string, RecipeItemFields>()
     if (invIds.length > 0) {
       const invRows = await db
-        .select({ id: inventoryItems.id })
+        .select({
+          id: inventoryItems.id,
+          baseUnit: inventoryItems.baseUnit,
+          packageSize: inventoryItems.packageSize,
+        })
         .from(inventoryItems)
         .where(
           and(
@@ -630,6 +753,12 @@ export const inventoryRoute = new Hono()
           { error: "Una o más materias primas no existen o están desactivadas." },
           400
         )
+      }
+      for (const row of invRows) {
+        itemFieldsById.set(row.id, {
+          baseUnit: row.baseUnit,
+          packageSize: row.packageSize,
+        })
       }
     }
 
@@ -652,12 +781,22 @@ export const inventoryRoute = new Hono()
       })
       if (body.recipes.length > 0) {
         await tx.insert(productRecipes).values(
-          body.recipes.map((r) => ({
-            id: uuidv4(),
-            productId,
-            inventoryItemId: r.inventoryItemId,
-            quantityUsed: decToDb(dec(r.quantityUsed)),
-          }))
+          body.recipes.map((r) => {
+            const stored = resolveRecipeStorage(
+              r,
+              itemFieldsById.get(r.inventoryItemId) ?? {
+                baseUnit: "UNIT",
+                packageSize: "0",
+              }
+            )
+            return {
+              id: uuidv4(),
+              productId,
+              inventoryItemId: r.inventoryItemId,
+              quantityUsed: stored.quantityUsed,
+              yieldPerPackage: stored.yieldPerPackage,
+            }
+          })
         )
       }
     })
@@ -672,6 +811,7 @@ export const inventoryRoute = new Hono()
         id: productRecipes.id,
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
+        yieldPerPackage: productRecipes.yieldPerPackage,
         inventoryName: inventoryItems.name,
         inventoryBaseUnit: inventoryItems.baseUnit,
         inventoryPackageSize: inventoryItems.packageSize,
@@ -726,9 +866,14 @@ export const inventoryRoute = new Hono()
     }
 
     const invIds = [...new Set(body.recipes.map((r) => r.inventoryItemId))]
+    const itemFieldsById = new Map<string, RecipeItemFields>()
     if (invIds.length > 0) {
       const invRows = await db
-        .select({ id: inventoryItems.id })
+        .select({
+          id: inventoryItems.id,
+          baseUnit: inventoryItems.baseUnit,
+          packageSize: inventoryItems.packageSize,
+        })
         .from(inventoryItems)
         .where(
           and(
@@ -742,6 +887,12 @@ export const inventoryRoute = new Hono()
           { error: "Una o más materias primas no existen o están desactivadas." },
           400
         )
+      }
+      for (const row of invRows) {
+        itemFieldsById.set(row.id, {
+          baseUnit: row.baseUnit,
+          packageSize: row.packageSize,
+        })
       }
     }
 
@@ -764,12 +915,22 @@ export const inventoryRoute = new Hono()
       await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
       if (body.recipes.length > 0) {
         await tx.insert(productRecipes).values(
-          body.recipes.map((r) => ({
-            id: uuidv4(),
-            productId,
-            inventoryItemId: r.inventoryItemId,
-            quantityUsed: decToDb(dec(r.quantityUsed)),
-          }))
+          body.recipes.map((r) => {
+            const stored = resolveRecipeStorage(
+              r,
+              itemFieldsById.get(r.inventoryItemId) ?? {
+                baseUnit: "UNIT",
+                packageSize: "0",
+              }
+            )
+            return {
+              id: uuidv4(),
+              productId,
+              inventoryItemId: r.inventoryItemId,
+              quantityUsed: stored.quantityUsed,
+              yieldPerPackage: stored.yieldPerPackage,
+            }
+          })
         )
       }
     })
@@ -784,6 +945,7 @@ export const inventoryRoute = new Hono()
         id: productRecipes.id,
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
+        yieldPerPackage: productRecipes.yieldPerPackage,
         inventoryName: inventoryItems.name,
         inventoryBaseUnit: inventoryItems.baseUnit,
         inventoryPackageSize: inventoryItems.packageSize,
@@ -808,6 +970,7 @@ export const inventoryRoute = new Hono()
           id: r.id,
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
+          yieldPerPackage: recipeYieldOut(r),
           inventoryItemName: r.inventoryName,
           inventoryBaseUnit: r.inventoryBaseUnit,
           inventoryPackageSize: r.inventoryPackageSize,
@@ -905,6 +1068,7 @@ export const inventoryRoute = new Hono()
         id: productRecipes.id,
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
+        yieldPerPackage: productRecipes.yieldPerPackage,
         inventoryName: inventoryItems.name,
         inventoryBaseUnit: inventoryItems.baseUnit,
         inventoryPackageSize: inventoryItems.packageSize,
@@ -929,6 +1093,7 @@ export const inventoryRoute = new Hono()
           id: r.id,
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
+          yieldPerPackage: recipeYieldOut(r),
           inventoryItemName: r.inventoryName,
           inventoryBaseUnit: r.inventoryBaseUnit,
           inventoryPackageSize: r.inventoryPackageSize,
@@ -976,6 +1141,7 @@ export const inventoryRoute = new Hono()
         id: productRecipes.id,
         inventoryItemId: productRecipes.inventoryItemId,
         quantityUsed: productRecipes.quantityUsed,
+        yieldPerPackage: productRecipes.yieldPerPackage,
         inventoryName: inventoryItems.name,
         inventoryBaseUnit: inventoryItems.baseUnit,
         inventoryPackageSize: inventoryItems.packageSize,
@@ -1000,6 +1166,7 @@ export const inventoryRoute = new Hono()
           id: r.id,
           inventoryItemId: r.inventoryItemId,
           quantityUsed: r.quantityUsed,
+          yieldPerPackage: recipeYieldOut(r),
           inventoryItemName: r.inventoryName,
           inventoryBaseUnit: r.inventoryBaseUnit,
           inventoryPackageSize: r.inventoryPackageSize,

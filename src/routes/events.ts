@@ -7,6 +7,7 @@ import {
   barInventory,
   barProducts,
   bars,
+  courtesies,
   customers,
   digitalConsumptions,
   eventInventory,
@@ -16,9 +17,11 @@ import {
   eventStaff,
   inventoryItems,
   products,
+  purchases,
   saleItems,
   sales,
   staff,
+  ticketTiers,
   ticketTypes,
   tickets,
 } from "../db/schema"
@@ -39,7 +42,13 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
-import { stockAllocatedToBaseUnits } from "../lib/inventory-deduction"
+import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
+import {
+  bottleLoadStockDelta,
+  stockAllocatedToBaseUnits,
+} from "../lib/inventory-deduction"
+import { findOrCreateInventoryItemByName } from "./inventory"
+import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
   deleteFileByKey,
   keyFromPublicUrl,
@@ -56,6 +65,15 @@ function requireTenantId(c: AuthenticatedContext): string | null {
 const createEventSchema = z.object({
   name: z.string().min(1).max(255),
   date: z.string().min(1),
+  location: z.string().max(255).optional(),
+})
+
+// Tarea 1.9 — "Partir de: [último evento]". Duplica la CONFIGURACIÓN de un evento en un
+// nuevo borrador. Todos los campos son opcionales: sin body, el nuevo evento hereda nombre
+// ("... (copia)"), fecha y lugar del origen.
+const duplicateEventSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  date: z.string().min(1).optional(),
   location: z.string().max(255).optional(),
 })
 
@@ -111,6 +129,12 @@ const createTicketTypeSchema = z.object({
   stockLimit: z
     .union([z.coerce.number().int().positive(), z.null()])
     .optional(),
+})
+
+const createCourtesySchema = z.object({
+  ticketTypeId: z.string().min(1).max(36),
+  guestName: z.string().min(1).max(255),
+  guestEmail: z.union([z.string().email(), z.literal(""), z.null()]).optional(),
 })
 
 const toggleEventProductSchema = z.object({
@@ -185,6 +209,37 @@ const createExpenseSchema = z.object({
   ]),
 })
 
+// Tarea 1.6 — Compra de mercadería. El insumo se identifica por id (existente) o por nombre
+// (nace implícito). La cantidad va en unidad contable (botellas/latas); el costo total asienta
+// el gasto. Exactamente uno de inventoryItemId / itemName.
+const createPurchaseSchema = z
+  .object({
+    inventoryItemId: z.string().min(1).max(36).optional(),
+    itemName: z.string().min(1).max(255).optional(),
+    // Unidad contable si el insumo nace implícito (se ignora si el insumo ya existe).
+    countingUnit: z.string().min(1).max(50).optional(),
+    quantity: z.union([
+      z.number().finite().positive(),
+      z.string().regex(/^\d+(\.\d{1,2})?$/),
+    ]),
+    // Costo total de la compra. 0 = ajuste sin costo (no asienta gasto).
+    totalCost: z
+      .union([z.number().finite().nonnegative(), z.string().regex(/^\d+(\.\d{1,2})?$/)])
+      .optional(),
+    note: z.string().max(255).optional(),
+  })
+  .superRefine((data, ctx) => {
+    const hasId = data.inventoryItemId != null && data.inventoryItemId !== ""
+    const hasName = data.itemName != null && data.itemName.trim() !== ""
+    if (hasId === hasName) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Indicá exactamente inventoryItemId o itemName",
+        path: ["itemName"],
+      })
+    }
+  })
+
 async function countIssuedTickets(
   db: ReturnType<typeof drizzle>,
   tenantId: string,
@@ -203,6 +258,44 @@ async function countIssuedTickets(
   return Number(row?.n ?? 0)
 }
 
+// Cortesías canjeadas (entradas emitidas por invitación) de un tipo, para contarlas
+// "aparte" de las ventas pagas (spec §4.2). Una cortesía cuenta acá cuando ya emitió
+// su entrada (status REDEEMED) y esa entrada no fue anulada.
+async function countRedeemedCourtesies(
+  db: ReturnType<typeof drizzle>,
+  tenantId: string,
+  ticketTypeId: string
+): Promise<number> {
+  const [row] = await db
+    .select({ n: count() })
+    .from(courtesies)
+    .innerJoin(tickets, eq(courtesies.ticketId, tickets.id))
+    .where(
+      and(
+        eq(courtesies.tenantId, tenantId),
+        eq(courtesies.ticketTypeId, ticketTypeId),
+        eq(courtesies.status, "REDEEMED"),
+        ne(tickets.status, "CANCELLED")
+      )
+    )
+  return Number(row?.n ?? 0)
+}
+
+function sanitizeCourtesy(row: typeof courtesies.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    ticketTypeId: row.ticketTypeId,
+    guestName: row.guestName,
+    guestEmail: row.guestEmail ?? null,
+    token: row.token,
+    status: row.status,
+    ticketId: row.ticketId ?? null,
+    redeemedAt: row.redeemedAt ? row.redeemedAt.toISOString() : null,
+    createdAt: row.createdAt ? row.createdAt.toISOString() : null,
+  }
+}
+
 function sanitizeEvent(row: typeof events.$inferSelect) {
   return {
     id: row.id,
@@ -212,6 +305,11 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     date: row.date,
     location: row.location,
     isActive: row.isActive,
+    status: row.status ?? "draft",
+    doorsAt: row.doorsAt ? row.doorsAt.toISOString() : null,
+    salesOpenedAt: row.salesOpenedAt ? row.salesOpenedAt.toISOString() : null,
+    wentLiveAt: row.wentLiveAt ? row.wentLiveAt.toISOString() : null,
+    closedAt: row.closedAt ? row.closedAt.toISOString() : null,
     createdAt: row.createdAt,
     imageUrl: row.imageUrl ?? null,
     designType: row.designType ?? "GLASS",
@@ -306,6 +404,59 @@ async function requireBarForEventTenant(
   return row ?? null
 }
 
+/**
+ * Devuelve la barra implícita del evento (la que "vende todo" por defecto),
+ * materializándola on-demand si hace falta. Encarna la "barra implícita" de la
+ * spec §4.3: el productor nunca la crea; existe sola. Reglas:
+ *  - si ya hay una barra con isDefault=true, la devuelve;
+ *  - si hay barras pero ninguna default (datos viejos), promueve la más vieja;
+ *  - si el evento no tiene barras, crea "Barra general" (isDefault=true).
+ * No la llama ningún read por sí solo (para no cambiar el comportamiento del POS,
+ * que sigue operando a nivel evento con barId=null); se invoca en acciones
+ * deliberadas como "Dividir en puestos". Exportada para reusar en Fase 3.2.
+ */
+export async function ensureDefaultBar(
+  db: ReturnType<typeof drizzle>,
+  tenantId: string,
+  eventId: string
+): Promise<typeof bars.$inferSelect> {
+  const existing = await db
+    .select()
+    .from(bars)
+    .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
+    .orderBy(desc(bars.isDefault), asc(bars.createdAt), asc(bars.id))
+
+  const current = existing[0]
+  if (current) {
+    if (!current.isDefault) {
+      // Datos viejos sin default: promuevo la más vieja.
+      await db
+        .update(bars)
+        .set({ isDefault: true })
+        .where(and(eq(bars.id, current.id), eq(bars.tenantId, tenantId)))
+      return { ...current, isDefault: true }
+    }
+    return current
+  }
+
+  const id = uuidv4()
+  await db.insert(bars).values({
+    id,
+    eventId,
+    tenantId,
+    name: "Barra general",
+    isDefault: true,
+    isActive: true,
+    createdAt: new Date(),
+  })
+  const [row] = await db
+    .select()
+    .from(bars)
+    .where(and(eq(bars.id, id), eq(bars.tenantId, tenantId)))
+    .limit(1)
+  return row!
+}
+
 const EMPTY_BAR_STATS = {
   staffList: [] as string[],
   productList: [] as string[],
@@ -344,6 +495,7 @@ function sanitizeBar(
     eventId: row.eventId,
     tenantId: row.tenantId,
     name: row.name,
+    isDefault: row.isDefault,
     isActive: row.isActive,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -370,16 +522,73 @@ function sanitizeExpense(row: typeof eventExpenses.$inferSelect) {
     amount: String(row.amount),
     date: row.date,
     createdAt: row.createdAt,
+    // Tarea 1.6: != null cuando el gasto vino de una compra de mercadería (no editable a mano).
+    purchaseId: row.purchaseId ?? null,
+  }
+}
+
+function sanitizePurchase(row: typeof purchases.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    tenantId: row.tenantId,
+    inventoryItemId: row.inventoryItemId,
+    quantity: String(row.quantity),
+    countingUnit: row.countingUnit,
+    totalCost: String(row.totalCost),
+    note: row.note ?? null,
+    createdBy: row.createdBy ?? null,
+    createdAt: row.createdAt,
+  }
+}
+
+function tierRowToTier(row: typeof ticketTiers.$inferSelect): TicketTier {
+  return {
+    id: row.id,
+    name: row.name,
+    price: row.price,
+    position: row.position,
+    stockLimit: row.stockLimit,
+    activeFrom: row.activeFrom ? row.activeFrom.toISOString() : null,
+    activeUntil: row.activeUntil ? row.activeUntil.toISOString() : null,
   }
 }
 
 function sanitizeTicketType(
   row: typeof ticketTypes.$inferSelect,
-  sold: number
+  sold: number,
+  tierRows: (typeof ticketTiers.$inferSelect)[] = [],
+  // Cortesías canjeadas de este tipo, contadas aparte (spec §4.2). No consumen
+  // el cupo pago ni las tandas: son un regalo extra del productor.
+  courtesyCount = 0
 ) {
   const limit = row.stockLimit
   const remaining =
     limit == null ? null : Math.max(0, limit - sold)
+
+  // Tandas (spec §4.2): si el tipo tiene escalera, el precio efectivo y el stock
+  // vigente salen de la tanda activa; si no, hereda el precio/stock plano del tipo.
+  const tiers = tierRows.map(tierRowToTier)
+  let activeTier = null as null | {
+    id: string
+    name: string
+    price: string
+    remaining: number | null
+  }
+  let effectivePrice = row.price
+  if (tiers.length > 0) {
+    const evalResult = evaluateTicketTiers(tiers, sold)
+    if (evalResult.active) {
+      activeTier = {
+        id: evalResult.active.id,
+        name: evalResult.active.name,
+        price: evalResult.active.price,
+        remaining: evalResult.remainingInActive,
+      }
+      effectivePrice = evalResult.active.price
+    }
+  }
+
   return {
     id: row.id,
     eventId: row.eventId,
@@ -389,6 +598,13 @@ function sanitizeTicketType(
     stockLimit: row.stockLimit,
     sold,
     remaining,
+    // Cortesías canjeadas de este tipo, contadas aparte de `sold`.
+    courtesies: courtesyCount,
+    // Precio que efectivamente sale ahora (tanda activa o precio plano).
+    effectivePrice,
+    // La escalera completa (ordenada) + la tanda vigente, o vacío si no hay tandas.
+    tiers: tiers.sort((a, b) => a.position - b.position),
+    activeTier,
   }
 }
 
@@ -427,12 +643,191 @@ export const eventsRoute = new Hono()
       date: new Date(body.date),
       location: body.location ?? null,
       isActive: true,
+      status: "draft",
       createdAt: new Date(),
     })
     const [row] = await db
       .select()
       .from(events)
       .where(and(eq(events.id, id), eq(events.tenantId, tenantId)))
+    return c.json({ event: sanitizeEvent(row) }, 201)
+  })
+  // Tarea 1.9 — Duplicar evento ("Partir de: [último evento]"). Clona la CONFIGURACIÓN del
+  // evento origen en un nuevo BORRADOR: tipos de entrada + tandas, menú (event_products) con
+  // sus precios/isActive, barras (default + puestos) con su menú (bar_products), y el equipo
+  // (event_staff, con su puesto). NO clona los HECHOS del evento: ventas, entradas emitidas,
+  // cortesías canjeadas, stock (event/bar inventory), compras ni gastos. El evento nuevo nace
+  // 'draft' (isActive true), sin slug (es único), sin fechas de apertura/cierre.
+  .post("/:id/duplicate", zValidator("json", duplicateEventSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const sourceId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const [source] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, sourceId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!source) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    // Config a clonar del evento origen.
+    const [srcTypes, srcTiers, srcEventProducts, srcBars, srcBarProducts, srcEventStaff] =
+      await Promise.all([
+        db
+          .select()
+          .from(ticketTypes)
+          .where(and(eq(ticketTypes.eventId, sourceId), eq(ticketTypes.tenantId, tenantId))),
+        db
+          .select()
+          .from(ticketTiers)
+          .where(and(eq(ticketTiers.eventId, sourceId), eq(ticketTiers.tenantId, tenantId))),
+        db
+          .select()
+          .from(eventProducts)
+          .where(and(eq(eventProducts.eventId, sourceId), eq(eventProducts.tenantId, tenantId))),
+        db
+          .select()
+          .from(bars)
+          .where(and(eq(bars.eventId, sourceId), eq(bars.tenantId, tenantId))),
+        db
+          .select()
+          .from(barProducts)
+          .where(eq(barProducts.tenantId, tenantId)),
+        db
+          .select()
+          .from(eventStaff)
+          .where(and(eq(eventStaff.eventId, sourceId), eq(eventStaff.tenantId, tenantId))),
+      ])
+
+    // barProducts no tiene eventId: filtro las filas cuyas barras pertenecen al evento origen.
+    const srcBarIds = new Set(srcBars.map((b) => b.id))
+    const srcBarProductsForEvent = srcBarProducts.filter((bp) => srcBarIds.has(bp.barId))
+
+    const newEventId = uuidv4()
+    const newName = body.name?.trim() || `${source.name} (copia)`
+    const newDate = body.date ? new Date(body.date) : source.date
+    const newLocation = body.location ?? source.location ?? null
+
+    // Mapas id origen → id nuevo para remapear las FKs entre tablas.
+    const typeIdMap = new Map<string, string>()
+    const barIdMap = new Map<string, string>()
+
+    await db.transaction(async (tx) => {
+      await tx.insert(events).values({
+        id: newEventId,
+        tenantId,
+        name: newName,
+        date: newDate,
+        location: newLocation,
+        isActive: true,
+        status: "draft",
+        designType: source.designType,
+        imageUrl: source.imageUrl ?? null,
+        createdAt: new Date(),
+      })
+
+      // Tipos de entrada (precio + stock).
+      for (const t of srcTypes) {
+        const id = uuidv4()
+        typeIdMap.set(t.id, id)
+        await tx.insert(ticketTypes).values({
+          id,
+          eventId: newEventId,
+          tenantId,
+          name: t.name,
+          price: t.price,
+          stockLimit: t.stockLimit,
+        })
+      }
+
+      // Tandas (escalera de precios) remapeadas al nuevo tipo y evento.
+      for (const tier of srcTiers) {
+        const newTypeId = typeIdMap.get(tier.ticketTypeId)
+        if (!newTypeId) continue
+        await tx.insert(ticketTiers).values({
+          id: uuidv4(),
+          ticketTypeId: newTypeId,
+          eventId: newEventId,
+          tenantId,
+          name: tier.name,
+          price: tier.price,
+          position: tier.position,
+          stockLimit: tier.stockLimit,
+          activeFrom: tier.activeFrom,
+          activeUntil: tier.activeUntil,
+          createdAt: new Date(),
+        })
+      }
+
+      // Menú del evento con precios de evento. NO se clona el stock (directStock queda null):
+      // el stock es un hecho del evento, no configuración.
+      for (const ep of srcEventProducts) {
+        await tx.insert(eventProducts).values({
+          id: uuidv4(),
+          eventId: newEventId,
+          productId: ep.productId,
+          tenantId,
+          priceOverride: ep.priceOverride,
+          isActive: ep.isActive,
+          directStock: null,
+          createdAt: new Date(),
+        })
+      }
+
+      // Barras (default + puestos) — sin stock (bar_inventory no se clona).
+      for (const b of srcBars) {
+        const id = uuidv4()
+        barIdMap.set(b.id, id)
+        await tx.insert(bars).values({
+          id,
+          eventId: newEventId,
+          tenantId,
+          name: b.name,
+          isDefault: b.isDefault,
+          isActive: b.isActive,
+          createdAt: new Date(),
+        })
+      }
+
+      // Menú de cada barra/puesto remapeado a la barra nueva.
+      for (const bp of srcBarProductsForEvent) {
+        const newBarId = barIdMap.get(bp.barId)
+        if (!newBarId) continue
+        await tx.insert(barProducts).values({
+          id: uuidv4(),
+          barId: newBarId,
+          productId: bp.productId,
+          tenantId,
+          isActive: bp.isActive,
+          createdAt: new Date(),
+        })
+      }
+
+      // Equipo: cada persona con su puesto (barId remapeado si estaba asignada a uno).
+      for (const es of srcEventStaff) {
+        const newBarId = es.barId ? barIdMap.get(es.barId) ?? null : null
+        await tx.insert(eventStaff).values({
+          id: uuidv4(),
+          eventId: newEventId,
+          tenantId,
+          staffId: es.staffId,
+          barId: newBarId,
+          createdAt: new Date(),
+        })
+      }
+    })
+
+    const [row] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, newEventId), eq(events.tenantId, tenantId)))
     return c.json({ event: sanitizeEvent(row) }, 201)
   })
   .get("/:id/ticket-types", async (c) => {
@@ -457,10 +852,29 @@ export const eventsRoute = new Hono()
       .where(
         and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, tenantId))
       )
+    const tierRows = await db
+      .select()
+      .from(ticketTiers)
+      .where(
+        and(eq(ticketTiers.eventId, eventId), eq(ticketTiers.tenantId, tenantId))
+      )
+    const tiersByType = new Map<string, (typeof ticketTiers.$inferSelect)[]>()
+    for (const t of tierRows) {
+      const list = tiersByType.get(t.ticketTypeId) ?? []
+      list.push(t)
+      tiersByType.set(t.ticketTypeId, list)
+    }
     const enriched = []
     for (const t of types) {
-      const sold = await countIssuedTickets(db, tenantId, t.id)
-      enriched.push(sanitizeTicketType(t, sold))
+      // `issued` = todas las entradas no anuladas; `courtesyCount` = las que vinieron
+      // de una cortesía. Las ventas pagas (`sold`) son la diferencia: así las cortesías
+      // se cuentan aparte y no consumen cupo pago ni tandas (spec §4.2).
+      const issued = await countIssuedTickets(db, tenantId, t.id)
+      const courtesyCount = await countRedeemedCourtesies(db, tenantId, t.id)
+      const sold = Math.max(0, issued - courtesyCount)
+      enriched.push(
+        sanitizeTicketType(t, sold, tiersByType.get(t.id) ?? [], courtesyCount)
+      )
     }
     return c.json({ ticketTypes: enriched })
   })
@@ -497,6 +911,139 @@ export const eventsRoute = new Hono()
       .where(and(eq(ticketTypes.id, id), eq(ticketTypes.tenantId, tenantId)))
     const sold = 0
     return c.json({ ticketType: sanitizeTicketType(row, sold) }, 201)
+  })
+  // Cortesías / invitaciones (spec §4.2): links nominados que emiten una entrada.
+  .get("/:id/courtesies", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+    const [ev] = await db
+      .select()
+      .from(events)
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      .limit(1)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    const rows = await db
+      .select()
+      .from(courtesies)
+      .where(
+        and(eq(courtesies.eventId, eventId), eq(courtesies.tenantId, tenantId))
+      )
+      .orderBy(desc(courtesies.createdAt))
+    return c.json({ courtesies: rows.map(sanitizeCourtesy) })
+  })
+  .post(
+    "/:id/courtesies",
+    zValidator("json", createCourtesySchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+      const [ev] = await db
+        .select()
+        .from(events)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+        .limit(1)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      // El tipo de entrada tiene que ser de este evento y tenant.
+      const [tt] = await db
+        .select()
+        .from(ticketTypes)
+        .where(
+          and(
+            eq(ticketTypes.id, body.ticketTypeId),
+            eq(ticketTypes.eventId, eventId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!tt) {
+        return c.json({ error: "Tipo de entrada no encontrado" }, 404)
+      }
+      const email =
+        body.guestEmail != null && body.guestEmail !== ""
+          ? body.guestEmail
+          : null
+      const id = uuidv4()
+      const token = uuidv4()
+      await db.insert(courtesies).values({
+        id,
+        tenantId,
+        eventId,
+        ticketTypeId: body.ticketTypeId,
+        guestName: body.guestName,
+        guestEmail: email,
+        token,
+        status: "PENDING",
+        createdBy: ctx.staff.id,
+        createdAt: new Date(),
+      })
+      const [row] = await db
+        .select()
+        .from(courtesies)
+        .where(and(eq(courtesies.id, id), eq(courtesies.tenantId, tenantId)))
+        .limit(1)
+      return c.json({ courtesy: sanitizeCourtesy(row) }, 201)
+    }
+  )
+  .post("/:id/courtesies/:courtesyId/revoke", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const courtesyId = c.req.param("courtesyId")
+    const db = drizzle(pool)
+    const [row] = await db
+      .select()
+      .from(courtesies)
+      .where(
+        and(
+          eq(courtesies.id, courtesyId),
+          eq(courtesies.eventId, eventId),
+          eq(courtesies.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Cortesía no encontrada" }, 404)
+    }
+    if (row.status === "REDEEMED") {
+      return c.json(
+        {
+          error:
+            "No se puede anular una cortesía ya canjeada. Anulá la entrada emitida desde Entradas.",
+        },
+        409
+      )
+    }
+    if (row.status === "REVOKED") {
+      return c.json({ courtesy: sanitizeCourtesy(row) })
+    }
+    await db
+      .update(courtesies)
+      .set({ status: "REVOKED" })
+      .where(and(eq(courtesies.id, courtesyId), eq(courtesies.tenantId, tenantId)))
+    const [updated] = await db
+      .select()
+      .from(courtesies)
+      .where(eq(courtesies.id, courtesyId))
+      .limit(1)
+    return c.json({ courtesy: sanitizeCourtesy(updated) })
   })
   .get("/:id/tickets", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -1668,15 +2215,49 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
+    // "Dividir en puestos": el puesto nuevo hereda del default y jamás nace
+    // vacío. Materializo primero la barra implícita, luego creo el puesto
+    // copiando su menú (los barProducts activos del default).
+    const defaultBar = await ensureDefaultBar(db, tenantId, eventId)
+
     const id = uuidv4()
     await db.insert(bars).values({
       id,
       eventId,
       tenantId,
       name: body.name,
+      isDefault: false,
       isActive: true,
       createdAt: new Date(),
     })
+
+    // Hereda el menú del default: copia sus overrides de barProducts, así el
+    // puesto jamás nace vacío. El menú real (con nombres) se ve en el próximo
+    // GET /:id/bars; acá devuelvo stats vacías como hacía antes.
+    const menu = await db
+      .select({
+        productId: barProducts.productId,
+        isActive: barProducts.isActive,
+      })
+      .from(barProducts)
+      .where(
+        and(
+          eq(barProducts.barId, defaultBar.id),
+          eq(barProducts.tenantId, tenantId)
+        )
+      )
+    if (menu.length > 0) {
+      await db.insert(barProducts).values(
+        menu.map((m) => ({
+          id: uuidv4(),
+          barId: id,
+          productId: m.productId,
+          tenantId,
+          isActive: m.isActive ?? true,
+          createdAt: new Date(),
+        }))
+      )
+    }
 
     const [row] = await db
       .select()
@@ -1713,6 +2294,15 @@ export const eventsRoute = new Hono()
       const existing = await requireBarForEventTenant(db, barId, eventId, tenantId)
       if (!existing) {
         return c.json({ error: "Barra no encontrada" }, 404)
+      }
+
+      // La barra implícita siempre existe y vende todo: no se puede desactivar
+      // (sí renombrar). Los puestos sí se pueden desactivar.
+      if (existing.isDefault && body.isActive === false) {
+        return c.json(
+          { error: "No se puede desactivar la barra general del evento." },
+          400
+        )
       }
 
       const patch: Partial<{
@@ -1866,6 +2456,183 @@ export const eventsRoute = new Hono()
       )
 
     return c.json({ ok: true })
+  })
+  // Tarea 1.6 — Compras de mercadería del evento. Registro único: sube stock del evento y
+  // asienta el gasto a la vez, enlazado por `eventExpenses.purchaseId` para no duplicar.
+  .get("/:id/purchases", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select()
+      .from(purchases)
+      .where(and(eq(purchases.eventId, eventId), eq(purchases.tenantId, tenantId)))
+      .orderBy(desc(purchases.createdAt))
+
+    return c.json({ purchases: rows.map(sanitizePurchase) })
+  })
+  .post("/:id/purchases", zValidator("json", createPurchaseSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    // Cantidad (unidad contable) y costo total, validados a Decimal.
+    let qty
+    let cost
+    try {
+      qty = dec(body.quantity)
+      cost = body.totalCost == null ? dec(0) : dec(body.totalCost)
+    } catch {
+      return c.json({ error: "Cantidad o costo inválidos" }, 400)
+    }
+    if (qty.isNaN() || !qty.isFinite() || qty.lte(0)) {
+      return c.json({ error: "La cantidad debe ser mayor que 0" }, 400)
+    }
+    if (cost.isNaN() || !cost.isFinite() || cost.lt(0)) {
+      return c.json({ error: "Costo inválido" }, 400)
+    }
+
+    // Resolvé el insumo: por id (existente) o por nombre (nace implícito, spec §2/§4.3).
+    let item
+    if (body.inventoryItemId) {
+      const [found] = await db
+        .select()
+        .from(inventoryItems)
+        .where(
+          and(
+            eq(inventoryItems.id, body.inventoryItemId),
+            eq(inventoryItems.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!found) {
+        return c.json({ error: "Insumo no encontrado" }, 404)
+      }
+      if (found.isActive === false) {
+        return c.json({ error: "El insumo está desactivado." }, 400)
+      }
+      item = found
+    } else {
+      item = await findOrCreateInventoryItemByName(
+        db,
+        tenantId,
+        body.itemName!,
+        body.countingUnit?.trim() || "unidad"
+      )
+    }
+
+    // Convertí la cantidad contable a base units para el stock del evento (mismo criterio que
+    // load-bottles). Para insumos del modelo nuevo (UNIT) el delta es la cantidad tal cual.
+    const { delta, error: deltaErr } = bottleLoadStockDelta(item, qty.toNumber())
+    if (deltaErr) {
+      return c.json({ error: deltaErr }, 400)
+    }
+    if (!delta.gt(0)) {
+      return c.json({ error: "La cantidad a sumar debe ser mayor que 0" }, 400)
+    }
+
+    const purchaseId = uuidv4()
+    const costStr = decToDb(cost)
+    const noteTrimmed = body.note?.trim() || null
+
+    const nextAllocated = await db.transaction(async (tx) => {
+      // 1) El registro físico de la compra (fuente de verdad del hecho).
+      await tx.insert(purchases).values({
+        id: purchaseId,
+        tenantId,
+        eventId,
+        inventoryItemId: item.id,
+        quantity: decToDb(qty),
+        countingUnit: item.countingUnit,
+        totalCost: costStr,
+        note: noteTrimmed,
+        createdBy: ctx.staff.id,
+        createdAt: new Date(),
+      })
+
+      // 2) El gasto enlazado (solo si hubo costo). purchaseId lo marca como mercadería, así
+      //    Finanzas (3.5) lo excluye de los gastos operativos y el /summary lo cuenta una vez.
+      if (cost.gt(0)) {
+        await tx.insert(eventExpenses).values({
+          id: uuidv4(),
+          eventId,
+          tenantId,
+          description: `Compra: ${decToDb(qty)} ${item.countingUnit} de ${item.name}`.slice(0, 255),
+          category: "FOOD",
+          amount: costStr,
+          date: new Date(),
+          createdAt: new Date(),
+          purchaseId,
+        })
+      }
+
+      // 3) Subí el stock asignado al evento (upsert), igual que la rama de evento de load-bottles.
+      const [evInv] = await tx
+        .select()
+        .from(eventInventory)
+        .where(
+          and(
+            eq(eventInventory.eventId, eventId),
+            eq(eventInventory.inventoryItemId, item.id),
+            eq(eventInventory.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      const next = (evInv ? decFromDb(evInv.stockAllocated) : dec(0)).plus(delta)
+      await tx
+        .insert(eventInventory)
+        .values({
+          id: uuidv4(),
+          eventId,
+          inventoryItemId: item.id,
+          tenantId,
+          stockAllocated: decToDb(next),
+          createdAt: new Date(),
+        })
+        .onDuplicateKeyUpdate({ set: { stockAllocated: decToDb(next) } })
+
+      return next
+    })
+
+    void emitCommittedStockDeltas(tenantId, eventId, {
+      eventItemIds: [item.id],
+    })
+
+    const [row] = await db
+      .select()
+      .from(purchases)
+      .where(and(eq(purchases.id, purchaseId), eq(purchases.tenantId, tenantId)))
+      .limit(1)
+
+    return c.json(
+      {
+        purchase: row ? sanitizePurchase(row) : null,
+        stockAllocated: decToDb(nextAllocated),
+        inventoryItemId: item.id,
+        itemName: item.name,
+      },
+      201
+    )
   })
   .get("/:id/sales", async (c) => {
     const ctx = c as AuthenticatedContext

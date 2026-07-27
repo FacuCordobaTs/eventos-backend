@@ -33,6 +33,37 @@ export function recipeStockDeduction(
   return recipeQty
 }
 
+/**
+ * Model 1.5 "rinde N por envase". A recipe line declares how many servings come out of one
+ * counting unit (envase) of the insumo: "10 tragos por botella". These two helpers translate
+ * between that human value and the legacy base-unit `quantityUsed`, so both stay in sync while
+ * the stock model migrates (3.2). They are pure and dependency-light on purpose.
+ */
+
+/** Legacy base units (ml/g/UNIT) consumed per one serving, given "N servings per package". */
+export function baseUnitsPerServingFromYield(
+  item: ItemDeductionFields,
+  yieldPerPackage: Decimal
+): Decimal {
+  if (yieldPerPackage.lte(0)) return dec(0)
+  if (item.baseUnit === "UNIT") return dec(1).div(yieldPerPackage)
+  const pkg = decFromDb(item.packageSize)
+  if (pkg.gt(0)) return pkg.div(yieldPerPackage)
+  return dec(1).div(yieldPerPackage)
+}
+
+/** Inverse: derive the human "N per package" yield from legacy base-unit `quantityUsed`. */
+export function yieldPerPackageFromQuantityUsed(
+  item: ItemDeductionFields,
+  quantityUsed: Decimal
+): Decimal {
+  if (quantityUsed.lte(0)) return dec(0)
+  if (item.baseUnit === "UNIT") return dec(1).div(quantityUsed)
+  const pkg = decFromDb(item.packageSize)
+  if (pkg.gt(0)) return pkg.div(quantityUsed)
+  return dec(1).div(quantityUsed)
+}
+
 export function bottleLoadStockDelta(
   item: ItemDeductionFields,
   quantityOfBottles: number,
