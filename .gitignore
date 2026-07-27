@@ -4,3 +4,4 @@ node_modules/
 bun.lock
 # Accidental Windows artifact (e.g. `bun build --outfile NUL` in repo root)
 NUL
+public/updates/
