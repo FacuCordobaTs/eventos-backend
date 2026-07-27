@@ -131,6 +131,35 @@ const createTicketTypeSchema = z.object({
     .optional(),
 })
 
+// Edición de un tipo de entrada (spec §4.2: persiste al blur, sin "Guardar" global).
+// Todos los campos opcionales: el front manda solo lo que cambió.
+const patchTicketTypeSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  price: z.coerce.number().nonnegative().optional(),
+  stockLimit: z
+    .union([z.coerce.number().int().positive(), z.null()])
+    .optional(),
+})
+
+// Tandas (spec §4.2): reemplazo atómico de TODA la escalera de un tipo. El editor de la
+// UI arma la frase completa ("Early $8.000 (200) → General $10.000") y la manda entera;
+// acá se borran las tandas viejas y se insertan las nuevas con `position` = orden del array.
+const replaceTiersSchema = z.object({
+  tiers: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(100),
+        price: z.coerce.number().nonnegative(),
+        stockLimit: z
+          .union([z.coerce.number().int().positive(), z.null()])
+          .optional(),
+        activeFrom: z.union([z.string().datetime(), z.null()]).optional(),
+        activeUntil: z.union([z.string().datetime(), z.null()]).optional(),
+      })
+    )
+    .max(20),
+})
+
 const createCourtesySchema = z.object({
   ticketTypeId: z.string().min(1).max(36),
   guestName: z.string().min(1).max(255),
@@ -912,6 +941,184 @@ export const eventsRoute = new Hono()
     const sold = 0
     return c.json({ ticketType: sanitizeTicketType(row, sold) }, 201)
   })
+  .patch(
+    "/:id/ticket-types/:typeId",
+    zValidator("json", patchTicketTypeSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const typeId = c.req.param("typeId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+      const [row] = await db
+        .select()
+        .from(ticketTypes)
+        .where(
+          and(
+            eq(ticketTypes.id, typeId),
+            eq(ticketTypes.eventId, eventId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!row) {
+        return c.json({ error: "Tipo de entrada no encontrado" }, 404)
+      }
+      const patch: Partial<typeof ticketTypes.$inferInsert> = {}
+      if (body.name !== undefined) patch.name = body.name
+      if (body.price !== undefined) patch.price = body.price.toFixed(2)
+      if (body.stockLimit !== undefined) patch.stockLimit = body.stockLimit
+      if (Object.keys(patch).length > 0) {
+        await db
+          .update(ticketTypes)
+          .set(patch)
+          .where(
+            and(eq(ticketTypes.id, typeId), eq(ticketTypes.tenantId, tenantId))
+          )
+      }
+      const [updated] = await db
+        .select()
+        .from(ticketTypes)
+        .where(and(eq(ticketTypes.id, typeId), eq(ticketTypes.tenantId, tenantId)))
+        .limit(1)
+      const tierRows = await db
+        .select()
+        .from(ticketTiers)
+        .where(
+          and(
+            eq(ticketTiers.ticketTypeId, typeId),
+            eq(ticketTiers.tenantId, tenantId)
+          )
+        )
+      const issued = await countIssuedTickets(db, tenantId, typeId)
+      const courtesyCount = await countRedeemedCourtesies(db, tenantId, typeId)
+      const sold = Math.max(0, issued - courtesyCount)
+      return c.json({
+        ticketType: sanitizeTicketType(updated, sold, tierRows, courtesyCount),
+      })
+    }
+  )
+  .delete("/:id/ticket-types/:typeId", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const typeId = c.req.param("typeId")
+    const db = drizzle(pool)
+    const [row] = await db
+      .select()
+      .from(ticketTypes)
+      .where(
+        and(
+          eq(ticketTypes.id, typeId),
+          eq(ticketTypes.eventId, eventId),
+          eq(ticketTypes.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Tipo de entrada no encontrado" }, 404)
+    }
+    // No se borra un tipo que ya emitió entradas: tocaría dinero/accesos ya vivos.
+    const issued = await countIssuedTickets(db, tenantId, typeId)
+    if (issued > 0) {
+      return c.json(
+        {
+          error:
+            "Este tipo ya tiene entradas emitidas. No se puede eliminar; ajustá su cupo o precio.",
+        },
+        409
+      )
+    }
+    // Limpiar la escalera de tandas antes de borrar el tipo (FK).
+    await db
+      .delete(ticketTiers)
+      .where(
+        and(eq(ticketTiers.ticketTypeId, typeId), eq(ticketTiers.tenantId, tenantId))
+      )
+    await db
+      .delete(ticketTypes)
+      .where(and(eq(ticketTypes.id, typeId), eq(ticketTypes.tenantId, tenantId)))
+    return c.json({ ok: true })
+  })
+  // Tandas (spec §4.2): reemplaza TODA la escalera de un tipo de una vez. La UI arma la
+  // frase completa y la manda entera; acá se borra lo viejo y se inserta lo nuevo.
+  .put(
+    "/:id/ticket-types/:typeId/tiers",
+    zValidator("json", replaceTiersSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const typeId = c.req.param("typeId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+      const [tt] = await db
+        .select()
+        .from(ticketTypes)
+        .where(
+          and(
+            eq(ticketTypes.id, typeId),
+            eq(ticketTypes.eventId, eventId),
+            eq(ticketTypes.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!tt) {
+        return c.json({ error: "Tipo de entrada no encontrado" }, 404)
+      }
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(ticketTiers)
+          .where(
+            and(
+              eq(ticketTiers.ticketTypeId, typeId),
+              eq(ticketTiers.tenantId, tenantId)
+            )
+          )
+        for (let i = 0; i < body.tiers.length; i++) {
+          const t = body.tiers[i]
+          await tx.insert(ticketTiers).values({
+            id: uuidv4(),
+            ticketTypeId: typeId,
+            eventId,
+            tenantId,
+            name: t.name,
+            price: t.price.toFixed(2),
+            position: i,
+            stockLimit: t.stockLimit ?? null,
+            activeFrom: t.activeFrom ? new Date(t.activeFrom) : null,
+            activeUntil: t.activeUntil ? new Date(t.activeUntil) : null,
+            createdAt: new Date(),
+          })
+        }
+      })
+      const tierRows = await db
+        .select()
+        .from(ticketTiers)
+        .where(
+          and(
+            eq(ticketTiers.ticketTypeId, typeId),
+            eq(ticketTiers.tenantId, tenantId)
+          )
+        )
+      const issued = await countIssuedTickets(db, tenantId, typeId)
+      const courtesyCount = await countRedeemedCourtesies(db, tenantId, typeId)
+      const sold = Math.max(0, issued - courtesyCount)
+      return c.json({
+        ticketType: sanitizeTicketType(tt, sold, tierRows, courtesyCount),
+      })
+    }
+  )
   // Cortesías / invitaciones (spec §4.2): links nominados que emiten una entrada.
   .get("/:id/courtesies", async (c) => {
     const ctx = c as AuthenticatedContext

@@ -49,8 +49,8 @@ async function countIssuedForType(
 export type PurchaseParams = {
   eventId: string
   ticketTypeId: string
-  buyerName: string
-  buyerEmail: string
+  buyerName: string | null
+  buyerEmail: string | null
   /** App B2B2C: vincula la entrada al cliente. */
   customerId?: string
   /** Venta web/POS que agrupa entradas de esta compra. */

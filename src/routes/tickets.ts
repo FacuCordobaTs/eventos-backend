@@ -14,11 +14,12 @@ import {
 import { qrCodeDataUrl } from "../lib/qr"
 import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
 
+// Venta manual (spec §4.2): pide lo mínimo — tipo → cobrar → listo. Nombre y correo opcionales.
 const sellTicketSchema = z.object({
   eventId: z.string().min(1),
   ticketTypeId: z.string().min(1),
-  buyerName: z.string().min(1).max(255),
-  buyerEmail: z.string().email(),
+  buyerName: z.string().max(255).optional(),
+  buyerEmail: z.union([z.string().email(), z.literal(""), z.null()]).optional(),
 })
 
 const validateTicketSchema = z.object({
@@ -60,8 +61,8 @@ export const ticketsRoute = new Hono()
         executeTicketPurchase(tx, {
           eventId: body.eventId,
           ticketTypeId: body.ticketTypeId,
-          buyerName: body.buyerName,
-          buyerEmail: body.buyerEmail,
+          buyerName: body.buyerName?.trim() || null,
+          buyerEmail: body.buyerEmail?.trim() || null,
           enforceTenantId: tenantId,
         })
       )
