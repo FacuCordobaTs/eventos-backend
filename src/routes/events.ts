@@ -21,6 +21,7 @@ import {
   saleItems,
   sales,
   staff,
+  tenants,
   ticketTiers,
   ticketTypes,
   tickets,
@@ -43,6 +44,12 @@ import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
+import {
+  EVENT_STATUSES,
+  eventStatusRank,
+  outgoingTransition,
+  type EventStatus,
+} from "../lib/event-status"
 import {
   bottleLoadStockDelta,
   stockAllocatedToBaseUnits,
@@ -388,6 +395,46 @@ async function requireEventForTenant(
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
   return ev ?? null
+}
+
+/**
+ * Requisitos esenciales para "Abrir venta" (spec §5). Devuelve las piezas que faltan como
+ * fragmentos ("al menos un tipo de entrada", "configurar el cobro") para que el header las una
+ * en una sola frase. Esencial = al menos un tipo de entrada + el cobro configurado a nivel tenant.
+ */
+type OpenSaleReadiness = { canOpenSale: boolean; missing: string[] }
+
+async function computeOpenSaleReadiness(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string
+): Promise<OpenSaleReadiness> {
+  const [typeRows, tenantRows] = await Promise.all([
+    db
+      .select({ n: count() })
+      .from(ticketTypes)
+      .where(
+        and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, tenantId))
+      ),
+    db
+      .select({
+        mpConnected: tenants.mpConnected,
+        cucuruEnabled: tenants.cucuruEnabled,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .limit(1),
+  ])
+  const missing: string[] = []
+  if (Number(typeRows[0]?.n ?? 0) === 0) {
+    missing.push("al menos un tipo de entrada")
+  }
+  const paymentConfigured =
+    Boolean(tenantRows[0]?.mpConnected) || Boolean(tenantRows[0]?.cucuruEnabled)
+  if (!paymentConfigured) {
+    missing.push("configurar el cobro")
+  }
+  return { canOpenSale: missing.length === 0, missing }
 }
 
 async function sumBarStockForEventItem(
@@ -3170,6 +3217,113 @@ export const eventsRoute = new Hono()
 
     return c.json({ items })
   })
+  // Readiness para "Abrir venta" (spec §5). El header lee esto en borrador para atenuar el
+  // botón y mostrar en una línea qué falta. Ver `computeOpenSaleReadiness`.
+  .get("/:id/readiness", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    const readiness = await computeOpenSaleReadiness(db, eventId, tenantId)
+    return c.json(readiness)
+  })
+  // Transición de estado del evento (spec §5). El productor solo empuja dos manualmente:
+  // "Abrir venta" (draft→on_sale) y "Cerrar el evento" (→closed). Solo se avanza (nunca se
+  // retrocede). El grafo es lineal (draft→on_sale→live→closed): para llegar a `to` se recorre
+  // el camino sellando las marcas efectivas. Abrir venta exige readiness. Como el modo En vivo
+  // (4.3) aún no existe, "Cerrar el evento" desde on_sale atraviesa live sellando ambas marcas.
+  .post(
+    "/:id/transition",
+    zValidator(
+      "json",
+      z.object({
+        to: z.enum(EVENT_STATUSES as unknown as [EventStatus, ...EventStatus[]]),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const { to } = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const from = (ev.status ?? "draft") as EventStatus
+      if (from === to) {
+        return c.json({ event: sanitizeEvent(ev) })
+      }
+      if (eventStatusRank(to) <= eventStatusRank(from)) {
+        return c.json(
+          { error: "El estado del evento solo avanza, no retrocede." },
+          400
+        )
+      }
+
+      // Abrir venta exige lo esencial (tipo de entrada + cobro configurado).
+      if (from === "draft") {
+        const readiness = await computeOpenSaleReadiness(db, eventId, tenantId)
+        if (!readiness.canOpenSale) {
+          return c.json(
+            {
+              error: `Falta ${readiness.missing.join(" y ")}.`,
+              missing: readiness.missing,
+            },
+            422
+          )
+        }
+      }
+
+      const now = new Date()
+      const setPayload: {
+        status: EventStatus
+        isActive?: boolean
+        salesOpenedAt?: Date
+        wentLiveAt?: Date
+        closedAt?: Date
+      } = { status: to }
+
+      // Recorrer el grafo lineal desde `from` hasta `to`, sellando cada marca efectiva.
+      let cursor: EventStatus | undefined = from
+      while (cursor && cursor !== to) {
+        const step = outgoingTransition(cursor)
+        if (!step) break
+        const next = step.to
+        if (next === "on_sale" && !ev.salesOpenedAt) setPayload.salesOpenedAt = now
+        if (next === "live" && !ev.wentLiveAt) setPayload.wentLiveAt = now
+        if (next === "closed") setPayload.closedAt = now
+        cursor = next
+      }
+
+      // Sync legacy `isActive`: activo mientras vende/está en vivo, inactivo al cerrar.
+      setPayload.isActive = to !== "closed"
+
+      await db
+        .update(events)
+        .set(setPayload)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+
+      const [row] = await db
+        .select()
+        .from(events)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+        .limit(1)
+      return c.json({ event: sanitizeEvent(row) })
+    }
+  )
   .patch("/:id", zValidator("json", patchEventSchema), async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
