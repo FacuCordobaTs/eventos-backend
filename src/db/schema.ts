@@ -64,6 +64,38 @@ export const customers = mysqlTable('customers', {
 // 2. EVENTOS Y ENTRADAS (El control de acceso)
 // -----------------------------------------------------------------------------
 
+/**
+ * Liquidación congelada de la ceremonia de cierre (tarea 4.4). Todas las cifras monetarias van
+ * como string decimal (misma convención que el resto de la API). `insumos` guarda el conteo real
+ * vs. la estimación del sistema por insumo, para el reporte de merma. Ver `POST /events/:id/closing`.
+ */
+export type EventClosingReport = {
+  closedAt: string
+  income: { tickets: string; bar: string; gross: string }
+  expenses: {
+    operational: string
+    merchandisePurchased: string
+    merchandiseConsumed: string
+  }
+  leftoverValue: string
+  netReal: string
+  netProjected: string
+  cash: { expected: string; counted: string } | null
+  insumos: {
+    inventoryItemId: string
+    name: string
+    countingUnit: string
+    estimated: number
+    counted: number
+    purchased: number
+    unitCost: string
+    consumedCost: string
+    leftoverValue: string
+    mermaUnits: number
+    mermaValue: string
+  }[]
+}
+
 export const events = mysqlTable(
   'events',
   {
@@ -94,6 +126,14 @@ export const events = mysqlTable(
     wentLiveAt: timestamp('went_live_at'),
     /** Efectiva: instante real en que el evento se cerró (live → closed). */
     closedAt: timestamp('closed_at'),
+    /**
+     * Tarea 4.4 — Liquidación de la ceremonia de cierre (spec §5 "Cierre"/"Cerrado").
+     * Snapshot JSON congelado al cerrar: conteo real de insumos, estimación del sistema, costo
+     * de mercadería CONSUMIDA (no comprada), sobrante valuado, caja, ingresos, gastos, neto y
+     * merma. Se persiste porque el conteo manual NO se puede rederivar después. Null hasta que
+     * el evento pasa por la ceremonia. La vista "Cerrado" (4.5) lo lee como reporte.
+     */
+    closingReport: json('closing_report').$type<EventClosingReport | null>(),
   },
   (table) => ({
     tenantIdIdx: index('events_tenant_id_idx').on(table.tenantId),

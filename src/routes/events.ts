@@ -14,6 +14,7 @@ import {
   eventProducts,
   eventExpenses,
   events,
+  type EventClosingReport,
   eventStaff,
   inventoryItems,
   products,
@@ -346,6 +347,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     salesOpenedAt: row.salesOpenedAt ? row.salesOpenedAt.toISOString() : null,
     wentLiveAt: row.wentLiveAt ? row.wentLiveAt.toISOString() : null,
     closedAt: row.closedAt ? row.closedAt.toISOString() : null,
+    closingReport: row.closingReport ?? null,
     createdAt: row.createdAt,
     imageUrl: row.imageUrl ?? null,
     designType: row.designType ?? "GLASS",
@@ -435,6 +437,211 @@ async function computeOpenSaleReadiness(
     missing.push("configurar el cobro")
   }
   return { canOpenSale: missing.length === 0, missing }
+}
+
+/**
+ * Datos base para la ceremonia de cierre (tarea 4.4 / spec §5). Reúne, en una sola pasada, lo
+ * que el flujo por pasos necesita: ingresos (entradas + barra), gastos operativos vs. mercadería
+ * comprada, la caja esperada en efectivo, y por cada insumo su estimación de sobrante (lo que el
+ * sistema cree que queda, en unidad contable) más su costo unitario derivado de las compras.
+ * El conteo REAL lo aporta el productor en `POST /:id/closing`; acá no se persiste nada.
+ */
+type ClosingInsumo = {
+  inventoryItemId: string
+  name: string
+  countingUnit: string
+  estimated: number
+  purchased: number
+  unitCost: string
+  purchasedCost: string
+}
+type ClosingData = {
+  income: { tickets: string; bar: string; gross: string }
+  expenses: { operational: string; merchandisePurchased: string }
+  cash: { expected: string; hasCashSales: boolean }
+  insumos: ClosingInsumo[]
+}
+
+/** Stock en base units (ml/g/unidad) → unidad contable (botellas/latas/unidades). */
+function baseToCounting(
+  base: ReturnType<typeof dec>,
+  baseUnit: "ML" | "GRAMS" | "UNIT",
+  packageSize: string
+): number {
+  if (baseUnit === "ML" || baseUnit === "GRAMS") {
+    const per = dec(packageSize)
+    if (per.gt(0)) return base.div(per).toNumber()
+  }
+  return base.toNumber()
+}
+
+async function computeClosingData(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string
+): Promise<ClosingData> {
+  const whereTicketsNonCancelled = () =>
+    and(
+      eq(tickets.eventId, eventId),
+      eq(tickets.tenantId, tenantId),
+      ne(tickets.status, "CANCELLED")
+    )
+
+  const [
+    ticketRevenueRow,
+    barRevenueRow,
+    operationalRow,
+    merchandiseRow,
+    cashRow,
+    invRows,
+    purchaseRows,
+  ] = await Promise.all([
+    db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${ticketTypes.price} as decimal(14,2))), 0)`,
+      })
+      .from(tickets)
+      .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+      .where(
+        and(
+          whereTicketsNonCancelled(),
+          eq(ticketTypes.eventId, eventId),
+          eq(ticketTypes.tenantId, tenantId)
+        )
+      ),
+    db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      ),
+    db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${eventExpenses.amount} as decimal(14,2))), 0)`,
+      })
+      .from(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.eventId, eventId),
+          eq(eventExpenses.tenantId, tenantId),
+          isNull(eventExpenses.purchaseId)
+        )
+      ),
+    db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${eventExpenses.amount} as decimal(14,2))), 0)`,
+      })
+      .from(eventExpenses)
+      .where(
+        and(
+          eq(eventExpenses.eventId, eventId),
+          eq(eventExpenses.tenantId, tenantId),
+          sql`${eventExpenses.purchaseId} is not null`
+        )
+      ),
+    db
+      .select({
+        total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
+      })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED"),
+          eq(sales.paymentMethod, "CASH")
+        )
+      ),
+    db
+      .select({
+        id: inventoryItems.id,
+        name: inventoryItems.name,
+        countingUnit: inventoryItems.countingUnit,
+        baseUnit: inventoryItems.baseUnit,
+        packageSize: inventoryItems.packageSize,
+        stockAllocated: eventInventory.stockAllocated,
+      })
+      .from(eventInventory)
+      .innerJoin(
+        inventoryItems,
+        eq(eventInventory.inventoryItemId, inventoryItems.id)
+      )
+      .where(
+        and(
+          eq(eventInventory.eventId, eventId),
+          eq(eventInventory.tenantId, tenantId),
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
+        )
+      )
+      .orderBy(asc(inventoryItems.name)),
+    db
+      .select({
+        inventoryItemId: purchases.inventoryItemId,
+        qty: sql<string>`coalesce(sum(cast(${purchases.quantity} as decimal(14,2))), 0)`,
+        cost: sql<string>`coalesce(sum(cast(${purchases.totalCost} as decimal(14,2))), 0)`,
+      })
+      .from(purchases)
+      .where(
+        and(eq(purchases.eventId, eventId), eq(purchases.tenantId, tenantId))
+      )
+      .groupBy(purchases.inventoryItemId),
+  ])
+
+  const ticketDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
+  const barDec = decFromDb(barRevenueRow[0]?.total ?? "0")
+  const grossDec = ticketDec.plus(barDec)
+  const cashDec = decFromDb(cashRow[0]?.total ?? "0")
+
+  const purchaseByItem = new Map(
+    purchaseRows.map((r) => [r.inventoryItemId, { qty: r.qty, cost: r.cost }])
+  )
+
+  const insumos: ClosingInsumo[] = invRows.map((r) => {
+    const purchase = purchaseByItem.get(r.id)
+    const purchasedQtyDec = dec(purchase?.qty ?? "0")
+    const purchasedCostDec = dec(purchase?.cost ?? "0")
+    const unitCostDec = purchasedQtyDec.gt(0)
+      ? purchasedCostDec.div(purchasedQtyDec)
+      : dec(0)
+    return {
+      inventoryItemId: r.id,
+      name: r.name,
+      countingUnit: r.countingUnit,
+      estimated: baseToCounting(
+        decFromDb(r.stockAllocated),
+        r.baseUnit,
+        String(r.packageSize)
+      ),
+      purchased: purchasedQtyDec.toNumber(),
+      unitCost: decToDb(unitCostDec),
+      purchasedCost: decToDb(purchasedCostDec),
+    }
+  })
+
+  return {
+    income: {
+      tickets: decToDb(ticketDec),
+      bar: decToDb(barDec),
+      gross: decToDb(grossDec),
+    },
+    expenses: {
+      operational: decToDb(decFromDb(operationalRow[0]?.total ?? "0")),
+      merchandisePurchased: decToDb(decFromDb(merchandiseRow[0]?.total ?? "0")),
+    },
+    cash: {
+      expected: decToDb(cashDec),
+      hasCashSales: cashDec.gt(0),
+    },
+    insumos,
+  }
 }
 
 async function sumBarStockForEventItem(
@@ -3235,10 +3442,11 @@ export const eventsRoute = new Hono()
     return c.json(readiness)
   })
   // Transición de estado del evento (spec §5). El productor solo empuja dos manualmente:
-  // "Abrir venta" (draft→on_sale) y "Cerrar el evento" (→closed). Solo se avanza (nunca se
+  // "Abrir venta" (draft→on_sale) y "Cerrar el evento" (live→closed). "Arrancar ahora"
+  // (on_sale→live) es override de lo automático a la hora de puertas. Solo se avanza (nunca se
   // retrocede). El grafo es lineal (draft→on_sale→live→closed): para llegar a `to` se recorre
-  // el camino sellando las marcas efectivas. Abrir venta exige readiness. Como el modo En vivo
-  // (4.3) aún no existe, "Cerrar el evento" desde on_sale atraviesa live sellando ambas marcas.
+  // el camino sellando las marcas efectivas. Abrir venta exige readiness. Si algún `to` saltea
+  // estados (p. ej. cerrar directo desde on_sale) se sellan todas las marcas intermedias.
   .post(
     "/:id/transition",
     zValidator(
@@ -3322,6 +3530,171 @@ export const eventsRoute = new Hono()
         .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
         .limit(1)
       return c.json({ event: sanitizeEvent(row) })
+    }
+  )
+  // Ceremonia de cierre (tarea 4.4 / spec §5). GET prepara los datos del flujo por pasos:
+  // insumos con su estimación de sobrante + costo unitario, ingresos, gastos y caja esperada.
+  // Si el evento ya está cerrado, devuelve además el `report` congelado (para 4.5).
+  .get("/:id/closing", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    const data = await computeClosingData(db, eventId, tenantId)
+    return c.json({ ...data, report: ev.closingReport ?? null })
+  })
+  // POST cierra el evento con la liquidación de la ceremonia: recibe el conteo REAL de insumos y
+  // la caja contada, recalcula todo del lado servidor (autoridad), congela el reporte en
+  // `events.closing_report` y transiciona el evento a `closed`. El costo se cuenta sobre la
+  // mercadería CONSUMIDA (lo comprado menos lo que sobró, valuado al costo unitario): el sobrante
+  // no es pérdida, viaja como stock valuado. La merma es la diferencia estimado − contado.
+  .post(
+    "/:id/closing",
+    zValidator(
+      "json",
+      z.object({
+        counts: z.array(
+          z.object({
+            inventoryItemId: z.string(),
+            counted: z.number().min(0),
+          })
+        ),
+        cashCounted: z.union([z.number(), z.string()]).nullable().optional(),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const { counts, cashCounted } = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      const from = (ev.status ?? "draft") as EventStatus
+      if (from === "closed") {
+        return c.json({ error: "El evento ya está cerrado." }, 409)
+      }
+
+      const data = await computeClosingData(db, eventId, tenantId)
+      const countedById = new Map(
+        counts.map((r) => [r.inventoryItemId, Math.max(0, r.counted)])
+      )
+
+      let consumedDec = dec(0)
+      let leftoverDec = dec(0)
+      let mermaValueDec = dec(0)
+      const reportInsumos: EventClosingReport["insumos"] = data.insumos.map(
+        (i) => {
+          const counted = countedById.get(i.inventoryItemId) ?? i.estimated
+          const unitCostDec = dec(i.unitCost)
+          // Sobrante valuado: acotado a lo comprado (no se valúa más de lo que costó plata).
+          const leftoverUnits = Math.min(counted, i.purchased)
+          const itemLeftoverDec = dec(leftoverUnits).times(unitCostDec)
+          const itemConsumedDec = dec(i.purchasedCost).minus(itemLeftoverDec)
+          const mermaUnits = i.estimated - counted
+          const itemMermaDec =
+            mermaUnits > 0 ? dec(mermaUnits).times(unitCostDec) : dec(0)
+          consumedDec = consumedDec.plus(itemConsumedDec)
+          leftoverDec = leftoverDec.plus(itemLeftoverDec)
+          mermaValueDec = mermaValueDec.plus(itemMermaDec)
+          return {
+            inventoryItemId: i.inventoryItemId,
+            name: i.name,
+            countingUnit: i.countingUnit,
+            estimated: i.estimated,
+            counted,
+            purchased: i.purchased,
+            unitCost: i.unitCost,
+            consumedCost: decToDb(itemConsumedDec),
+            leftoverValue: decToDb(itemLeftoverDec),
+            mermaUnits,
+            mermaValue: decToDb(itemMermaDec),
+          }
+        }
+      )
+
+      const grossDec = decFromDb(data.income.gross)
+      const operationalDec = decFromDb(data.expenses.operational)
+      const merchandisePurchasedDec = decFromDb(
+        data.expenses.merchandisePurchased
+      )
+      // Neto real: ingresos − gastos operativos − mercadería CONSUMIDA (el sobrante no resta).
+      const netRealDec = grossDec.minus(operationalDec).minus(consumedDec)
+      // Neto proyectado: como si toda la mercadería comprada fuera costo (lo que muestra /summary).
+      const netProjectedDec = grossDec
+        .minus(operationalDec)
+        .minus(merchandisePurchasedDec)
+
+      const now = new Date()
+      const report: EventClosingReport = {
+        closedAt: now.toISOString(),
+        income: data.income,
+        expenses: {
+          operational: data.expenses.operational,
+          merchandisePurchased: data.expenses.merchandisePurchased,
+          merchandiseConsumed: decToDb(consumedDec),
+        },
+        leftoverValue: decToDb(leftoverDec),
+        netReal: decToDb(netRealDec),
+        netProjected: decToDb(netProjectedDec),
+        cash:
+          data.cash.hasCashSales && cashCounted != null
+            ? {
+                expected: data.cash.expected,
+                counted: decToDb(dec(cashCounted)),
+              }
+            : null,
+        insumos: reportInsumos,
+      }
+
+      // Cierre = transición a `closed` sellando las marcas efectivas intermedias (grafo lineal).
+      const setPayload: {
+        status: EventStatus
+        isActive: boolean
+        salesOpenedAt?: Date
+        wentLiveAt?: Date
+        closedAt: Date
+        closingReport: EventClosingReport
+      } = {
+        status: "closed",
+        isActive: false,
+        closedAt: now,
+        closingReport: report,
+      }
+      let cursor: EventStatus | undefined = from
+      while (cursor && cursor !== "closed") {
+        const step = outgoingTransition(cursor)
+        if (!step) break
+        if (step.to === "on_sale" && !ev.salesOpenedAt)
+          setPayload.salesOpenedAt = now
+        if (step.to === "live" && !ev.wentLiveAt) setPayload.wentLiveAt = now
+        cursor = step.to
+      }
+
+      await db
+        .update(events)
+        .set(setPayload)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+
+      const [row] = await db
+        .select()
+        .from(events)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+        .limit(1)
+      return c.json({ event: sanitizeEvent(row), report })
     }
   )
   .patch("/:id", zValidator("json", patchEventSchema), async (c) => {
