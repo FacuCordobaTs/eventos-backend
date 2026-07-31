@@ -275,6 +275,40 @@ export const publicRoute = new Hono()
       productCategories: productCategoriesOut,
     })
   })
+  // Reporte de cierre público y de solo lectura (tarea 4.5 / spec §5 "Cerrado": compartible por
+  // link). Solo responde para eventos ya cerrados con su liquidación congelada; los eventos
+  // cerrados tienen `isActive = false`, por eso NO reusamos el filtro de `/events/:id`.
+  .get("/events/:id/report", async (c) => {
+    const slugOrId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const [ev] = await db
+      .select()
+      .from(events)
+      .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
+      .limit(1)
+
+    if (!ev || ev.status !== "closed" || !ev.closingReport) {
+      return c.json({ error: "Reporte no disponible" }, 404)
+    }
+
+    const [productoraRow] = await db
+      .select({ name: tenants.name })
+      .from(tenants)
+      .where(eq(tenants.id, ev.tenantId))
+      .limit(1)
+
+    return c.json({
+      productora: { name: productoraRow?.name ?? "Productora" },
+      event: {
+        id: ev.id,
+        name: ev.name,
+        date: ev.date,
+        location: ev.location,
+      },
+      report: ev.closingReport,
+    })
+  })
   .post("/checkout", zValidator("json", guestCheckoutSchema), async (c) => {
     const body = c.req.valid("json")
     const db = drizzle(pool)
