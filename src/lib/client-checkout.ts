@@ -27,6 +27,10 @@ export type ClientCheckoutContact = {
   name: string
   email: string
   phone: string
+  /** Tarea 1.1 — DNI del comprador (identidad dentro del evento). Opcional: hoy no se pide en el checkout; lo manda F2. */
+  dni?: string
+  /** Fecha de nacimiento conocida (ej. parseada del código de barras en puerta). Opcional por ahora — el +18 es en puerta. */
+  birthDate?: Date | null
 }
 
 export type ClientCheckoutParams = {
@@ -86,6 +90,26 @@ async function findOrCreateCustomer(
   const name = contact.name.trim()
   const email = contact.email.toLowerCase().trim()
   const phone = contact.phone.trim()
+  // Tarea 1.1 — El DNI es la identidad del cliente dentro del evento: si viene, manda por
+  // encima de email/teléfono (una persona = un cliente, `customers.dni` único global).
+  const dni = contact.dni?.trim() || null
+  const birthDate = contact.birthDate ?? null
+
+  if (dni !== null) {
+    const [byDni] = await tx
+      .select()
+      .from(customers)
+      .where(eq(customers.dni, dni))
+      .limit(1)
+
+    if (byDni) {
+      await tx
+        .update(customers)
+        .set({ name, email, phone: phone || byDni.phone })
+        .where(eq(customers.id, byDni.id))
+      return byDni.id
+    }
+  }
 
   const [byEmail] = await tx
     .select()
@@ -94,9 +118,19 @@ async function findOrCreateCustomer(
     .limit(1)
 
   if (byEmail) {
+    // Si acá llegamos, ningún cliente tiene ese DNI (el lookup por dni falló arriba), así que
+    // solo se asigna a un cliente cuyo dni esté libre — si el cliente ya tiene OTRO dni, el
+    // email estaría en disputa entre dos personas y el unique key de `customers.dni` no se
+    // toca (se prefiere la identidad ya registrada).
+    const canClaimDni = dni === null || byEmail.dni == null || byEmail.dni === dni
     await tx
       .update(customers)
-      .set({ name, phone: phone || byEmail.phone })
+      .set({
+        name,
+        phone: phone || byEmail.phone,
+        ...(canClaimDni ? { dni } : {}),
+        ...(birthDate !== null ? { birthDate } : {}),
+      })
       .where(eq(customers.id, byEmail.id))
     return byEmail.id
   }
@@ -108,9 +142,15 @@ async function findOrCreateCustomer(
       .where(eq(customers.phone, phone))
       .limit(1)
     if (byPhone) {
+      const canClaimDni = dni === null || byPhone.dni == null || byPhone.dni === dni
       await tx
         .update(customers)
-        .set({ name, email })
+        .set({
+          name,
+          email,
+          ...(canClaimDni ? { dni } : {}),
+          ...(birthDate !== null ? { birthDate } : {}),
+        })
         .where(eq(customers.id, byPhone.id))
       return byPhone.id
     }
@@ -122,6 +162,8 @@ async function findOrCreateCustomer(
     name,
     email,
     phone: phone || null,
+    ...(dni !== null ? { dni } : {}),
+    ...(birthDate !== null ? { birthDate } : {}),
     isActive: true,
     createdAt: new Date(),
   })
@@ -284,6 +326,7 @@ export async function executeClientCheckout(
         name: params.contact.name.trim(),
         email: params.contact.email.toLowerCase().trim(),
         phone: params.contact.phone.trim(),
+        ...(params.contact.dni?.trim() ? { dni: params.contact.dni.trim() } : {}),
       },
     }
 
@@ -358,6 +401,7 @@ export async function executeClientCheckout(
         ticketTypeId: line.ticketTypeId,
         buyerName: params.contact.name.trim(),
         buyerEmail: params.contact.email.toLowerCase().trim(),
+        buyerDni: params.contact.dni?.trim() || null,
         customerId: prep.customerId,
         saleId,
       })
@@ -443,6 +487,7 @@ export async function fulfillPendingGuestCheckout(
     name: snap.contact.name,
     email: snap.contact.email,
     phone: snap.contact.phone,
+    ...(snap.contact.dni != null && snap.contact.dni !== "" ? { dni: snap.contact.dni } : {}),
   }
 
   const drinkPrices = new Map<string, PricedDrink>()
@@ -506,6 +551,7 @@ export async function fulfillPendingGuestCheckout(
         ticketTypeId: line.ticketTypeId,
         buyerName: contact.name.trim(),
         buyerEmail: contact.email.toLowerCase().trim(),
+        buyerDni: contact.dni?.trim() || null,
         customerId,
         saleId,
       })

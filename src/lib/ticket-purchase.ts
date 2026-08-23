@@ -51,6 +51,11 @@ export type PurchaseParams = {
   ticketTypeId: string
   buyerName: string | null
   buyerEmail: string | null
+  /**
+   * Tarea 1.1 — Snapshot del DNI del comprador para el lookup por DNI en puerta
+   * (índice `tickets_event_buyer_dni_idx`). Opcional: las ventas sin DNI lo dejan null.
+   */
+  buyerDni?: string | null
   /** App B2B2C: vincula la entrada al cliente. */
   customerId?: string
   /** Venta web/POS que agrupa entradas de esta compra. */
@@ -123,6 +128,7 @@ export async function executeTicketPurchase(
     status: "PENDING",
     buyerName: params.buyerName,
     buyerEmail: params.buyerEmail,
+    ...(params.buyerDni !== undefined ? { buyerDni: params.buyerDni } : {}),
     ...(params.customerId !== undefined ? { customerId: params.customerId } : {}),
     ...(params.saleId !== undefined ? { saleId: params.saleId } : {}),
     createdAt: new Date(),

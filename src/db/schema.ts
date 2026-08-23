@@ -56,6 +56,14 @@ export const customers = mysqlTable('customers', {
   name: varchar('name', { length: 255 }).notNull(),
   email: varchar('email', { length: 255 }).notNull().unique(),
   phone: varchar('phone', { length: 255 }),
+  /**
+   * Tarea 1.1 — El DNI es la identidad del cliente dentro del evento (visión §2.0).
+   * Único GLOBAL (un cliente es una persona) pero nullable: los clientes pre-existentes
+   * no tienen DNI. Multiple NULLs son válidos en un unique key de MySQL.
+   */
+  dni: varchar('dni', { length: 20 }).unique(),
+  /** Fecha de nacimiento para la validación +18 en puerta (tarea 1.1). Null hasta que se conozca. */
+  birthDate: timestamp('birth_date'),
   isActive: boolean('is_active').default(true),
   createdAt: timestamp('created_at').defaultNow(),
 });
@@ -197,6 +205,11 @@ export const tickets = mysqlTable(
     status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).default('PENDING'),
     buyerName: varchar('buyer_name', { length: 255 }),
     buyerEmail: varchar('buyer_email', { length: 255 }),
+    /**
+     * Tarea 1.1 — Snapshot del DNI del comprador al emitir la entrada, para el lookup por DNI
+     * en puerta SIN join a `customers` (índice `tickets_event_buyer_dni_idx`).
+     */
+    buyerDni: varchar('buyer_dni', { length: 20 }),
     customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
     scannedAt: timestamp('scanned_at'),
     scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
@@ -209,6 +222,7 @@ export const tickets = mysqlTable(
     eventTenantIdx: index('tickets_event_tenant_idx').on(table.eventId, table.tenantId),
     customerIdx: index('tickets_customer_id_idx').on(table.customerId),
     saleIdIdx: index('tickets_sale_id_idx').on(table.saleId),
+    buyerDniIdx: index('tickets_event_buyer_dni_idx').on(table.eventId, table.buyerDni),
   })
 );
 
@@ -576,7 +590,7 @@ export const productRecipes = mysqlTable('product_recipes', {
 export type GuestCheckoutSnapshotJson = {
   ticketLines: { ticketTypeId: string; quantity: number }[]
   drinkLines: { productId: string; quantity: number }[]
-  contact: { name: string; email: string; phone: string }
+  contact: { name: string; email: string; phone: string; dni?: string }
 }
 
 export const sales = mysqlTable(
