@@ -17,14 +17,14 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { randomBytes } from "crypto"
 import { setCookie } from "hono/cookie"
-import { and, desc, eq, gt, isNull, type SQL } from "drizzle-orm"
+import { and, desc, eq, gt, isNull, ne, type SQL } from "drizzle-orm"
 import { createAccessToken } from "../lib/jwt"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
 
-const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.totem.uno").replace(/\/$/, "")
+const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.crow.ar").replace(/\/$/, "")
 
 /** Token URL-safe (hex) para links de invitación, magic links y sesiones de puesto. */
 function genToken(): string {
@@ -209,7 +209,7 @@ export const staffRoute = new Hono()
           eq(eventStaff.staffId, ctx.staff.id),
           eq(eventStaff.tenantId, tenantId),
           eq(events.tenantId, tenantId),
-          eq(events.isActive, true)
+          ne(events.status, "closed")
         )
       )
       .orderBy(desc(events.date))

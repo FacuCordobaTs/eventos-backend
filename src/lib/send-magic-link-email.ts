@@ -16,7 +16,7 @@ export async function sendMagicLinkEmail(input: {
   }
   try {
     const resend = new Resend(apiKey)
-    const from = process.env.RESEND_FROM ?? "Crow <no-reply@totem.uno>"
+    const from = process.env.RESEND_FROM ?? "Crow <no-reply@crow.ar>"
     await resend.emails.send({
       from,
       to: input.to,

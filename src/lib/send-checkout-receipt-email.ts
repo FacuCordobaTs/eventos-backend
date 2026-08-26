@@ -89,7 +89,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     )
     .orderBy(asc(digitalConsumptions.createdAt))
 
-  const baseUrl = (process.env.FRONTEND_URL ?? "https://totem.uno").replace(
+  const baseUrl = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(
     /\/$/,
     ""
   )
@@ -146,7 +146,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
       : undefined
 
   const { error } = await resend.emails.send({
-    from: "Totem <entradas@totem.uno>",
+    from: "Crow <entradas@crow.ar>",
     to: contact.email.trim(),
     subject,
     react: React.createElement(TicketEmail, {
@@ -234,7 +234,7 @@ export async function sendManualTicketQrEmail(input: {
     color: { dark: "#000000ff", light: "#ffffffff" },
   })
 
-  const baseUrl = (process.env.FRONTEND_URL ?? "https://totem.uno").replace(
+  const baseUrl = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(
     /\/$/,
     ""
   )
@@ -245,7 +245,7 @@ export async function sendManualTicketQrEmail(input: {
   const subject = `Tu entrada para ${row.eventName}`
 
   const { error } = await resend.emails.send({
-    from: "Totem <entradas@totem.uno>",
+    from: "Crow <entradas@crow.ar>",
     to: email,
     subject,
     react: React.createElement(TicketEmail, {

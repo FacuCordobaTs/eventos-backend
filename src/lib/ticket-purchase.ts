@@ -1,7 +1,7 @@
 import { and, count, eq, ne } from "drizzle-orm"
 import type { MySql2Transaction } from "drizzle-orm/mysql2"
 import * as schema from "../db/schema"
-import { events, ticketTypes, tickets } from "../db/schema"
+import { events, promoters, ticketTypes, tickets } from "../db/schema"
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
 
@@ -15,6 +15,9 @@ export type PurchaseErrorCode =
   | "CONSUMPTIONS_NOT_YET_AVAILABLE"
   | "CHECKOUT_TOTAL_MISMATCH"
   | "EMPTY_CART"
+  | "BALANCE_REQUIRES_DNI"
+  | "INSUFFICIENT_BALANCE"
+  | "PROMOTER_NOT_FOUND"
 
 export class PurchaseError extends Error {
   readonly code: PurchaseErrorCode
@@ -62,6 +65,8 @@ export type PurchaseParams = {
   saleId?: string
   /** Staff flows: must match event tenant. Omit for public (tenant taken from event). */
   enforceTenantId?: string
+  /** Tarea 9.1 — Promotor que vende la entrada (venta manual/caja). Debe pertenecer al tenant. */
+  promoterId?: string
 }
 
 export type PurchaseRow = typeof tickets.$inferSelect
@@ -82,7 +87,8 @@ export async function executeTicketPurchase(
   if (!ev) {
     throw new PurchaseError("EVENT_NOT_FOUND")
   }
-  if (ev.isActive === false) {
+  // Tarea 11.3 — `isActive` retirado: el evento no disponible es el cerrado.
+  if (ev.status === "closed") {
     throw new PurchaseError("EVENT_INACTIVE")
   }
 
@@ -116,6 +122,24 @@ export async function executeTicketPurchase(
     throw new PurchaseError("OUT_OF_STOCK")
   }
 
+  // Tarea 9.1 — El promotor debe pertenecer al tenant de la venta (aislamiento multi-tenant);
+  // si no existe, la venta se rechaza (un id stale de la UI no atribuye a otro tenant).
+  if (params.promoterId !== undefined) {
+    const [promo] = await tx
+      .select({ id: promoters.id })
+      .from(promoters)
+      .where(
+        and(
+          eq(promoters.id, params.promoterId),
+          eq(promoters.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!promo) {
+      throw new PurchaseError("PROMOTER_NOT_FOUND")
+    }
+  }
+
   const ticketId = uuidv4()
   const qrHash = randomUUID()
 
@@ -131,6 +155,7 @@ export async function executeTicketPurchase(
     ...(params.buyerDni !== undefined ? { buyerDni: params.buyerDni } : {}),
     ...(params.customerId !== undefined ? { customerId: params.customerId } : {}),
     ...(params.saleId !== undefined ? { saleId: params.saleId } : {}),
+    ...(params.promoterId !== undefined ? { promoterId: params.promoterId } : {}),
     createdAt: new Date(),
   })
 
@@ -178,6 +203,12 @@ export function purchaseErrorStatus(
       return { status: 400, body: { error: "El total no coincide con el servidor" } }
     case "EMPTY_CART":
       return { status: 400, body: { error: "El carrito está vacío" } }
+    case "BALANCE_REQUIRES_DNI":
+      return { status: 400, body: { error: "Pagar con saldo requiere el DNI del comprador" } }
+    case "INSUFFICIENT_BALANCE":
+      return { status: 400, body: { error: "Saldo insuficiente para esta compra" } }
+    case "PROMOTER_NOT_FOUND":
+      return { status: 400, body: { error: "Promotor no válido para esta venta" } }
     default:
       return { status: 500, body: { error: "Error al procesar la compra" } }
   }

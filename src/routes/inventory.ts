@@ -18,6 +18,7 @@ import {
   productCategories,
   productRecipes,
   products,
+  promoters,
   saleItems,
   sales,
 } from "../db/schema"
@@ -29,6 +30,8 @@ import {
   baseUnitsPerServingFromYield,
   yieldPerPackageFromQuantityUsed,
 } from "../lib/inventory-deduction"
+import { findOrCreateCustomer } from "../lib/client-checkout"
+import { debitBalance, getBalance } from "../lib/balance"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
   deleteFileByKey,
@@ -265,7 +268,8 @@ const createSaleSchema = z.object({
     (v) => (v === null || v === "" ? undefined : v),
     z.string().min(1).max(36).optional()
   ),
-  paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER"]),
+  /** Tarea 6.1 — SALDO: la caja cobra contra el saldo del DNI (requiere `customerDni`). */
+  paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER", "SALDO"]),
   items: z
     .array(
       z.object({
@@ -274,6 +278,22 @@ const createSaleSchema = z.object({
       })
     )
     .min(1),
+  /** Tarea 5.1 — Venta de caja registrada a nombre del cliente: DNI opcional (identidad del
+   * evento, visión §2.0). Si viene, el backend resuelve/persiste el customer y setea `sales.customerId`. */
+  customerDni: z.preprocess(
+    (v) => (v === null || v === "" ? undefined : v),
+    z.string().min(6).max(20).optional()
+  ),
+  /** Tarea 5.1 — Nombre del cliente de caja (opcional; se usa al crear un customer nuevo). */
+  customerName: z.preprocess(
+    (v) => (v === null || v === "" ? undefined : v),
+    z.string().max(255).optional()
+  ),
+  /** Tarea 9.1 — Promotor que originó la venta (caja/POS); atribución en sales.promoter_id. */
+  promoterId: z.preprocess(
+    (v) => (v === null || v === "" ? undefined : v),
+    z.string().max(36).optional()
+  ),
 })
 
 const productListed = or(eq(products.isActive, true), isNull(products.isActive))
@@ -1695,14 +1715,65 @@ export const inventoryRoute = new Hono()
           }
         }
 
+        // Tarea 5.1 — Venta de caja con DNI: resolver/persistir el customer (upsert por DNI,
+        // mismo criterio que el checkout web). Sin DNI la venta queda anónima como hoy.
+        let customerId: string | null = null
+        if (body.customerDni != null) {
+          customerId = await findOrCreateCustomer(tx, {
+            name: body.customerName?.trim() || "Cliente de caja",
+            email: "",
+            phone: "",
+            dni: body.customerDni,
+          })
+        }
+
+        // Tarea 9.1 — El promotor debe pertenecer al tenant (aislamiento multi-tenant); si no,
+        // la venta se rechaza igual que un producto o una barra ajenos.
+        let promoterId: string | null = null
+        if (body.promoterId != null) {
+          const [promo] = await tx
+            .select({ id: promoters.id })
+            .from(promoters)
+            .where(
+              and(
+                eq(promoters.id, body.promoterId),
+                eq(promoters.tenantId, tenantId)
+              )
+            )
+            .limit(1)
+          if (!promo) {
+            return { kind: "bad_promoter" as const }
+          }
+          promoterId = promo.id
+        }
+
+        // Tarea 6.1 — Cobro con saldo (visión §2.7: "da el DNI y le dan el ticket"): el saldo
+        // está atado al DNI, así que el cobro con saldo lo exige. Se verifica antes de crear la
+        // sale; el débito va después de insertarla (el movimiento CONSUMO la referencia).
+        let balanceAfter: string | null = null
+        if (body.paymentMethod === "SALDO") {
+          if (body.customerDni == null || customerId == null) {
+            return { kind: "saldo_requires_dni" as const }
+          }
+          const balance = dec(await getBalance(tx, customerId, body.eventId))
+          if (balance.lt(total)) {
+            return { kind: "insufficient_balance" as const }
+          }
+        }
+
         const saleId = uuidv4()
+        // Tarea 5.2 — El token del recibo se devuelve en la respuesta: el ticket impreso en caja
+        // lleva el comprobante y los QRs de las consumiciones para canjear en barra.
+        const receiptToken = randomUUID()
         await tx.insert(sales).values({
           id: saleId,
           eventId: body.eventId,
           tenantId,
           barId: saleBarId,
           staffId: ctx.staff.id,
-          receiptToken: randomUUID(),
+          customerId,
+          promoterId,
+          receiptToken,
           totalAmount: decToDb(total),
           paymentMethod: body.paymentMethod,
           status: "COMPLETED",
@@ -1720,20 +1791,44 @@ export const inventoryRoute = new Hono()
           })
         }
 
+        // Tarea 5.2 — Cada item de la venta genera UNA consumición canjeable (QR). Se acumulan
+        // los hashes en la respuesta para que la caja imprima el ticket con sus QRs y la barra
+        // los canjee con el `redeem` existente (escáner lee el hash crudo).
+        const printedConsumptions: { productName: string; qrHash: string }[] = []
         for (const line of body.items) {
+          const p = prodRows.find((x) => x.id === line.productId)!
           for (let u = 0; u < line.quantity; u++) {
+            const qrHash = randomUUID()
             await tx.insert(digitalConsumptions).values({
               id: uuidv4(),
-              customerId: null,
+              // Tarea 5.1 — La consumición queda a nombre del cliente cuando la venta lo tiene
+              // (visión §2.7: "todo queda registrado a nombre de esa persona").
+              customerId,
               eventId: body.eventId,
               tenantId,
               productId: line.productId,
               saleId,
-              qrHash: randomUUID(),
+              qrHash,
               status: "PENDING",
               createdAt: new Date(),
             })
+            printedConsumptions.push({ productName: p.name, qrHash })
           }
+        }
+
+        // Tarea 6.1 — El saldo se debita con la sale ya insertada (el movimiento CONSUMO la
+        // referencia). El chequeo de fondos se hizo arriba; si algo cambió en el medio,
+        // `debitBalance` lanza BALANCE_INSUFFICIENT y la transacción entera se aborta.
+        if (body.paymentMethod === "SALDO" && customerId != null) {
+          balanceAfter = await debitBalance(tx, {
+            customerId,
+            eventId: body.eventId,
+            tenantId,
+            amount: decToDb(total),
+            staffId: ctx.staff.id,
+            saleId,
+            note: "Venta de caja con saldo",
+          })
         }
 
         if (needs.size > 0) {
@@ -1786,11 +1881,15 @@ export const inventoryRoute = new Hono()
         return {
           kind: "ok" as const,
           saleId,
+          receiptToken,
           totalAmount: decToDb(total),
           eventId: body.eventId,
           barId: saleBarId,
+          customerId,
+          consumptions: printedConsumptions,
           inventoryItemIds:
             needs.size > 0 ? [...needs.keys()] : ([] as string[]),
+          ...(balanceAfter != null ? { balance: balanceAfter } : {}),
         }
       })
 
@@ -1799,6 +1898,9 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_bar") {
         return c.json({ error: "Barra no válida para este evento" }, 400)
+      }
+      if (result.kind === "bad_promoter") {
+        return c.json({ error: "Promotor no válido para esta venta" }, 400)
       }
       if (result.kind === "bad_product") {
         return c.json({ error: "Uno o más productos no son válidos." }, 400)
@@ -1811,6 +1913,15 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_inventory") {
         return c.json({ error: "Error al verificar inventario." }, 400)
+      }
+      if (result.kind === "saldo_requires_dni") {
+        return c.json(
+          { error: "Cobrar con saldo requiere el DNI del cliente" },
+          400
+        )
+      }
+      if (result.kind === "insufficient_balance") {
+        return c.json({ error: "Saldo insuficiente para esta venta" }, 400)
       }
       if (result.kind === "insufficient_direct_stock") {
         return c.json(
@@ -1840,7 +1951,11 @@ export const inventoryRoute = new Hono()
         {
           message: "Venta registrada",
           saleId: result.saleId,
+          // Tarea 5.2 — Token del recibo y QRs canjeables de la venta para el ticket impreso.
+          receiptToken: result.receiptToken,
           totalAmount: result.totalAmount,
+          customerId: result.customerId,
+          consumptions: result.consumptions,
         },
         201
       )

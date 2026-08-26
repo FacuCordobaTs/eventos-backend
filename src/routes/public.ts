@@ -5,9 +5,11 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   courtesies,
+  customers,
   digitalConsumptions,
   eventProducts,
   events,
+  pickupOrders,
   productCategories,
   products,
   sales,
@@ -15,10 +17,14 @@ import {
   ticketTypes,
   tickets,
 } from "../db/schema"
-import { SQL, and, asc, count, eq, gte, inArray, ne, or } from "drizzle-orm"
-import { executeClientCheckout } from "../lib/client-checkout"
+import type { PickupItemsJson } from "../db/schema"
+import { SQL, and, asc, count, desc, eq, gte, inArray, ne, or } from "drizzle-orm"
+import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
+import { getBalance } from "../lib/balance"
+import { pickupItemsWithNames } from "../lib/pickup-items"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
+import { dec, decToDb } from "../lib/decimal-money"
 import { obtenerTokenValido } from "../lib/mercadopago-utils"
 import { qrCodeDataUrl } from "../lib/qr"
 import { v4 as uuidv4 } from "uuid"
@@ -42,14 +48,84 @@ async function countIssued(
   return Number(row?.n ?? 0)
 }
 
+/**
+ * Tarea 7.1 — Los QRs de los tragos de regalo de una cortesía (consumiciones emitidas por el
+ * canje, ancladas a su sale de $0). Usado por el GET (volver a ver tras canjear) y por el
+ * redeem (resultado del canje). Una fila por unidad canjeable, como en el comprobante.
+ */
+async function courtesyDrinkQrs(
+  db: ReturnType<typeof drizzle>,
+  saleId: string,
+  tenantId: string
+): Promise<
+  { id: string; qrHash: string; qrDataUrl: string; productName: string }[]
+> {
+  const rows = await db
+    .select({
+      id: digitalConsumptions.id,
+      qrHash: digitalConsumptions.qrHash,
+      productName: products.name,
+    })
+    .from(digitalConsumptions)
+    .innerJoin(products, eq(digitalConsumptions.productId, products.id))
+    .where(
+      and(
+        eq(digitalConsumptions.saleId, saleId),
+        eq(digitalConsumptions.tenantId, tenantId)
+      )
+    )
+    .orderBy(products.name, digitalConsumptions.createdAt)
+  return Promise.all(
+    rows.map(async (r) => ({ ...r, qrDataUrl: await qrCodeDataUrl(r.qrHash) }))
+  )
+}
+
+/** Pedido de retiro (tarea 4.1): qué consumiciones PENDING del comprobante se llevan ahora. */
+const pickupCreateSchema = z.object({
+  receiptToken: z.string().min(1),
+  consumptionIds: z.array(z.string().min(1)).min(1),
+})
+
+/**
+ * Tarea 6.1 — Carga de saldo desde el celular (visión §2.7). La sale queda PENDING hasta que el
+ * webhook acredita el pago (MP/transferencia); recién ahí se acredita `customer_balances`
+ * (mismo camino de dedupe que el checkout, despachado por `snapshot.kind === "deposit"`).
+ */
+const balanceDepositSchema = z.object({
+  amount: z.string().min(1).regex(/^\d+(\.\d{1,2})?$/),
+  paymentMethod: z.enum(["MERCADOPAGO", "TRANSFER"]),
+  /**
+   * Tarea 6.2 — Cuando viene `receiptToken`, el contacto se reusa del snapshot de esa
+   * compra (el cliente ya está identificado): cargar saldo desde el comprobante no vuelve
+   * a pedir nombre/mail/teléfono. `contact` es entonces opcional.
+   */
+  receiptToken: z.string().min(1).optional(),
+  contact: z
+    .object({
+      name: z.string().min(1).max(255),
+      email: z.string().email(),
+      phone: z.string().min(1).max(255),
+      /** DNI del titular: si viene, el saldo queda atado a esa identidad (una persona = un saldo). */
+      dni: z.string().regex(/^\d{6,9}$/).optional(),
+    })
+    .optional(),
+})
+
 const guestCheckoutSchema = z.object({
   eventId: z.string().min(1),
-  paymentMethod: z.enum(["TRANSFER", "CARD", "MERCADOPAGO"]),
+  /** Tarea 6.1 — SALDO: pago con el saldo cargado del cliente (visión §2.7). Requiere DNI en el contacto. */
+  paymentMethod: z.enum(["TRANSFER", "CARD", "MERCADOPAGO", "SALDO"]),
   clientTotal: z.string().min(1),
   contact: z.object({
     name: z.string().min(1).max(255),
     email: z.string().email(),
     phone: z.string().min(1).max(255),
+    /**
+     * Tarea 2.1 — DNI del comprador (la identidad dentro del evento: puerta, caja, saldo).
+     * Opcional en el schema: el client lo manda siempre, pero el endpoint no debe romper
+     * pedidos que no lo traigan. Valida el formato de DNI argentino (6–9 dígitos).
+     */
+    dni: z.string().regex(/^\d{6,9}$/).optional(),
   }),
   ticketLines: z
     .array(
@@ -99,7 +175,9 @@ export const publicRoute = new Hono()
     const tenantFilter = c.req.query("productoraId")
 
     const filters: SQL[] = [
-      eq(events.isActive, true),
+      // Tarea 11.3 — `isActive` retirado: la visibilidad pública vive en `status`
+      // (el viejo sync de transición hacía `isActive = status !== "closed"`).
+      ne(events.status, "closed"),
       eq(tenants.isActive, true),
       gte(events.date, new Date()),
     ]
@@ -147,7 +225,7 @@ export const publicRoute = new Hono()
     console.log("ev")
     console.log(ev)
 
-    if (!ev || ev.isActive === false) {
+    if (!ev || ev.status === "closed") {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
@@ -262,6 +340,8 @@ export const publicRoute = new Hono()
       },
       event: {
         id: ev.id,
+        // Tarea 2.2 — la slug para navegar "Volver" al evento desde el checkout.
+        slug: ev.slug ?? null,
         name: ev.name,
         date: ev.date,
         location: ev.location,
@@ -277,7 +357,7 @@ export const publicRoute = new Hono()
   })
   // Reporte de cierre público y de solo lectura (tarea 4.5 / spec §5 "Cerrado": compartible por
   // link). Solo responde para eventos ya cerrados con su liquidación congelada; los eventos
-  // cerrados tienen `isActive = false`, por eso NO reusamos el filtro de `/events/:id`.
+  // cerrados tienen `status = "closed"`, por eso NO reusamos el filtro de `/events/:id`.
   .get("/events/:id/report", async (c) => {
     const slugOrId = c.req.param("id")
     const db = drizzle(pool)
@@ -318,6 +398,7 @@ export const publicRoute = new Hono()
         tenantId: events.tenantId,
         cucuruEnabled: tenants.cucuruEnabled,
         mpConnected: tenants.mpConnected,
+        mpPublicKey: tenants.mpPublicKey,
       })
       .from(events)
       .innerJoin(tenants, eq(events.tenantId, tenants.id))
@@ -351,6 +432,9 @@ export const publicRoute = new Hono()
             name: body.contact.name,
             email: body.contact.email,
             phone: body.contact.phone,
+            // Tarea 2.1 — el DNI viaja al checkout: `findOrCreateCustomer` lo persiste y
+            // `executeTicketPurchase` lo snapshotea en `tickets.buyer_dni` (lookup en puerta).
+            ...(body.contact.dni ? { dni: body.contact.dni } : {}),
           },
           paymentMethod: body.paymentMethod,
           clientTotal: body.clientTotal.trim(),
@@ -359,13 +443,111 @@ export const publicRoute = new Hono()
         })
       )
 
-      if (body.paymentMethod === "CARD" || body.paymentMethod === "MERCADOPAGO") {
+      if (body.paymentMethod === "SALDO") {
+        // Tarea 6.1 — El pago con saldo se completa al instante (no hay nada que acreditar):
+        // `executeClientCheckout` ya dejó la sale COMPLETED y debitó el saldo (movimiento
+        // CONSUMO). Sin redirección: el client navega directo al comprobante.
+        return c.json(
+          {
+            message: "Compra confirmada",
+            receiptToken: result.receiptToken,
+            saleId: result.saleId,
+            ...(result.balance != null ? { balance: result.balance } : {}),
+          },
+          201
+        )
+      }
+
+      if (body.paymentMethod === "MERCADOPAGO") {
+        // Tarea 2.2 — Checkout Pro: creamos la preferencia y el client redirige al link de
+        // pago (mismo patrón que el addon de consumos). Sin link, la sale queda huérfana:
+        // se marca PAYMENT_FAILED.
+        const mpAccessToken = await obtenerTokenValido(result.tenantId)
+        if (!mpAccessToken) {
+          await db
+            .update(sales)
+            .set({ status: "PAYMENT_FAILED" })
+            .where(
+              and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+            )
+          return c.json({ error: "No se pudo conectar con Mercado Pago" }, 502)
+        }
+
+        const total = parseFloat(body.clientTotal)
+        const fee = Math.round(total * 0.01 * 100) / 100
+
+        const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${mpAccessToken}`,
+          },
+          body: JSON.stringify({
+            items: [
+              {
+                title: "Compra en el evento",
+                quantity: 1,
+                currency_id: "ARS",
+                unit_price: total,
+              },
+            ],
+            marketplace_fee: fee,
+            back_urls: {
+              success: `https://crow.ar/receipt/${result.receiptToken}`,
+              failure: `https://crow.ar/receipt/${result.receiptToken}`,
+              pending: `https://crow.ar/receipt/${result.receiptToken}`,
+            },
+            auto_return: "approved",
+            external_reference: `totem-sale-${result.saleId}`,
+            notification_url: "https://api.crow.ar/api/mp/webhook",
+            statement_descriptor: "TOTEM",
+            expires: true,
+            expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+          }),
+        })
+
+        if (!mpRes.ok) {
+          await db
+            .update(sales)
+            .set({ status: "PAYMENT_FAILED" })
+            .where(
+              and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+            )
+          return c.json({ error: "No se pudo crear el link de pago" }, 500)
+        }
+
+        const preference = (await mpRes.json()) as { init_point?: string }
+        if (!preference.init_point) {
+          await db
+            .update(sales)
+            .set({ status: "PAYMENT_FAILED" })
+            .where(
+              and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+            )
+          return c.json({ error: "No se pudo obtener el link de pago" }, 500)
+        }
+
         return c.json(
           {
             message: "Pendiente de pago",
             receiptToken: result.receiptToken,
             saleId: result.saleId,
             payOnReceipt: true,
+            redirectUrl: preference.init_point,
+          },
+          201
+        )
+      }
+
+      if (body.paymentMethod === "CARD") {
+        // Tarea 2.2 — el client monta el CardPayment Brick con la public key del tenant.
+        return c.json(
+          {
+            message: "Pendiente de pago",
+            receiptToken: result.receiptToken,
+            saleId: result.saleId,
+            payOnReceipt: true,
+            card: { publicKey: paymentCtx.mpPublicKey ?? null },
           },
           201
         )
@@ -434,6 +616,279 @@ export const publicRoute = new Hono()
       throw e
     }
   })
+  // ─── Saldo: consulta por DNI (tarea 6.2) ──────────────────────────────────────────
+  // El checkout consulta acá para ofrecer "Saldo disponible" solo cuando hay fondos
+  // (visión §2.7). El DNI es la identidad dentro del evento; sin cliente o sin saldo → "0.00".
+  .get("/events/:id/balance", async (c) => {
+    const eventId = c.req.param("id")
+    const dni = c.req.query("dni")
+    const db = drizzle(pool)
+
+    if (!dni || !/^\d{6,9}$/.test(dni)) {
+      return c.json({ amount: "0.00" })
+    }
+
+    const [ev] = await db
+      .select({ id: events.id })
+      .from(events)
+      .where(and(eq(events.id, eventId), ne(events.status, "closed")))
+      .limit(1)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [customer] = await db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(eq(customers.dni, dni))
+      .limit(1)
+    if (!customer) {
+      return c.json({ amount: "0.00" })
+    }
+
+    const amount = await getBalance(db, customer.id, eventId)
+    return c.json({ amount })
+  })
+  // ─── Saldo: carga desde el celular (tarea 6.1, visión §2.7) ──────────────────────
+  // Crea una sale PENDING con snapshot `kind: "deposit"` (sin items). El webhook existente
+  // (MP/Cucuru) la cumple como cualquier otra: `fulfillPendingGuestCheckout` despacha por el
+  // snapshot y acredita `customer_balances` en vez de emitir tickets/consumos.
+  .post("/events/:id/balance/deposit", zValidator("json", balanceDepositSchema), async (c) => {
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    let amt
+    try {
+      amt = dec(body.amount)
+    } catch {
+      return c.json({ error: "Monto inválido" }, 400)
+    }
+    if (amt.isNaN() || !amt.isFinite() || amt.lte(0)) {
+      return c.json({ error: "Monto inválido" }, 400)
+    }
+    const amountStr = decToDb(amt)
+
+    const [paymentCtx] = await db
+      .select({
+        tenantId: events.tenantId,
+        status: events.status,
+        cucuruEnabled: tenants.cucuruEnabled,
+        mpConnected: tenants.mpConnected,
+        mpPublicKey: tenants.mpPublicKey,
+      })
+      .from(events)
+      .innerJoin(tenants, eq(events.tenantId, tenants.id))
+      .where(eq(events.id, eventId))
+      .limit(1)
+
+    if (!paymentCtx) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    if (paymentCtx.status === "closed") {
+      return c.json({ error: "Evento no disponible" }, 404)
+    }
+    if (body.paymentMethod === "TRANSFER" && !paymentCtx.cucuruEnabled) {
+      return c.json(
+        { error: "Los cobros por transferencia no están disponibles para este evento." },
+        400
+      )
+    }
+    if (body.paymentMethod === "MERCADOPAGO" && !paymentCtx.mpConnected) {
+      return c.json(
+        { error: "Mercado Pago no está habilitado para este evento" },
+        400
+      )
+    }
+
+    // Tarea 6.2 — Contacto explícito o, si viene `receiptToken`, el del snapshot de esa
+    // compra (misma persona: el saldo queda atado a quien ya está identificado).
+    let contact: { name: string; email: string; phone: string; dni?: string }
+    if (body.contact) {
+      contact = {
+        name: body.contact.name,
+        email: body.contact.email,
+        phone: body.contact.phone,
+        ...(body.contact.dni ? { dni: body.contact.dni } : {}),
+      }
+    } else if (body.receiptToken) {
+      const [saleRow] = await db
+        .select()
+        .from(sales)
+        .where(eq(sales.receiptToken, body.receiptToken))
+        .limit(1)
+      if (!saleRow || saleRow.eventId !== eventId) {
+        return c.json({ error: "Comprobante no encontrado" }, 404)
+      }
+      if (!saleRow.paid) {
+        return c.json({ error: "La compra original no está confirmada" }, 400)
+      }
+      const snap = saleRow.guestCheckoutSnapshot
+      if (!snap?.contact) {
+        return c.json({ error: "No hay datos de contacto en esta compra" }, 400)
+      }
+      contact = snap.contact
+    } else {
+      return c.json({ error: "Faltan los datos de contacto" }, 400)
+    }
+
+    const result = await db.transaction(async (tx) => {
+      const customerId = await findOrCreateCustomer(tx, contact)
+      const saleId = uuidv4()
+      const receiptToken = randomUUID()
+      await tx.insert(sales).values({
+        id: saleId,
+        eventId,
+        tenantId: paymentCtx.tenantId,
+        customerId,
+        receiptToken,
+        source: "WEB",
+        totalAmount: amountStr,
+        paymentMethod: body.paymentMethod,
+        status: "PENDING",
+        guestCheckoutSnapshot: {
+          kind: "deposit",
+          ticketLines: [],
+          drinkLines: [],
+          contact: {
+            name: contact.name,
+            email: contact.email.toLowerCase().trim(),
+            phone: contact.phone,
+            ...(contact.dni ? { dni: contact.dni } : {}),
+          },
+        },
+        createdAt: new Date(),
+      })
+      return { saleId, receiptToken, tenantId: paymentCtx.tenantId }
+    })
+
+    if (body.paymentMethod === "MERCADOPAGO") {
+      // Checkout Pro: mismo patrón que `/checkout` (link de pago + PAYMENT_FAILED si no sale).
+      const mpAccessToken = await obtenerTokenValido(result.tenantId)
+      if (!mpAccessToken) {
+        await db
+          .update(sales)
+          .set({ status: "PAYMENT_FAILED" })
+          .where(
+            and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+          )
+        return c.json({ error: "No se pudo conectar con Mercado Pago" }, 502)
+      }
+
+      const total = parseFloat(amountStr)
+      const fee = Math.round(total * 0.01 * 100) / 100
+
+      const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${mpAccessToken}`,
+        },
+        body: JSON.stringify({
+          items: [
+            {
+              title: "Carga de saldo",
+              quantity: 1,
+              currency_id: "ARS",
+              unit_price: total,
+            },
+          ],
+          marketplace_fee: fee,
+          back_urls: {
+            success: `https://crow.ar/receipt/${result.receiptToken}`,
+            failure: `https://crow.ar/receipt/${result.receiptToken}`,
+            pending: `https://crow.ar/receipt/${result.receiptToken}`,
+          },
+          auto_return: "approved",
+          external_reference: `totem-sale-${result.saleId}`,
+          notification_url: "https://api.crow.ar/api/mp/webhook",
+          statement_descriptor: "TOTEM",
+          expires: true,
+          expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        }),
+      })
+
+      if (!mpRes.ok) {
+        await db
+          .update(sales)
+          .set({ status: "PAYMENT_FAILED" })
+          .where(
+            and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+          )
+        return c.json({ error: "No se pudo crear el link de pago" }, 500)
+      }
+
+      const preference = (await mpRes.json()) as { init_point?: string }
+      if (!preference.init_point) {
+        await db
+          .update(sales)
+          .set({ status: "PAYMENT_FAILED" })
+          .where(
+            and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+          )
+        return c.json({ error: "No se pudo obtener el link de pago" }, 500)
+      }
+
+      return c.json(
+        {
+          message: "Pendiente de pago",
+          receiptToken: result.receiptToken,
+          saleId: result.saleId,
+          payOnReceipt: true,
+          redirectUrl: preference.init_point,
+        },
+        201
+      )
+    }
+
+    // TRANSFER: alias/CVU de Cucuru, mismo patrón que `/checkout`.
+    const [slugCtx] = await db
+      .select({
+        productoraName: tenants.name,
+        eventName: events.name,
+      })
+      .from(events)
+      .innerJoin(tenants, eq(events.tenantId, tenants.id))
+      .where(and(eq(events.id, eventId), eq(tenants.id, result.tenantId)))
+      .limit(1)
+
+    const slugSource = (slugCtx?.productoraName ?? slugCtx?.eventName ?? "tenant").trim()
+    const tenantSlug = slugifyForCucuruAliasSegment(slugSource)
+
+    const aliasRes = await asignarAliasASale(result.saleId, result.tenantId, tenantSlug)
+    if ("ok" in aliasRes && aliasRes.ok === false) {
+      await db
+        .update(sales)
+        .set({ status: "PAYMENT_FAILED" })
+        .where(
+          and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+        )
+      return c.json({ error: mapAsignarAliasError(aliasRes.reason) }, 502)
+    }
+
+    const { alias, accountNumber } = aliasRes
+
+    await db
+      .update(sales)
+      .set({
+        cucuruAlias: alias,
+        cucuruCvu: accountNumber,
+      })
+      .where(
+        and(eq(sales.id, result.saleId), eq(sales.tenantId, result.tenantId))
+      )
+
+    return c.json(
+      {
+        message: "Pendiente de pago",
+        receiptToken: result.receiptToken,
+        saleId: result.saleId,
+        payOnReceipt: true,
+        transfer: { alias, accountNumber },
+      },
+      201
+    )
+  })
   .get("/receipts/:token", async (c) => {
     const token = c.req.param("token")
     const db = drizzle(pool)
@@ -458,6 +913,13 @@ export const publicRoute = new Hono()
     }
 
     const saleId = header.sale.id
+
+    // Tarea 6.1 — Saldo del cliente en este evento (visión §2.7): "0.00" si nunca cargó.
+    // El comprobante (y el client) lo muestran; la caja también lo lee por DNI (6.3).
+    let balanceAmount = "0.00"
+    if (header.sale.customerId) {
+      balanceAmount = await getBalance(db, header.sale.customerId, header.sale.eventId)
+    }
 
     const consumptionShape = {
       id: digitalConsumptions.id,
@@ -530,6 +992,7 @@ export const publicRoute = new Hono()
 
     return c.json({
       receiptToken: header.sale.receiptToken,
+      balance: { amount: balanceAmount },
       sale: {
         id: header.sale.id,
         totalAmount: header.sale.totalAmount,
@@ -579,7 +1042,13 @@ export const publicRoute = new Hono()
     const token = c.req.param("token")
     const db = drizzle(pool)
 
-    let body: { drinkLines: { productId: string; quantity: number }[]; clientTotal: string }
+    // Tarea 6.2 — `paymentMethod` opcional: "SALDO" paga con el saldo del cliente (completo
+    // al instante, sin acreditar nada); por defecto (y back-compat) Mercado Pago.
+    let body: {
+      drinkLines: { productId: string; quantity: number }[]
+      clientTotal: string
+      paymentMethod?: string
+    }
     try {
       body = await c.req.json()
     } catch {
@@ -589,6 +1058,8 @@ export const publicRoute = new Hono()
     if (!body.drinkLines?.length || !body.clientTotal) {
       return c.json({ error: "Datos incompletos" }, 400)
     }
+
+    const method = body.paymentMethod === "SALDO" ? "SALDO" : "MERCADOPAGO"
 
     const [saleRow] = await db
       .select()
@@ -610,8 +1081,23 @@ export const publicRoute = new Hono()
       .where(eq(tenants.id, saleRow.tenantId))
       .limit(1)
 
-    if (!tenant?.mpConnected) {
+    if (method === "MERCADOPAGO" && !tenant?.mpConnected) {
       return c.json({ error: "Mercado Pago no está habilitado para este evento" }, 400)
+    }
+
+    // Tarea 6.2 — El pago con saldo exige DNI (el saldo está atado a la identidad). El
+    // snapshot del comprador lo tiene si compró con DNI; si no, se resuelve del customer
+    // (una carga de saldo en caja quedó registrada con DNI).
+    let contact = snap.contact
+    if (method === "SALDO" && !contact.dni) {
+      const [customerRow] = saleRow.customerId
+        ? await db
+            .select({ dni: customers.dni })
+            .from(customers)
+            .where(eq(customers.id, saleRow.customerId))
+            .limit(1)
+        : []
+      contact = { ...snap.contact, ...(customerRow?.dni ? { dni: customerRow.dni } : {}) }
     }
 
     let result: Awaited<ReturnType<typeof executeClientCheckout>>
@@ -619,8 +1105,8 @@ export const publicRoute = new Hono()
       result = await db.transaction(async (tx) =>
         executeClientCheckout(tx, {
           eventId: saleRow.eventId,
-          contact: snap.contact,
-          paymentMethod: "MERCADOPAGO",
+          contact,
+          paymentMethod: method,
           clientTotal: body.clientTotal.trim(),
           ticketLines: [],
           drinkLines: body.drinkLines,
@@ -632,6 +1118,16 @@ export const publicRoute = new Hono()
         return c.json(errBody, status)
       }
       throw e
+    }
+
+    // Tarea 6.2 — SALDO: la sale quedó COMPLETED y el saldo debitado dentro de la
+    // transacción. Sin preferencia que crear: el client refresca el comprobante.
+    if (method === "SALDO") {
+      return c.json({
+        success: true,
+        receiptToken: result.receiptToken,
+        ...(result.balance != null ? { balance: result.balance } : {}),
+      })
     }
 
     const mpAccessToken = await obtenerTokenValido(saleRow.tenantId)
@@ -652,13 +1148,13 @@ export const publicRoute = new Hono()
         items: [{ title: "Consumos", quantity: 1, currency_id: "ARS", unit_price: total }],
         marketplace_fee: fee,
         back_urls: {
-          success: `https://totem.uno/receipt/${token}`,
-          failure: `https://totem.uno/receipt/${token}`,
-          pending: `https://totem.uno/receipt/${token}`,
+          success: `https://crow.ar/receipt/${token}`,
+          failure: `https://crow.ar/receipt/${token}`,
+          pending: `https://crow.ar/receipt/${token}`,
         },
         auto_return: "approved",
         external_reference: `totem-sale-${result.saleId}`,
-        notification_url: "https://api.totem.uno/api/mp/webhook",
+        notification_url: "https://api.crow.ar/api/mp/webhook",
         statement_descriptor: "TOTEM",
         expires: true,
         expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -676,6 +1172,126 @@ export const publicRoute = new Hono()
 
     return c.json({ success: true, url_pago: preference.init_point })
   })
+  // ─── Retiro en barra (tarea 4.1) — "¿Qué te llevás ahora?" ─────────────────────
+  // El cliente elige tragos comprados y no canjeados y genera UN QR de pedido. Las
+  // consumiciones NO se tocan acá: el pedido es una lista de intención; el canje real
+  // (REDEEMED + stock) lo hace la barra con el token del QR (tarea 4.2/4.3). Lo no
+  // retirado sigue PENDING en el comprobante.
+  .post("/pickups", zValidator("json", pickupCreateSchema), async (c) => {
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const [saleRow] = await db
+      .select()
+      .from(sales)
+      .where(eq(sales.receiptToken, body.receiptToken))
+      .limit(1)
+
+    if (!saleRow) return c.json({ error: "Comprobante no encontrado" }, 404)
+    if (!saleRow.paid) {
+      return c.json({ error: "La compra original no está confirmada" }, 400)
+    }
+    if (!saleRow.customerId) {
+      return c.json({ error: "Esta compra no tiene un cliente asociado" }, 400)
+    }
+
+    // Orden estable por consumptionId: sirve para detectar pedidos duplicados.
+    const idsSorted = [...body.consumptionIds].sort()
+
+    const consRows = await db
+      .select()
+      .from(digitalConsumptions)
+      .where(inArray(digitalConsumptions.id, idsSorted))
+
+    if (consRows.length !== idsSorted.length) {
+      return c.json({ error: "Algunas consumiciones no existen" }, 400)
+    }
+
+    const scoped = consRows.every(
+      (r) =>
+        r.status === "PENDING" &&
+        r.customerId === saleRow.customerId &&
+        r.eventId === saleRow.eventId &&
+        r.tenantId === saleRow.tenantId
+    )
+    if (!scoped) {
+      return c.json(
+        {
+          error:
+            "Algunas consumiciones ya fueron canjeadas o no pertenecen a esta compra",
+        },
+        409
+      )
+    }
+
+    const itemsJson: PickupItemsJson = idsSorted.map((cid) => {
+      const row = consRows.find((r) => r.id === cid)!
+      return { consumptionId: cid, productId: row.productId, quantity: 1 }
+    })
+
+    // Idempotencia: si ya existe un pedido PENDING con exactamente este contenido, se
+    // devuelve el mismo (un doble tap no puede generar dos pedidos → doble entrega).
+    const existingRows = await db
+      .select()
+      .from(pickupOrders)
+      .where(
+        and(
+          eq(pickupOrders.customerId, saleRow.customerId),
+          eq(pickupOrders.eventId, saleRow.eventId),
+          eq(pickupOrders.status, "PENDING")
+        )
+      )
+      .orderBy(desc(pickupOrders.createdAt))
+      .limit(20)
+    const itemsKey = JSON.stringify(itemsJson)
+    const duplicate = existingRows.find(
+      (o) => JSON.stringify(o.itemsJson ?? []) === itemsKey
+    )
+    if (duplicate) {
+      const items = await pickupItemsWithNames(db, duplicate.itemsJson)
+      return c.json({ token: duplicate.token, status: duplicate.status, items })
+    }
+
+    const orderId = uuidv4()
+    const token = randomUUID()
+    await db.insert(pickupOrders).values({
+      id: orderId,
+      eventId: saleRow.eventId,
+      tenantId: saleRow.tenantId,
+      customerId: saleRow.customerId,
+      token,
+      status: "PENDING",
+      itemsJson,
+      createdAt: new Date(),
+    })
+
+    const items = await pickupItemsWithNames(db, itemsJson)
+    return c.json({ token, status: "PENDING", items }, 201)
+  })
+  // Vista del pedido para el QR del client (tarea 4.1). Sin auth — el token ES la credencial.
+  .get("/pickups/:token", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const [row] = await db
+      .select()
+      .from(pickupOrders)
+      .where(eq(pickupOrders.token, token))
+      .limit(1)
+
+    if (!row) {
+      return c.json({ error: "Pedido no encontrado" }, 404)
+    }
+
+    const items = await pickupItemsWithNames(db, row.itemsJson)
+    return c.json({
+      token: row.token,
+      status: row.status,
+      createdAt: row.createdAt ?? null,
+      deliveredAt: row.deliveredAt ?? null,
+      items,
+    })
+  })
   // Cortesía / invitación (spec §4.2): el invitado abre su link nominado.
   // Sin auth — el token ES la credencial.
   .get("/courtesies/:token", async (c) => {
@@ -687,7 +1303,6 @@ export const publicRoute = new Hono()
         eventName: events.name,
         eventDate: events.date,
         eventLocation: events.location,
-        eventIsActive: events.isActive,
         ticketTypeName: ticketTypes.name,
       })
       .from(courtesies)
@@ -703,6 +1318,32 @@ export const publicRoute = new Hono()
       return c.json({ error: "Esta invitación fue anulada" }, 410)
     }
 
+    // Tragos de regalo (tarea 7.1): resumen [{productId, productName, quantity}] para que la
+    // invitación muestre qué incluye antes de canjear.
+    const drinkLines = Array.isArray(row.courtesy.drinkLines)
+      ? row.courtesy.drinkLines
+      : []
+    let drinks: { productId: string; productName: string; quantity: number }[] = []
+    if (drinkLines.length > 0) {
+      const drinkIds = [...new Set(drinkLines.map((l) => l.productId))]
+      const productRows = await db
+        .select({ id: products.id, name: products.name })
+        .from(products)
+        .where(inArray(products.id, drinkIds))
+      const byId = new Map(productRows.map((p) => [p.id, p.name]))
+      drinks = drinkLines.map((l) => ({
+        productId: l.productId,
+        productName: byId.get(l.productId) ?? "—",
+        quantity: l.quantity,
+      }))
+    }
+
+    // Si ya se canjeó, exponemos los QRs de la entrada y de los tragos (idempotente).
+    const drinkConsumptions =
+      row.courtesy.status === "REDEEMED" && row.courtesy.drinkSaleId
+        ? await courtesyDrinkQrs(db, row.courtesy.drinkSaleId, row.courtesy.tenantId)
+        : null
+
     return c.json({
       guestName: row.courtesy.guestName,
       status: row.courtesy.status,
@@ -713,8 +1354,10 @@ export const publicRoute = new Hono()
         location: row.eventLocation,
       },
       ticketTypeName: row.ticketTypeName,
+      drinks,
       // Si ya se canjeó, exponemos el QR para que pueda volver a verlo.
       ticketId: row.courtesy.ticketId ?? null,
+      drinkConsumptions,
     })
   })
   // Canje: emite UNA entrada real y la enlaza a la cortesía. Idempotente: si ya
@@ -738,14 +1381,17 @@ export const publicRoute = new Hono()
         return { kind: "err" as const, status: 410 as const, error: "Esta invitación fue anulada" }
       }
       if (cty.status === "REDEEMED" && cty.ticketId != null) {
-        // Ya canjeada: devolvemos la entrada existente (idempotente).
+        // Ya canjeada: devolvemos la entrada existente y los tragos ya emitidos (idempotente).
         const [existing] = await tx
           .select()
           .from(tickets)
           .where(eq(tickets.id, cty.ticketId))
           .limit(1)
         if (existing) {
-          return { kind: "ok" as const, ticket: existing, alreadyRedeemed: true }
+          const drinks = cty.drinkSaleId
+            ? await courtesyDrinkQrs(tx, cty.drinkSaleId, cty.tenantId)
+            : []
+          return { kind: "ok" as const, ticket: existing, alreadyRedeemed: true, drinks }
         }
       }
 
@@ -754,7 +1400,7 @@ export const publicRoute = new Hono()
         .from(events)
         .where(eq(events.id, cty.eventId))
         .limit(1)
-      if (!ev || ev.isActive === false) {
+      if (!ev || ev.status === "closed") {
         return { kind: "err" as const, status: 404 as const, error: "Evento no disponible" }
       }
 
@@ -786,9 +1432,64 @@ export const publicRoute = new Hono()
         createdAt: new Date(),
       })
 
+      // Tragos de regalo (tarea 7.1): emite consumiciones PENDING canjeables en barra como
+      // cualquier otra. Decisión de implementación (documentada en la migración 0047): se cuelgan
+      // de una sale real de $0 (source WEB, sin sale_items) porque `digital_consumptions.sale_id`
+      // es NOT NULL y el canje 1×1 en barra joinnea `sales`. La sale de $0 no aporta recaudación
+      // (el cierre suma sale_items × precio y el total CASH). Solo se emiten los tragos que
+      // siguen activos en el menú del evento: el menú puede cambiar entre que se crea la
+      // invitación y que se canjea, y la invitación no puede fallar por eso.
+      const drinkLines = Array.isArray(cty.drinkLines) ? cty.drinkLines : []
+      let drinkSaleId: string | null = null
+      if (drinkLines.length > 0) {
+        const drinkIds = [...new Set(drinkLines.map((l) => l.productId))]
+        const menu = await tx
+          .select({ productId: eventProducts.productId })
+          .from(eventProducts)
+          .where(
+            and(
+              eq(eventProducts.eventId, cty.eventId),
+              eq(eventProducts.tenantId, cty.tenantId),
+              eq(eventProducts.isActive, true),
+              inArray(eventProducts.productId, drinkIds)
+            )
+          )
+        const available = new Set(menu.map((m) => m.productId))
+        const activeLines = drinkLines.filter((l) => available.has(l.productId))
+
+        if (activeLines.length > 0) {
+          drinkSaleId = uuidv4()
+          await tx.insert(sales).values({
+            id: drinkSaleId,
+            eventId: cty.eventId,
+            tenantId: cty.tenantId,
+            receiptToken: randomUUID(),
+            source: "WEB",
+            totalAmount: "0",
+            paymentMethod: "CASH",
+            status: "COMPLETED",
+            createdAt: new Date(),
+          })
+          for (const line of activeLines) {
+            for (let i = 0; i < line.quantity; i++) {
+              await tx.insert(digitalConsumptions).values({
+                id: uuidv4(),
+                eventId: cty.eventId,
+                tenantId: cty.tenantId,
+                productId: line.productId,
+                saleId: drinkSaleId,
+                qrHash: randomUUID(),
+                status: "PENDING",
+                createdAt: new Date(),
+              })
+            }
+          }
+        }
+      }
+
       await tx
         .update(courtesies)
-        .set({ status: "REDEEMED", ticketId, redeemedAt: new Date() })
+        .set({ status: "REDEEMED", ticketId, drinkSaleId, redeemedAt: new Date() })
         .where(eq(courtesies.id, cty.id))
 
       const [row] = await tx
@@ -797,7 +1498,11 @@ export const publicRoute = new Hono()
         .where(eq(tickets.id, ticketId))
         .limit(1)
 
-      return { kind: "ok" as const, ticket: row!, alreadyRedeemed: false }
+      const drinks = drinkSaleId
+        ? await courtesyDrinkQrs(tx, drinkSaleId, cty.tenantId)
+        : []
+
+      return { kind: "ok" as const, ticket: row!, alreadyRedeemed: false, drinks }
     })
 
     if (outcome.kind === "err") {
@@ -816,5 +1521,8 @@ export const publicRoute = new Hono()
         buyerName: outcome.ticket.buyerName,
       },
       qrDataUrl,
+      // Tragos de regalo emitidos (tarea 7.1): consumiciones PENDING con su QR, listas para
+      // retirar en barra como cualquier otra. Vacío si la invitación no traía tragos.
+      drinks: outcome.drinks,
     })
   })

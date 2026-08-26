@@ -9,7 +9,9 @@ import { inventoryRoute } from "./routes/inventory"
 import { analyticsRoute } from "./routes/analytics"
 import { barsRoute } from "./routes/bars"
 import { salesRoute } from "./routes/sales"
+import { promotersRoute } from "./routes/promoters"
 import { mountStockWebSocket } from "./routes/ws-stock"
+import { startJobsRunner } from "./lib/jobs-runner"
 import { mercadopagoRoute } from "./routes/mercadopago"
 import { webhookRoute } from "./routes/webhook"
 import { cors } from "hono/cors"
@@ -23,15 +25,10 @@ app.use(
   "/*",
   cors({
     origin: [
-      "https://totem.uno",
+      "https://crow.ar",
+      "https://admin.crow.ar",
       "http://localhost:5173",
       "http://127.0.0.1:5173",
-      "https://totem-admin-9hw.pages.dev",
-      "https://totem-client.pages.dev",
-      "https://my.totem.uno",
-      "https://admin.totem.uno",
-      "https://admin.crow.ar",
-      "https://crow.ar",
     ],  
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
@@ -54,9 +51,15 @@ app.route("/inventory", inventoryRoute)
 app.route("/analytics", analyticsRoute)
 app.route("/bars", barsRoute)
 app.route("/sales", salesRoute)
+app.route("/promoters", promotersRoute)
 app.route("/api/mp", mercadopagoRoute)
 app.route("/api/webhook", webhookRoute)
 mountStockWebSocket(app)
+
+// Tarea 8.2 — Runner de jobs de fondo (visión §2.3): recordatorio de WhatsApp 1 h antes y
+// transición on_sale → live a la hora de puertas. Tick inmediato + cada minuto. El estado
+// vive en DB (idempotente por columna), ver src/lib/jobs-runner.ts.
+startJobsRunner()
 
 const port = Number(process.env.PORT ?? 3000)
 

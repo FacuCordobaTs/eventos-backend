@@ -2,9 +2,9 @@ import { Hono } from "hono"
 import type { Context } from "hono"
 import { z } from "zod"
 import { drizzle } from "drizzle-orm/mysql2"
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { pool } from "../db"
-import { sales, tenants, customers } from "../db/schema"
+import { mpProcessedPayments, sales, tenants } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import {
   enriquecerTenantConUsersMe,
@@ -12,10 +12,12 @@ import {
   obtenerTokenValido,
 } from "../lib/mercadopago-utils"
 import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-email"
-import { processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
+import { isMysqlDuplicateKey, processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
+import { fulfillPendingGuestCheckout } from "../lib/client-checkout"
+import { PurchaseError } from "../lib/ticket-purchase"
 
 const MP_MARKETPLACE_FEE_RATE = 0.01
-const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.totem.uno'
+const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.crow.ar'
 const MP_CLIENT_ID = process.env.MP_CLIENT_ID
 const MP_CLIENT_SECRET = process.env.MP_CLIENT_SECRET
 const MP_REDIRECT_URI = process.env.MP_REDIRECT_URI
@@ -212,13 +214,13 @@ export const mercadopagoRoute = new Hono()
           items: mpItems,
           marketplace_fee: marketplaceFeeFromAmount(total),
           back_urls: {
-            success: `https://totem.uno/receipt/${sale.receiptToken}`,
-            failure: `https://totem.uno/receipt/${sale.receiptToken}`,
-            pending: `https://totem.uno/receipt/${sale.receiptToken}`,
+            success: `https://crow.ar/receipt/${sale.receiptToken}`,
+            failure: `https://crow.ar/receipt/${sale.receiptToken}`,
+            pending: `https://crow.ar/receipt/${sale.receiptToken}`,
           },
           auto_return: 'approved',
           external_reference: externalReference,
-          notification_url: `https://api.totem.uno/api/mp/webhook`,
+          notification_url: `https://api.crow.ar/api/mp/webhook`,
           statement_descriptor: 'TOTEM',
           expires: true,
           expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -274,7 +276,7 @@ export const mercadopagoRoute = new Hono()
           identification: payer.identification
         },
         external_reference: `totem-sale-${sale.id}`,
-        notification_url: `https://api.totem.uno/api/mp/webhook`
+        notification_url: `https://api.crow.ar/api/mp/webhook`
       }
       if (applicationFee > 0) {
         mpPayload.application_fee = applicationFee
@@ -299,26 +301,91 @@ export const mercadopagoRoute = new Hono()
       }
 
       if (payment.status === 'approved') {
-        await db.update(sales).set({ paid: true }).where(eq(sales.id, sale.id))
-          
-        if (sale.customerId) {  
-        const customer = await db.select().from(customers).where(eq(customers.id, sale.customerId)).limit(1)
-          await sendGuestCheckoutReceiptEmail({
-            db,
-            eventId: sale.eventId,
-            saleId: sale.id,
-            receiptToken: sale.receiptToken,
-            contact: {
-              name: customer[0].name,
-              email: customer[0].email,
-            },
-          })
+        // Tarea 2.2 (hallazgo 1.6#5) — un pago de tarjeta aprobado debe CUMPLIR la sale
+        // PENDING (emitir tickets/consumos desde el snapshot), igual que hace el webhook MP.
+        // Deduplicación idempotente con `mpProcessedPayments`: si el webhook ya lo procesó,
+        // este insert falla con ER_DUP_ENTRY y no hacemos nada (y viceversa).
+        let skippedAsDuplicate = false
+        await db.transaction(async (tx) => {
+          try {
+            await tx.insert(mpProcessedPayments).values({
+              paymentId: String(payment.id),
+              saleId: sale.id,
+            })
+          } catch (e) {
+            if (isMysqlDuplicateKey(e)) {
+              skippedAsDuplicate = true
+              return
+            }
+            throw e
+          }
+
+          const [current] = await tx
+            .select()
+            .from(sales)
+            .where(eq(sales.id, sale.id))
+            .limit(1)
+          if (!current || current.paid) return
+
+          if (current.status === "PENDING" && current.guestCheckoutSnapshot != null) {
+            try {
+              await fulfillPendingGuestCheckout(tx, current.id)
+            } catch (e) {
+              if (e instanceof PurchaseError) {
+                await tx
+                  .update(sales)
+                  .set({ status: "PAYMENT_FAILED" })
+                  .where(and(eq(sales.id, current.id), eq(sales.status, "PENDING")))
+              } else {
+                throw e
+              }
+            }
+          } else {
+            // Venta sin snapshot (ej. POS): solo se marca como pagada, como antes.
+            await tx
+              .update(sales)
+              .set({ paid: true, paidAt: new Date() })
+              .where(eq(sales.id, current.id))
+          }
+        })
+
+        if (!skippedAsDuplicate) {
+          const [after] = await db
+            .select()
+            .from(sales)
+            .where(eq(sales.id, sale.id))
+            .limit(1)
+
+          if (after?.status === "COMPLETED") {
+            const snap = after.guestCheckoutSnapshot
+            const contact =
+              snap && typeof snap === "object" && "contact" in snap
+                ? (snap as { contact?: { email?: string; name?: string } }).contact
+                : undefined
+            if (contact?.email) {
+              void sendGuestCheckoutReceiptEmail({
+                db,
+                eventId: after.eventId,
+                saleId: sale.id,
+                receiptToken: after.receiptToken,
+                contact: {
+                  name: contact.name ?? "Cliente",
+                  email: contact.email,
+                },
+              }).catch((err) => {
+                console.error("[process-brick] Receipt email failed:", err)
+              })
+            }
+          }
         }
         return c.json({ success: true, status: 'approved' })
       }
 
       return c.json({ success: true, payment_id: payment.id, status: payment.status })
     } catch (error) {
-      
+      // El catch vacío anterior dejaba el request colgado (el Brick quedaba en loading
+      // eterno). Tarea 2.2: responder siempre para que el client pueda mostrar el error.
+      console.error("[process-brick] Error al procesar el pago:", error)
+      return c.json({ success: false, error: "Error al procesar el pago" }, 500)
     }
   })

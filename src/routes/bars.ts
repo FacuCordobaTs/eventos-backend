@@ -2,7 +2,18 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
+import {
+  and,
+  asc,
+  eq,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+  type TablesRelationalConfig,
+} from "drizzle-orm"
+import type { MySql2Transaction } from "drizzle-orm/mysql2"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import {
@@ -14,18 +25,22 @@ import {
   eventProducts,
   events,
   inventoryItems,
+  pickupOrders,
   productCategories,
   productRecipes,
   products,
+  saleItems,
   sales,
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import { pickupItemsWithNames } from "../lib/pickup-items"
 import { InsufficientStockError } from "./inventory"
 import {
   recipeStockDeduction,
   stockAllocatedToBaseUnits,
+  type ProductSaleType,
 } from "../lib/inventory-deduction"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
@@ -79,6 +94,161 @@ async function requireEventForTenant(
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
   return row ?? null
+}
+
+/** Tx de `db.transaction()` — mismo truco de tipado que `pickupItemsWithNames` en public.ts. */
+type Tx = MySql2Transaction<Record<string, never>, TablesRelationalConfig>
+
+/** Una línea de descuento de stock: producto + cuántas unidades + tipo de venta. */
+type DeductionLine = { productId: string; quantity: number; saleType: ProductSaleType }
+
+/**
+ * Descuenta stock de la barra por receta dentro de la transacción abierta, UNA vez por
+ * producto (cantidad agregada de la línea). Compartido por el canje 1×1 (`redeem`) y la
+ * entrega de pedidos (`deliver`): entregar 2 fernets de un pedido descuenta exactamente lo
+ * mismo que canjear 2 QRs individuales (un Fernet descuenta Coca y Alcohol). Lanza
+ * `InsufficientStockError` si no alcanza. Devuelve los inventoryItemIds que cambiaron.
+ */
+async function deductRecipeStock(
+  tx: Tx,
+  params: { tenantId: string; eventId: string; barId: string },
+  lines: DeductionLine[]
+): Promise<string[]> {
+  const changedItemIds: string[] = []
+  for (const line of lines) {
+    const recipes = await tx
+      .select()
+      .from(productRecipes)
+      .where(eq(productRecipes.productId, line.productId))
+
+    const recipeInvIds = [...new Set(recipes.map((r) => r.inventoryItemId))]
+    const invRows =
+      recipeInvIds.length === 0
+        ? []
+        : await tx
+            .select()
+            .from(inventoryItems)
+            .where(
+              and(
+                inArray(inventoryItems.id, recipeInvIds),
+                eq(inventoryItems.tenantId, params.tenantId)
+              )
+            )
+    const invById = new Map(invRows.map((i) => [i.id, i]))
+
+    for (const r of recipes) {
+      const item = invById.get(r.inventoryItemId)
+      if (!item) continue
+      const deduct = recipeStockDeduction(
+        r.quantityUsed,
+        line.quantity,
+        line.saleType,
+        item
+      )
+      if (!deduct.gt(dec(0))) continue
+
+      const [evRow] = await tx
+        .select()
+        .from(eventInventory)
+        .where(
+          and(
+            eq(eventInventory.eventId, params.eventId),
+            eq(eventInventory.inventoryItemId, r.inventoryItemId),
+            eq(eventInventory.tenantId, params.tenantId)
+          )
+        )
+        .limit(1)
+      const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
+
+      const [sumR] = await tx
+        .select({
+          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+        })
+        .from(barInventory)
+        .innerJoin(bars, eq(barInventory.barId, bars.id))
+        .where(
+          and(
+            eq(bars.eventId, params.eventId),
+            eq(bars.tenantId, params.tenantId),
+            eq(barInventory.tenantId, params.tenantId),
+            eq(barInventory.inventoryItemId, r.inventoryItemId)
+          )
+        )
+
+      const sumAll = decFromDb(sumR?.s ?? "0")
+      const [bRow] = await tx
+        .select()
+        .from(barInventory)
+        .where(
+          and(
+            eq(barInventory.barId, params.barId),
+            eq(barInventory.inventoryItemId, r.inventoryItemId),
+            eq(barInventory.tenantId, params.tenantId)
+          )
+        )
+        .limit(1)
+      const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
+
+      if (!evRow) {
+        if (deduct.gt(barAvail)) {
+          throw new InsufficientStockError(
+            "Stock insuficiente",
+            r.inventoryItemId,
+            item.name
+          )
+        }
+        if (bRow) {
+          await tx
+            .update(barInventory)
+            .set({ currentStock: decToDb(barAvail.minus(deduct)) })
+            .where(
+              and(
+                eq(barInventory.id, bRow.id),
+                eq(barInventory.tenantId, params.tenantId)
+              )
+            )
+        }
+        continue
+      }
+
+      const unalloc = cap.minus(sumAll)
+      if (deduct.gt(barAvail.plus(unalloc))) {
+        throw new InsufficientStockError(
+          "Stock insuficiente",
+          r.inventoryItemId,
+          item.name
+        )
+      }
+
+      const fromBar = deduct.lte(barAvail) ? deduct : barAvail
+      const newCap = cap.minus(deduct)
+      await tx
+        .update(eventInventory)
+        .set({ stockAllocated: decToDb(newCap) })
+        .where(
+          and(
+            eq(eventInventory.id, evRow.id),
+            eq(eventInventory.tenantId, params.tenantId)
+          )
+        )
+
+      if (bRow && fromBar.gt(0)) {
+        const newBar = barAvail.minus(fromBar)
+        await tx
+          .update(barInventory)
+          .set({ currentStock: decToDb(newBar) })
+          .where(
+            and(
+              eq(barInventory.id, bRow.id),
+              eq(barInventory.tenantId, params.tenantId)
+            )
+          )
+      }
+
+      changedItemIds.push(r.inventoryItemId)
+    }
+  }
+  return [...new Set(changedItemIds)]
 }
 
 export const barsRoute = new Hono()
@@ -633,142 +803,25 @@ export const barsRoute = new Hono()
           return { kind: "race_used" as const }
         }
 
-        const recipes = await tx
-          .select()
-          .from(productRecipes)
-          .where(eq(productRecipes.productId, row.consumption.productId))
-
-        const recipeInvIds = [...new Set(recipes.map((r) => r.inventoryItemId))]
-        const invRows =
-          recipeInvIds.length === 0
-            ? []
-            : await tx
-                .select()
-                .from(inventoryItems)
-                .where(
-                  and(
-                    inArray(inventoryItems.id, recipeInvIds),
-                    eq(inventoryItems.tenantId, tenantId)
-                  )
-                )
-        const invById = new Map(invRows.map((i) => [i.id, i]))
-        const saleType = row.productSaleType
-
-        for (const r of recipes) {
-          const item = invById.get(r.inventoryItemId)
-          if (!item) continue
-          const deduct = recipeStockDeduction(
-            r.quantityUsed,
-            1,
-            saleType,
-            item
-          )
-          if (!deduct.gt(dec(0))) continue
-
-          const [evRow] = await tx
-            .select()
-            .from(eventInventory)
-            .where(
-              and(
-                eq(eventInventory.eventId, bar.eventId),
-                eq(eventInventory.inventoryItemId, r.inventoryItemId),
-                eq(eventInventory.tenantId, tenantId)
-              )
-            )
-            .limit(1)
-          const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
-
-          const [sumR] = await tx
-            .select({
-              s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
-            })
-            .from(barInventory)
-            .innerJoin(bars, eq(barInventory.barId, bars.id))
-            .where(
-              and(
-                eq(bars.eventId, bar.eventId),
-                eq(bars.tenantId, tenantId),
-                eq(barInventory.tenantId, tenantId),
-                eq(barInventory.inventoryItemId, r.inventoryItemId)
-              )
-            )
-
-          const sumAll = decFromDb(sumR?.s ?? "0")
-          const [bRow] = await tx
-            .select()
-            .from(barInventory)
-            .where(
-              and(
-                eq(barInventory.barId, barId),
-                eq(barInventory.inventoryItemId, r.inventoryItemId),
-                eq(barInventory.tenantId, tenantId)
-              )
-            )
-            .limit(1)
-          const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
-
-          if (!evRow) {
-            if (deduct.gt(barAvail)) {
-              throw new InsufficientStockError(
-                "Stock insuficiente",
-                r.inventoryItemId,
-                item.name
-              )
-            }
-            if (bRow) {
-              await tx
-                .update(barInventory)
-                .set({ currentStock: decToDb(barAvail.minus(deduct)) })
-                .where(
-                  and(
-                    eq(barInventory.id, bRow.id),
-                    eq(barInventory.tenantId, tenantId)
-                  )
-                )
-            }
-            continue
-          }
-
-          const unalloc = cap.minus(sumAll)
-          if (deduct.gt(barAvail.plus(unalloc))) {
-            throw new InsufficientStockError(
-              "Stock insuficiente",
-              r.inventoryItemId,
-              item.name
-            )
-          }
-
-          const fromBar = deduct.lte(barAvail) ? deduct : barAvail
-          const newCap = cap.minus(deduct)
-          await tx
-            .update(eventInventory)
-            .set({ stockAllocated: decToDb(newCap) })
-            .where(
-              and(
-                eq(eventInventory.id, evRow.id),
-                eq(eventInventory.tenantId, tenantId)
-              )
-            )
-
-          if (bRow && fromBar.gt(0)) {
-            const newBar = barAvail.minus(fromBar)
-            await tx
-              .update(barInventory)
-              .set({ currentStock: decToDb(newBar) })
-              .where(
-                and(
-                  eq(barInventory.id, bRow.id),
-                  eq(barInventory.tenantId, tenantId)
-                )
-              )
-          }
-        }
+        // Descuento de stock por receta (cantidad 1: es UN QR individual). El mismo
+        // helper hace la entrega en lote de pedidos con la cantidad agregada por producto.
+        const inventoryItemIds = await deductRecipeStock(
+          tx,
+          { tenantId, eventId: bar.eventId, barId },
+          [
+            {
+              productId: row.consumption.productId,
+              quantity: 1,
+              saleType: row.productSaleType,
+            },
+          ]
+        )
 
         return {
           kind: "ok" as const,
           productName: row.productName,
           eventId: bar.eventId,
-          inventoryItemIds: recipes.map((r) => r.inventoryItemId),
+          inventoryItemIds,
         }
         })
       } catch (e) {
@@ -818,3 +871,298 @@ export const barsRoute = new Hono()
       })
     }
   )
+  // Pedido de retiro (tarea 4.2): la tablet del barman ve la lista antes de entregar.
+  // El QR del pedido codifica el token; sin auth el client puede verlo (GET público en
+  // public.ts), acá está scoped a la barra del evento del pedido.
+  .get("/:barId/pickups/:token", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const [bar] = await db
+      .select()
+      .from(bars)
+      .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+      .limit(1)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+
+    const [order] = await db
+      .select()
+      .from(pickupOrders)
+      .where(eq(pickupOrders.token, token))
+      .limit(1)
+    if (!order) {
+      return c.json({ error: "Pedido no encontrado" }, 404)
+    }
+    if (order.eventId !== bar.eventId) {
+      return c.json({ error: "Este pedido no pertenece a este evento" }, 400)
+    }
+
+    const items = await pickupItemsWithNames(db, order.itemsJson)
+    return c.json({
+      token: order.token,
+      status: order.status,
+      createdAt: order.createdAt ?? null,
+      deliveredAt: order.deliveredAt ?? null,
+      items,
+    })
+  })
+  // Entrega de pedido de retiro (tarea 4.2): el barman escanea el QR del pedido, ve la
+  // lista en pantalla y toca "Entregado". Transaccional: valida que el pedido esté PENDING
+  // y que TODAS sus consumiciones sigan PENDING y pertenezcan al evento de la barra, marca
+  // todas REDEEMED, descuenta stock por receta UNA vez por producto (cantidad agregada) y
+  // responde el detalle para el overlay "SERVIR 2× Fernet, 1× Gancia". El pedido queda
+  // DELIVERED con `deliveredBy` (lo ve el client en GET /pickups/:token). El canje 1×1
+  // (`redeem`) sigue igual para QRs individuales.
+  .post("/:barId/pickups/:token/deliver", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    let result: {
+      kind:
+        | "no_bar"
+        | "no_order"
+        | "already_delivered"
+        | "wrong_event"
+        | "race_used"
+        | "ok"
+      items?: { productId: string; productName: string; quantity: number }[]
+      totalAmount?: string
+      eventId?: string
+      inventoryItemIds?: string[]
+    }
+    try {
+      result = await db.transaction(async (tx) => {
+        const [bar] = await tx
+          .select()
+          .from(bars)
+          .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+          .limit(1)
+        if (!bar) {
+          return { kind: "no_bar" as const }
+        }
+
+        const [order] = await tx
+          .select()
+          .from(pickupOrders)
+          .where(eq(pickupOrders.token, token))
+          .limit(1)
+        if (!order) {
+          return { kind: "no_order" as const }
+        }
+        if (order.status !== "PENDING") {
+          return { kind: "already_delivered" as const }
+        }
+        if (order.eventId !== bar.eventId) {
+          return { kind: "wrong_event" as const }
+        }
+
+        const items = order.itemsJson ?? []
+        if (items.length === 0) {
+          return { kind: "no_order" as const }
+        }
+
+        const consumptionIds = items.map((i) => i.consumptionId)
+        const consRows = await tx
+          .select()
+          .from(digitalConsumptions)
+          .where(
+            and(
+              inArray(digitalConsumptions.id, consumptionIds),
+              eq(digitalConsumptions.tenantId, tenantId)
+            )
+          )
+
+        if (consRows.length !== consumptionIds.length) {
+          return { kind: "race_used" as const }
+        }
+        if (consRows.some((r) => r.eventId !== bar.eventId)) {
+          return { kind: "wrong_event" as const }
+        }
+        if (consRows.some((r) => r.status !== "PENDING")) {
+          return { kind: "race_used" as const }
+        }
+
+        // Marcar todas REDEEMED (update condicional: si otra entrega concurrente del mismo
+        // pedido se adelantó, las filas que ya no están PENDING quedan sin tocar y la
+        // verificación de abajo lo detecta → rollback).
+        for (const r of consRows) {
+          await tx
+            .update(digitalConsumptions)
+            .set({
+              status: "REDEEMED",
+              redeemedAt: new Date(),
+              redeemedBy: ctx.staff.id,
+            })
+            .where(
+              and(
+                eq(digitalConsumptions.id, r.id),
+                eq(digitalConsumptions.status, "PENDING")
+              )
+            )
+        }
+
+        const [verify] = await tx
+          .select({ n: sql<string>`count(*)` })
+          .from(digitalConsumptions)
+          .where(
+            and(
+              inArray(digitalConsumptions.id, consumptionIds),
+              ne(digitalConsumptions.status, "REDEEMED")
+            )
+          )
+        if (Number(verify?.n ?? 0) > 0) {
+          return { kind: "race_used" as const }
+        }
+
+        // Descuento de stock por receta, UNA vez por producto con la cantidad agregada.
+        const prodIds = [...new Set(items.map((i) => i.productId))]
+        const prodRows = await tx
+          .select({ id: products.id, saleType: products.saleType })
+          .from(products)
+          .where(inArray(products.id, prodIds))
+        const saleTypeById = new Map(prodRows.map((p) => [p.id, p.saleType]))
+        const qtyByProduct = new Map<string, number>()
+        for (const i of items) {
+          qtyByProduct.set(
+            i.productId,
+            (qtyByProduct.get(i.productId) ?? 0) + i.quantity
+          )
+        }
+        const inventoryItemIds = await deductRecipeStock(
+          tx,
+          { tenantId, eventId: bar.eventId, barId },
+          prodIds.map((pid) => ({
+            productId: pid,
+            quantity: qtyByProduct.get(pid) ?? 1,
+            saleType: saleTypeById.get(pid) ?? "GLASS",
+          }))
+        )
+
+        // Pedido entregado: queda DELIVERED con quién/cuándo (lo muestra el client).
+        await tx
+          .update(pickupOrders)
+          .set({
+            status: "DELIVERED",
+            deliveredAt: new Date(),
+            deliveredBy: ctx.staff.id,
+          })
+          .where(eq(pickupOrders.id, order.id))
+
+        // Total = precio cobrado al momento de la compra (`sale_items.price_at_time`),
+        // con fallback al precio actual del producto — mismo criterio que el comprobante.
+        const saleIds = [...new Set(consRows.map((r) => r.saleId))]
+        const priceRows = await tx
+          .select({
+            saleId: saleItems.saleId,
+            productId: saleItems.productId,
+            priceAtTime: saleItems.priceAtTime,
+          })
+          .from(saleItems)
+          .where(
+            and(
+              inArray(saleItems.saleId, saleIds),
+              inArray(saleItems.productId, prodIds)
+            )
+          )
+        const priceByKey = new Map(
+          priceRows.map((p) => [`${p.saleId}:${p.productId}`, String(p.priceAtTime)])
+        )
+        const productRows = await tx
+          .select({ id: products.id, name: products.name, price: products.price })
+          .from(products)
+          .where(inArray(products.id, prodIds))
+        const prodById = new Map(productRows.map((p) => [p.id, p]))
+        const saleIdByConsumption = new Map(
+          consRows.map((r) => [r.id, r.saleId])
+        )
+
+        let total = dec(0)
+        for (const i of items) {
+          const saleId = saleIdByConsumption.get(i.consumptionId)
+          const charged = saleId ? priceByKey.get(`${saleId}:${i.productId}`) : undefined
+          const unit =
+            charged != null
+              ? decFromDb(charged)
+              : decFromDb(prodById.get(i.productId)?.price ?? "0")
+          total = total.plus(unit.times(i.quantity))
+        }
+
+        const groupedItems = [...qtyByProduct.entries()].map(
+          ([productId, quantity]) => ({
+            productId,
+            productName: prodById.get(productId)?.name ?? "Producto",
+            quantity,
+          })
+        )
+
+        return {
+          kind: "ok" as const,
+          items: groupedItems,
+          totalAmount: decToDb(total),
+          eventId: bar.eventId,
+          inventoryItemIds,
+        }
+      })
+    } catch (e) {
+      if (e instanceof InsufficientStockError) {
+        return c.json(
+          {
+            error: `Stock insuficiente: ${e.inventoryItemName}`,
+            inventoryItemId: e.inventoryItemId,
+          },
+          409
+        )
+      }
+      throw e
+    }
+
+    if (result.kind === "no_bar") {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+    if (result.kind === "no_order") {
+      return c.json({ error: "Pedido no encontrado" }, 404)
+    }
+    if (result.kind === "already_delivered") {
+      return c.json({ error: "Este pedido ya fue entregado" }, 409)
+    }
+    if (result.kind === "wrong_event") {
+      return c.json({ error: "Este pedido no pertenece a este evento" }, 400)
+    }
+    if (result.kind === "race_used") {
+      return c.json({ error: "Algunas consumiciones ya fueron canjeadas" }, 409)
+    }
+
+    if (
+      result.kind === "ok" &&
+      result.inventoryItemIds &&
+      result.inventoryItemIds.length > 0
+    ) {
+      void emitCommittedStockDeltas(tenantId, result.eventId!, {
+        eventItemIds: result.inventoryItemIds,
+        barDeltas: { barId, itemIds: result.inventoryItemIds },
+      })
+    }
+
+    return c.json({
+      ok: true,
+      items: result.items,
+      totalAmount: result.totalAmount,
+      message: `Servir: ${(result.items ?? [])
+        .map((i) => `${i.quantity}× ${i.productName}`)
+        .join(", ")}`,
+    })
+  })

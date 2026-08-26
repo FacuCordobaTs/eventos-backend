@@ -26,6 +26,13 @@ export const tenants = mysqlTable('tenants', {
   cucuruApiKey: varchar('cucuru_api_key', { length: 255 }),
   cucuruCollectorId: varchar('cucuru_collector_id', { length: 255 }),
   cucuruEnabled: boolean('cucuru_enabled').default(false),
+  // Tarea 8.1 — WhatsApp (visión §2.3): credenciales de la Meta WhatsApp Cloud API
+  // por tenant (mismo patrón que Cucuru). El token es un System User Access Token.
+  whatsappPhone: varchar('whatsapp_phone', { length: 32 }), // ej. 5491155555555 (normalizado)
+  whatsappPhoneNumberId: varchar('whatsapp_phone_number_id', { length: 64 }),
+  whatsappToken: varchar('whatsapp_token', { length: 512 }),
+  whatsappTemplateName: varchar('whatsapp_template_name', { length: 64 }), // template del recordatorio (8.2); null = default
+  whatsappEnabled: boolean('whatsapp_enabled').default(false),
 });
 
 export const staff = mysqlTable(
@@ -44,6 +51,31 @@ export const staff = mysqlTable(
   (table) => ({
     tenantIdIdx: index('staff_tenant_id_idx').on(table.tenantId),
     emailTenantIdx: uniqueIndex('staff_email_tenant_unique').on(table.email, table.tenantId),
+  })
+);
+
+// -----------------------------------------------------------------------------
+// PROMOTORES (tarea 9.1) — personas que venden entradas a comisión por la productora
+// -----------------------------------------------------------------------------
+
+/**
+ * Tarea 9.1 — Promotores (visión §2.8: "cuánto vendió cada promotor"). A nivel TENANT
+ * (una productora tiene sus promotores, que trabajan en varios eventos), no por evento:
+ * `sales.promoter_id` y `tickets.promoter_id` los atribuyen por venta. Se "borran" con
+ * `isActive = false` (soft delete): las ventas históricas siguen referenciándolos.
+ */
+export const promoters = mysqlTable(
+  'promoters',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    name: varchar('name', { length: 255 }).notNull(),
+    phone: varchar('phone', { length: 32 }),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    tenantIdIdx: index('promoters_tenant_id_idx').on(table.tenantId),
   })
 );
 
@@ -73,9 +105,55 @@ export const customers = mysqlTable('customers', {
 // -----------------------------------------------------------------------------
 
 /**
+ * Tarea 10.1 — Cierre de caja POR PUESTO (visión §2.8: "Cómo cerró cada caja: cuánto debería
+ * haber y cuánto contó el cajero. Si falta, se ve dónde."). Cada entrada es el cajón físico de
+ * un puesto/barra: el `expected` es el efectivo (CASH) que debería haber según las `sales` de
+ * esa barra, `byMethod` desglosa lo esperado por método de pago (para "se ve dónde") y `counted`
+ * es lo que contó el cajero a mano (null = no se contó).
+ */
+export type CashClosingEntry = {
+  /** null = caja de puerta: ventas sin puesto asignado (cargas de saldo en caja, etc.). */
+  barId: string | null
+  barName: string
+  /** Efectivo esperado en ese cajón (ventas CASH de la barra). */
+  expected: string
+  /** Contado manual por el cajero; null = sin contar. */
+  counted: string | null
+  /** Desglose esperado por método de pago (solo métodos con ventas). */
+  byMethod: {
+    method: "CASH" | "CARD" | "MERCADOPAGO" | "TRANSFER" | "SALDO"
+    expected: string
+  }[]
+}
+
+/**
+ * Tarea 9.2 — Venta por promotor (visión §2.8: "cuánto vendió cada promotor"). Espejo del shape
+ * que devuelve `GET /events/:id/promoter-sales`: por promotor del tenant (entradas no canceladas
+ * valuadas al precio del tipo + ventas de barra completadas valuadas por líneas al precio de
+ * venta). El cierre (10.3) lo congela en `closingReport.byPromoter` — misma forma que la API.
+ */
+export type PromoterSalesRow = {
+  id: string
+  name: string
+  phone: string | null
+  isActive: boolean
+  ticketsCount: number
+  ticketRevenue: string
+  barSalesCount: number
+  barItemsCount: number
+  barRevenue: string
+  totalRevenue: string
+}
+
+/**
  * Liquidación congelada de la ceremonia de cierre (tarea 4.4). Todas las cifras monetarias van
  * como string decimal (misma convención que el resto de la API). `insumos` guarda el conteo real
  * vs. la estimación del sistema por insumo, para el reporte de merma. Ver `POST /events/:id/closing`.
+ * `cashes` (10.1) reemplaza al `cash` único: un cierre por puesto/barra. `cash` se mantiene como
+ * agregado a nivel evento por back-compat — los eventos cerrados antes de 10.1 no tienen `cashes`.
+ * Los desgloses de 10.3 (`incomeBySource`, `incomeByMethod`, `salesByHour`, `topProducts`,
+ * `barPerformance`, `byPromoter`) son snapshot congelado al cerrar — no rederivables — y todos
+ * opcionales por back-compat: los eventos cerrados antes de 10.3 no los tienen.
  */
 export type EventClosingReport = {
   closedAt: string
@@ -89,6 +167,53 @@ export type EventClosingReport = {
   netReal: string
   netProjected: string
   cash: { expected: string; counted: string } | null
+  /** Tarea 10.1 — Cierres de caja por puesto/barra (vacío = sin cajas con efectivo). */
+  cashes: CashClosingEntry[]
+  /**
+   * Tarea 10.2 — Pendiente de entrega (visión §2.8: "Cuánto vendiste y todavía no entregaste").
+   * Tragos vendidos y NO retirados: `digital_consumptions` en PENDING al cerrar. `quantity` =
+   * unidades sin canjear; `amount` = su valor al momento de la venta (plata cobrada que todavía
+   * se debe). Snapshot congelado al cerrar — el canje posterior no lo altera.
+   */
+  pendingDelivery: { quantity: number; amount: string }
+  /**
+   * Tarea 10.3 — Ingresos por ORIGEN (visión §2.8: "cuánto entró, separado por entradas / tragos
+   * / saldo"): `tickets` = entradas no canceladas valuadas al precio del tipo; `tragos` = ventas
+   * de barra completadas valuadas por líneas (incluye los tragos pagados con saldo — son tragos
+   * reales vendidos); `saldo` = cargas de saldo completadas (snapshot `kind: "deposit"` — plata
+   * que entró de verdad, sin items de producto); `total` = la suma.
+   */
+  incomeBySource?: {
+    tickets: string
+    tragos: string
+    saldo: string
+    total: string
+  }
+  /**
+   * Tarea 10.3 — Ingresos por MÉTODO de pago: ventas completadas agrupadas por método (incluye
+   * las cargas de saldo por su método: un depósito en efectivo es efectivo que entró). SALDO
+   * figura por transparencia pero no es plata nueva — es tragos pagados con saldo ya cargado.
+   */
+  incomeByMethod?: {
+    method: "CASH" | "CARD" | "MERCADOPAGO" | "TRANSFER" | "SALDO"
+    amount: string
+  }[]
+  /** Tarea 10.3 — Ventas completadas por hora (mismo shape que `analytics/dashboard`). */
+  salesByHour?: { hour: number; label: string; revenue: number }[]
+  /** Tarea 10.3 — Top productos por unidades vendidas (mismo shape que `bar-sales`). */
+  topProducts?: { productName: string; quantitySold: number; revenue: string }[]
+  /**
+   * Tarea 10.3 — Rendimiento por barra/puesto, ordenado por recaudado desc. `barId` null =
+   * "Puerta" (ventas sin puesto: caja de puerta, cargas de saldo en caja).
+   */
+  barPerformance?: {
+    barId: string | null
+    barName: string
+    revenue: string
+    salesCount: number
+  }[]
+  /** Tarea 10.3 — Ventas por promotor (mismo shape que `GET /events/:id/promoter-sales`). */
+  byPromoter?: PromoterSalesRow[]
   insumos: {
     inventoryItemId: string
     name: string
@@ -115,7 +240,6 @@ export const events = mysqlTable(
     location: varchar('location', { length: 255 }),
     ticketsAvailableFrom: timestamp('tickets_available_from'),
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
-    isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
     imageUrl: varchar('image_url', { length: 512 }),
     /** Diseño de la página pública del evento. GLASS = glassmorphism (default), MINIMAL = plano/minimalista. */
@@ -126,6 +250,20 @@ export const events = mysqlTable(
      * `EVENT_STATUSES` de ese módulo. Un evento nace en 'draft'.
      */
     status: mysqlEnum('status', ['draft', 'on_sale', 'live', 'closed']).notNull().default('draft'),
+    /**
+     * Tarea 1.3 — Reingreso (visión §2.4: "Si ya entró con esa entrada, avisa").
+     * Si está activado, la puerta deja re-validar un ticket USED: `POST /tickets/validate`
+     * registra otro pase IN en `gate_logs` y la respuesta avisa `reentry: true` (el scanner
+     * muestra "Ya entró — reingreso" pero deja pasar). False (default) = una entrada entra
+     * una sola vez y un ticket USED sigue dando 409.
+     */
+    allowReentry: boolean('allow_reentry').notNull().default(false),
+    /**
+     * Tarea 3.1 — Restricción de edad (visión §2.4: "Si el evento es +18, el DNI trae la fecha
+     * de nacimiento y lo valida solo"). Edad mínima para entrar (ej. 18) o null = sin restricción.
+     * El escáner de DNI del admin la usa para bloquear menores ANTES de validar el ticket.
+     */
+    ageRestriction: int('age_restriction'),
     /** Apertura PROGRAMADA: hora de puertas. Único trigger automático (on_sale → live). Null = sin programar. */
     doorsAt: timestamp('doors_at'),
     /** Efectiva: instante real en que la venta se abrió (draft → on_sale). */
@@ -134,6 +272,13 @@ export const events = mysqlTable(
     wentLiveAt: timestamp('went_live_at'),
     /** Efectiva: instante real en que el evento se cerró (live → closed). */
     closedAt: timestamp('closed_at'),
+    /**
+     * Tarea 8.2 — Idempotencia del recordatorio de WhatsApp (visión §2.3): el instante en que
+     * el runner (`lib/jobs-runner.ts`) envió el mensaje "1 h antes" a los compradores del
+     * evento. Null = todavía no se envió. El estado vive en DB (no en memoria): un restart
+     * del servicio no re-envía el recordatorio.
+     */
+    whatsappReminderSentAt: timestamp('whatsapp_reminder_sent_at'),
     /**
      * Tarea 4.4 — Liquidación de la ceremonia de cierre (spec §5 "Cierre"/"Cerrado").
      * Snapshot JSON congelado al cerrar: conteo real de insumos, estimación del sistema, costo
@@ -211,6 +356,8 @@ export const tickets = mysqlTable(
      */
     buyerDni: varchar('buyer_dni', { length: 20 }),
     customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+    /** Tarea 9.1 — Promotor que vendió esta entrada (venta manual/caja); null = venta directa. */
+    promoterId: varchar('promoter_id', { length: 36 }).references(() => promoters.id),
     scannedAt: timestamp('scanned_at'),
     scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
     createdAt: timestamp('created_at').defaultNow(),
@@ -223,8 +370,84 @@ export const tickets = mysqlTable(
     customerIdx: index('tickets_customer_id_idx').on(table.customerId),
     saleIdIdx: index('tickets_sale_id_idx').on(table.saleId),
     buyerDniIdx: index('tickets_event_buyer_dni_idx').on(table.eventId, table.buyerDni),
+    promoterIdx: index('tickets_promoter_id_idx').on(table.promoterId),
   })
 );
+
+// -----------------------------------------------------------------------------
+// 2.b ADMISIÓN (tarea 1.2) — registro de gente que no puede entrar
+// -----------------------------------------------------------------------------
+
+/**
+ * Tarea 1.2 — Blacklist / registro de admisión (visión §2.4): "Si está en la lista de gente que
+ * no puede entrar, avisa con el motivo y la foto". Keyed por DNI (la identidad en puerta): la
+ * validación de una entrada (`POST /tickets/validate`) rechaza con motivo + foto cuando el
+ * `buyer_dni` del ticket tiene una entrada ACTIVA. La foto se sube a R2 (`photo_url`).
+ * Aditiva; un DNI puede tener varias filas (motivos distintos) — el chequeo usa cualquier
+ * fila activa.
+ */
+export const admissionBlacklist = mysqlTable(
+  'admission_blacklist',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    /** DNI de la persona — identidad en puerta (no necesita tener ticket). */
+    dni: varchar('dni', { length: 20 }).notNull(),
+    fullName: varchar('full_name', { length: 255 }),
+    /** Foto de la persona (R2). Nullable: el alta no exige foto. */
+    photoUrl: varchar('photo_url', { length: 512 }),
+    /** Motivo de la entrada en la lista. Se muestra en puerta. */
+    reason: varchar('reason', { length: 512 }).notNull(),
+    isActive: boolean('is_active').notNull().default(true),
+    /** Staff que cargó la entrada. */
+    createdBy: varchar('created_by', { length: 36 }).references(() => staff.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventTenantIdx: index('admission_blacklist_event_tenant_idx').on(table.eventId, table.tenantId),
+    eventDniIdx: index('admission_blacklist_event_dni_idx').on(table.eventId, table.dni),
+  })
+);
+
+// -----------------------------------------------------------------------------
+// 2.c PUERTA (tarea 1.3) — reingreso y registro de pases
+// -----------------------------------------------------------------------------
+
+/**
+ * Tarea 1.3 — Registro de pases de puerta (visión §2.4): "Si ya entró con esa entrada, avisa".
+ * Cada pase (IN/OUT) de una entrada queda acá — NO altera el estado del ticket: es el detalle
+ * de quién pasó, cuándo y con qué entrada, para el reingreso y el conteo de gente.
+ * `POST /tickets/validate` registra el IN del primer ingreso (junto al USED) y, cuando el
+ * evento tiene `allowReentry`, un ticket USED se re-valida registrando otro IN y devolviendo
+ * `reentry: true`. El OUT lo registra el scanner al salir (`POST /tickets/out`). El conteo de
+ * pases del ticket sale de contar las filas IN por `ticket_id`.
+ */
+export const gateLogs = mysqlTable(
+  'gate_logs',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    ticketId: varchar('ticket_id', { length: 36 }).notNull().references(() => tickets.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    /** IN = ingreso (primer pase y cada reingreso), OUT = salida registrada desde el scanner. */
+    action: mysqlEnum('action', ['IN', 'OUT']).notNull(),
+    /** Staff que escaneó el pase. */
+    scannedBy: varchar('scanned_by', { length: 36 }).references(() => staff.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    ticketIdx: index('gate_logs_ticket_idx').on(table.ticketId),
+    eventTenantIdx: index('gate_logs_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
+
+// Tarea 7.1 — Tragos de regalo de una cortesía: qué consumiciones emite el canje además de la
+// entrada. `quantity` es por producto; el canje crea UNA `digitalConsumption` por unidad.
+export type CourtesyDrinkLine = {
+  productId: string
+  quantity: number
+}
 
 // Cortesías / invitaciones (spec §4.2): "links nominados que emiten una entrada,
 // contados aparte". Cada fila es una invitación a nombre de una persona; su `token`
@@ -249,7 +472,17 @@ export const courtesies = mysqlTable(
     status: mysqlEnum('status', ['PENDING', 'REDEEMED', 'REVOKED']).notNull().default('PENDING'),
     // Entrada emitida al canjear. Null hasta que se canjea.
     ticketId: varchar('ticket_id', { length: 36 }).references(() => tickets.id),
+    // Tragos de regalo (tarea 7.1): [{productId, quantity}] de consumiciones que el canje
+    // emite además de la entrada. Null = invitación solo con entrada (como antes).
+    drinkLines: json('drink_lines').$type<CourtesyDrinkLine[] | null>(),
+    // Sale de $0 (source WEB, sin sale_items) que ancla las digital_consumptions de los tragos
+    // de regalo (la FK `digital_consumptions.sale_id` es NOT NULL y el canje 1×1 en barra la
+    // joinnea contra `sales`). La sale de $0 no aporta recaudación: el cierre suma
+    // sale_items × precio y el total CASH. Null hasta que se canjea una cortesía con tragos.
+    drinkSaleId: varchar('drink_sale_id', { length: 36 }).references(() => sales.id),
     redeemedAt: timestamp('redeemed_at'),
+    // Última vez que se envió la invitación por email (tarea 7.3). Null = no enviada.
+    inviteSentAt: timestamp('invite_sent_at'),
     // Staff que la creó (opcional).
     createdBy: varchar('created_by', { length: 36 }).references(() => staff.id),
     createdAt: timestamp('created_at').defaultNow(),
@@ -588,6 +821,12 @@ export const productRecipes = mysqlTable('product_recipes', {
 // -----------------------------------------------------------------------------
 
 export type GuestCheckoutSnapshotJson = {
+  /**
+   * Tarea 6.1 — Discrimina el tipo de venta PENDING que cumple el webhook: `checkout` (default,
+   * las sales viejas no lo tienen) = compra de entradas/tragos que emite tickets/consumos;
+   * `deposit` = carga de saldo (visión §2.7) que acredita `customer_balances` en vez de emitir.
+   */
+  kind?: "checkout" | "deposit"
   ticketLines: { ticketTypeId: string; quantity: number }[]
   drinkLines: { productId: string; quantity: number }[]
   contact: { name: string; email: string; phone: string; dni?: string }
@@ -602,10 +841,12 @@ export const sales = mysqlTable(
     barId: varchar('bar_id', { length: 36 }).references(() => bars.id),
     staffId: varchar('staff_id', { length: 36 }).references(() => staff.id), // Quién cobró
     customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+    /** Tarea 9.1 — Promotor que originó la venta (caja/POS); null = venta sin promotor. */
+    promoterId: varchar('promoter_id', { length: 36 }).references(() => promoters.id),
     receiptToken: varchar('receipt_token', { length: 36 }).notNull().unique(),
     source: mysqlEnum('source', ['POS', 'APP', 'WEB']).notNull().default('POS'),
     totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),
-    paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER']).notNull(),
+    paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER', 'SALDO']).notNull(),
     status: mysqlEnum('status', [
       'PENDING',
       'PAYMENT_FAILED',
@@ -625,6 +866,7 @@ export const sales = mysqlTable(
   (table) => ({
     barIdx: index('sales_bar_id_idx').on(table.barId),
     mpPreferenceIdx: index('sales_mp_preference_id_idx').on(table.mpPreferenceId),
+    promoterIdx: index('sales_promoter_id_idx').on(table.promoterId),
   })
 );
 
@@ -656,6 +898,110 @@ export const digitalConsumptions = mysqlTable('digital_consumptions', {
   redeemedBy: varchar('redeemed_by', { length: 36 }).references(() => staff.id),
   createdAt: timestamp('created_at').defaultNow(),
 });
+
+// -----------------------------------------------------------------------------
+// 4.c RETIRO EN BARRA (visión §2.5) — pedidos de retiro ("¿Qué te llevás ahora?")
+// -----------------------------------------------------------------------------
+
+export type PickupItemsJson = {
+  consumptionId: string
+  productId: string
+  quantity: number
+}[]
+
+// Pedido de retiro (tarea 4.1/4.2): el cliente elige qué tragos comprados y no canjeados se
+// lleva ahora, y el sistema le genera UN QR de pedido. La lista se guarda en `items_json`
+// ([{consumptionId, productId, quantity}]) y la barra la lee con el token del QR: el canje en
+// lote marca REDEEMED las consumiciones y descuenta stock una sola vez por producto.
+// Lo no retirado sigue PENDING en `digital_consumptions` — un pedido nunca "gasta" tragos.
+export const pickupOrders = mysqlTable(
+  'pickup_orders',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    customerId: varchar('customer_id', { length: 36 }).notNull().references(() => customers.id),
+    // Token del QR de pedido (el QR codifica este token). Único.
+    token: varchar('token', { length: 64 }).notNull().unique(),
+    status: mysqlEnum('status', ['PENDING', 'DELIVERED', 'CANCELLED']).notNull().default('PENDING'),
+    // Consumiciones del pedido, agrupadas por producto. Orden estable (por consumptionId) para
+    // poder comparar pedidos idénticos (idempotencia del POST /public/pickups).
+    itemsJson: json('items_json').$type<PickupItemsJson>(),
+    deliveredAt: timestamp('delivered_at'),
+    deliveredBy: varchar('delivered_by', { length: 36 }).references(() => staff.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventTenantIdx: index('pickup_orders_event_tenant_idx').on(table.eventId, table.tenantId),
+    customerIdx: index('pickup_orders_customer_idx').on(table.customerId),
+    statusIdx: index('pickup_orders_status_idx').on(table.status),
+  })
+);
+
+// -----------------------------------------------------------------------------
+// 4.d SALDO (visión §2.7) — plata cargada dentro del evento, asociada al DNI
+// -----------------------------------------------------------------------------
+
+/**
+ * Tarea 6.1 — Saldo vigente del cliente dentro de un evento (visión §2.7: "plata cargada dentro
+ * del evento, asociada a su DNI"). Una fila por (customer, evento) — único. Se carga desde el
+ * celular (WEB), en la caja física (CAJA) o de regalo por la productora (REGALO); se gasta al
+ * pagar con saldo (CONSUMO). Cada movimiento queda en `balance_movements`; este saldo es la
+ * suma de sus cargas menos sus gastos.
+ */
+export const customerBalances = mysqlTable(
+  'customer_balances',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    customerId: varchar('customer_id', { length: 36 })
+      .notNull()
+      .references(() => customers.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    amount: decimal('amount', { precision: 10, scale: 2 }).notNull().default('0'),
+    updatedAt: timestamp('updated_at').onUpdateNow(),
+  },
+  (table) => ({
+    customerEventUnique: uniqueIndex('customer_balances_customer_event_unique').on(
+      table.customerId,
+      table.eventId
+    ),
+    eventTenantIdx: index('customer_balances_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
+
+/**
+ * Tarea 6.1 — Registro de cada movimiento de saldo (auditoría y reporte). `type` distingue el
+ * origen: WEB (carga desde el celular, acreditada por webhook MP/Cucuru), CAJA (carga en
+ * efectivo/tarjeta en la caja física), REGALO (cortesía de la productora, sin plata que entre)
+ * y CONSUMO (gasto al pagar con saldo). `paymentMethod` es el medio de la carga (null en REGALO)
+ * y `saleId` ata el movimiento a la venta que lo originó.
+ */
+export const balanceMovements = mysqlTable(
+  'balance_movements',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    customerId: varchar('customer_id', { length: 36 })
+      .notNull()
+      .references(() => customers.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    type: mysqlEnum('type', ['WEB', 'CAJA', 'REGALO', 'CONSUMO']).notNull(),
+    paymentMethod: mysqlEnum('payment_method', ['CASH', 'CARD', 'MERCADOPAGO', 'TRANSFER', 'SALDO']),
+    amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+    staffId: varchar('staff_id', { length: 36 }).references(() => staff.id),
+    saleId: varchar('sale_id', { length: 36 }).references(() => sales.id),
+    note: varchar('note', { length: 255 }),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    customerEventIdx: index('balance_movements_customer_event_idx').on(
+      table.customerId,
+      table.eventId
+    ),
+    eventTenantIdx: index('balance_movements_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
 
 export const accountPool = mysqlTable("account_pool", {
   id: int("id").primaryKey().autoincrement(),

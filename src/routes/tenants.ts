@@ -9,6 +9,13 @@ import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff } from "../lib/staff-dto"
 import { configurarWebhookTenant } from "../lib/cucuru-service"
+import {
+  normalizeWhatsAppPhone,
+  REMINDER_TEMPLATE,
+  sendWhatsAppTemplateMessage,
+  TEST_TEMPLATE,
+  validateWhatsAppConnection,
+} from "../lib/whatsapp-service"
 
 const setupSchema = z.object({
   name: z.string().min(1).max(255),
@@ -17,6 +24,17 @@ const setupSchema = z.object({
 const cucuruPutSchema = z.object({
   cucuruApiKey: z.string().min(1).max(255),
   cucuruCollectorId: z.string().min(1).max(255),
+})
+
+const whatsappPutSchema = z.object({
+  whatsappPhone: z.string().min(8).max(32),
+  whatsappPhoneNumberId: z.string().min(1).max(64),
+  whatsappToken: z.string().min(10).max(512),
+  whatsappTemplateName: z.string().max(64).optional(),
+})
+
+const whatsappTestSchema = z.object({
+  to: z.string().min(8).max(32),
 })
 
 export const tenantsRoute = new Hono()
@@ -154,6 +172,145 @@ export const tenantsRoute = new Hono()
         updatedAt: new Date(),
       })
       .where(eq(tenants.id, ctx.staff.tenantId!))
+
+    return c.json({ ok: true as const })
+  })
+  // Tarea 8.1 — WhatsApp (visión §2.3): estado de la conexión. Nunca expone el token.
+  .get("/me/whatsapp", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ hasWhatsAppConfigured: false as const })
+    }
+
+    const db = drizzle(pool)
+    const [row] = await db
+      .select({
+        whatsappEnabled: tenants.whatsappEnabled,
+        whatsappPhone: tenants.whatsappPhone,
+        whatsappTemplateName: tenants.whatsappTemplateName,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .limit(1)
+
+    const hasWhatsAppConfigured = Boolean(
+      row?.whatsappEnabled &&
+        row.whatsappPhone != null &&
+        row.whatsappPhone.trim() !== ""
+    )
+
+    return c.json({
+      hasWhatsAppConfigured,
+      whatsappPhone: row?.whatsappPhone ?? null,
+      whatsappTemplateName:
+        row?.whatsappTemplateName?.trim() || REMINDER_TEMPLATE,
+    })
+  })
+  // Tarea 8.1 — Conecta el número de WhatsApp Business. Valida contra Meta antes de
+  // guardar: credenciales incorrectas = la conexión no se activa.
+  .put("/me/whatsapp", authMiddleware, zValidator("json", whatsappPutSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ error: "Productora no configurada" }, 400)
+    }
+
+    const body = c.req.valid("json")
+    const token = body.whatsappToken.trim()
+    const phoneNumberId = body.whatsappPhoneNumberId.trim()
+    const phone = normalizeWhatsAppPhone(body.whatsappPhone)
+    if (!phone) {
+      return c.json({ error: "El número de WhatsApp no es válido." }, 400)
+    }
+
+    const validation = await validateWhatsAppConnection(token, phoneNumberId)
+    if (!validation.ok) {
+      const reason =
+        validation.error?.includes("invalid") ||
+        validation.error?.includes("token") ||
+        validation.error?.includes("expired")
+          ? "El token o el ID de número fueron rechazados por Meta. Revisá las credenciales del System User."
+          : `Meta no aceptó la conexión (${validation.error ?? "error desconocido"}).`
+      return c.json({ error: reason }, 400)
+    }
+
+    const db = drizzle(pool)
+    await db
+      .update(tenants)
+      .set({
+        whatsappPhone: phone,
+        whatsappPhoneNumberId: phoneNumberId,
+        whatsappToken: token,
+        whatsappTemplateName: body.whatsappTemplateName?.trim() || null,
+        whatsappEnabled: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(tenants.id, ctx.staff.tenantId!))
+
+    return c.json({ ok: true as const })
+  })
+  // Tarea 8.1 — Mensaje de prueba: manda el template `crow_prueba` al número indicado.
+  .post("/me/whatsapp/test", authMiddleware, zValidator("json", whatsappTestSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ error: "Productora no configurada" }, 400)
+    }
+
+    const db = drizzle(pool)
+    const [row] = await db
+      .select({
+        whatsappEnabled: tenants.whatsappEnabled,
+        whatsappToken: tenants.whatsappToken,
+        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .limit(1)
+
+    if (
+      !row?.whatsappEnabled ||
+      !row.whatsappToken?.trim() ||
+      !row.whatsappPhoneNumberId?.trim()
+    ) {
+      return c.json({ error: "WhatsApp no está conectado. Conectalo primero." }, 400)
+    }
+
+    const to = normalizeWhatsAppPhone(c.req.valid("json").to)
+    if (!to) {
+      return c.json({ error: "El número de destino no es válido." }, 400)
+    }
+
+    const result = await sendWhatsAppTemplateMessage({
+      token: row.whatsappToken,
+      phoneNumberId: row.whatsappPhoneNumberId,
+      to,
+      templateName: TEST_TEMPLATE,
+      bodyParameters: [ctx.staff.name],
+    })
+    if (!result.ok) {
+      return c.json(
+        { error: `Meta rechazó el mensaje de prueba (${result.error}).` },
+        400
+      )
+    }
+
+    return c.json({ ok: true as const, messageId: result.messageId })
+  })
+  // Tarea 8.1 — Desconecta el número (apaga el envío; las credenciales se conservan).
+  .delete("/me/whatsapp", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId
+    if (tenantId == null || tenantId === "") {
+      return c.json({ error: "Productora no configurada" }, 400)
+    }
+
+    const db = drizzle(pool)
+    await db
+      .update(tenants)
+      .set({ whatsappEnabled: false, updatedAt: new Date() })
+      .where(eq(tenants.id, tenantId))
 
     return c.json({ ok: true as const })
   })

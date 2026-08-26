@@ -4,6 +4,7 @@ import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
+  admissionBlacklist,
   barInventory,
   barProducts,
   bars,
@@ -15,9 +16,11 @@ import {
   eventExpenses,
   events,
   type EventClosingReport,
+  type PromoterSalesRow,
   eventStaff,
   inventoryItems,
   products,
+  promoters,
   purchases,
   saleItems,
   sales,
@@ -31,10 +34,12 @@ import {
   and,
   asc,
   count,
+  countDistinct,
   desc,
   eq,
   exists,
   inArray,
+  isNotNull,
   isNull,
   ne,
   or,
@@ -42,7 +47,10 @@ import {
   sum,
 } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
+import { randomUUID } from "node:crypto"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { findOrCreateCustomer } from "../lib/client-checkout"
+import { creditBalance, getBalance } from "../lib/balance"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
 import {
@@ -56,6 +64,7 @@ import {
   stockAllocatedToBaseUnits,
 } from "../lib/inventory-deduction"
 import { findOrCreateInventoryItemByName } from "./inventory"
+import { sendCourtesyInvitationEmail } from "../lib/send-courtesy-invitation-email"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
   deleteFileByKey,
@@ -101,6 +110,10 @@ const patchEventSchema = z
       ])
       .optional(),
     designType: z.enum(["GLASS", "MINIMAL"]).optional(),
+    // Tarea 1.3 — Reingreso: bool del evento; la UI de puerta (3.2) lo edita desde el panel.
+    allowReentry: z.boolean().optional(),
+    // Tarea 3.1 — Restricción de edad (+18): int de edad mínima o null para quitar.
+    ageRestriction: z.union([z.number().int().min(0).max(120), z.null()]).optional(),
   })
   .superRefine((data, ctx) => {
     const check = (key: "ticketsAvailableFrom" | "consumptionsAvailableFrom") => {
@@ -121,7 +134,9 @@ const patchEventSchema = z
       data.ticketsAvailableFrom === undefined &&
       data.consumptionsAvailableFrom === undefined &&
       data.slug === undefined &&
-      data.designType === undefined
+      data.designType === undefined &&
+      data.allowReentry === undefined &&
+      data.ageRestriction === undefined
     ) {
       ctx.addIssue({
         code: "custom",
@@ -172,6 +187,16 @@ const createCourtesySchema = z.object({
   ticketTypeId: z.string().min(1).max(36),
   guestName: z.string().min(1).max(255),
   guestEmail: z.union([z.string().email(), z.literal(""), z.null()]).optional(),
+  // Tragos de regalo (tarea 7.1): opcional; [] o ausente = invitación solo con entrada.
+  drinkLines: z
+    .array(
+      z.object({
+        productId: z.string().min(1).max(36),
+        quantity: z.number().int().min(1).max(999),
+      })
+    )
+    .max(50)
+    .optional(),
 })
 
 const toggleEventProductSchema = z.object({
@@ -318,7 +343,10 @@ async function countRedeemedCourtesies(
   return Number(row?.n ?? 0)
 }
 
-function sanitizeCourtesy(row: typeof courtesies.$inferSelect) {
+function sanitizeCourtesy(
+  row: typeof courtesies.$inferSelect,
+  createdByName: string | null = null
+) {
   return {
     id: row.id,
     eventId: row.eventId,
@@ -328,7 +356,13 @@ function sanitizeCourtesy(row: typeof courtesies.$inferSelect) {
     token: row.token,
     status: row.status,
     ticketId: row.ticketId ?? null,
+    // Tragos de regalo (tarea 7.1): [{productId, quantity}]; [] si la invitación es solo entrada.
+    drinkLines: Array.isArray(row.drinkLines) ? row.drinkLines : [],
     redeemedAt: row.redeemedAt ? row.redeemedAt.toISOString() : null,
+    // Tarea 7.3 — estado del envío de la invitación por email.
+    inviteSentAt: row.inviteSentAt ? row.inviteSentAt.toISOString() : null,
+    // Tarea 7.3 — "quién invitó a quién" (nombre del staff que la creó).
+    createdByName,
     createdAt: row.createdAt ? row.createdAt.toISOString() : null,
   }
 }
@@ -341,7 +375,6 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     slug: row.slug ?? null,
     date: row.date,
     location: row.location,
-    isActive: row.isActive,
     status: row.status ?? "draft",
     doorsAt: row.doorsAt ? row.doorsAt.toISOString() : null,
     salesOpenedAt: row.salesOpenedAt ? row.salesOpenedAt.toISOString() : null,
@@ -351,6 +384,8 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     createdAt: row.createdAt,
     imageUrl: row.imageUrl ?? null,
     designType: row.designType ?? "GLASS",
+    allowReentry: row.allowReentry ?? false,
+    ageRestriction: row.ageRestriction ?? null,
     ticketsAvailableFrom: row.ticketsAvailableFrom
       ? row.ticketsAvailableFrom.toISOString()
       : null,
@@ -367,6 +402,27 @@ const EVENT_IMAGE_ALLOWED_TYPES = new Set([
   "image/webp",
   "image/gif",
 ])
+
+// Tarea 1.2 — blacklist: el DNI es la identidad en puerta; motivo obligatorio, resto opcional.
+const createBlacklistEntrySchema = z.object({
+  dni: z.string().min(6).max(20),
+  fullName: z.string().max(255).optional(),
+  reason: z.string().min(1).max(512),
+})
+
+// PATCH: todos opcionales; `fullName`/`photoUrl` se limpian con null (misma convención que
+// el resto del patch de evento).
+const patchBlacklistEntrySchema = z
+  .object({
+    dni: z.string().min(6).max(20).optional(),
+    fullName: z.union([z.string().max(255), z.null()]).optional(),
+    photoUrl: z.union([z.string().max(512), z.null()]).optional(),
+    reason: z.string().min(1).max(512).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .refine((d) => Object.keys(d).length > 0, {
+    message: "No hay campos para actualizar",
+  })
 
 function safeEventUploadFilename(name: string): string {
   const base = name
@@ -397,6 +453,22 @@ async function requireEventForTenant(
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
   return ev ?? null
+}
+
+// Tarea 1.2 — blacklist / registro de admisión. `fullName`, `photoUrl` y `isActive` nullable:
+// el alta exige solo DNI + motivo; la foto se adjunta después con `POST .../:entryId/image`.
+function sanitizeBlacklistEntry(row: typeof admissionBlacklist.$inferSelect) {
+  return {
+    id: row.id,
+    eventId: row.eventId,
+    dni: row.dni,
+    fullName: row.fullName ?? null,
+    photoUrl: row.photoUrl ?? null,
+    reason: row.reason,
+    isActive: row.isActive,
+    createdBy: row.createdBy ?? null,
+    createdAt: row.createdAt ? row.createdAt.toISOString() : null,
+  }
 }
 
 /**
@@ -458,8 +530,133 @@ type ClosingInsumo = {
 type ClosingData = {
   income: { tickets: string; bar: string; gross: string }
   expenses: { operational: string; merchandisePurchased: string }
+  /** Agregado a nivel evento (back-compat con la caja única de la tarea 4.4). */
   cash: { expected: string; hasCashSales: boolean }
+  /** Tarea 10.1 — Cierres de caja por puesto/barra: esperado por método, contado a mano. */
+  cashes: {
+    barId: string | null
+    barName: string
+    expected: string
+    byMethod: {
+      method: "CASH" | "CARD" | "MERCADOPAGO" | "TRANSFER" | "SALDO"
+      expected: string
+    }[]
+  }[]
+  /** Tarea 10.2 — Pendiente de entrega (visión §2.8): consumiciones PENDING (compradas, no retiradas). */
+  pendingDelivery: { quantity: number; amount: string }
+  /** Tarea 10.3 — Ingresos por origen (entradas / tragos / saldo) — ver `EventClosingReport`. */
+  incomeBySource: { tickets: string; tragos: string; saldo: string; total: string }
+  /** Tarea 10.3 — Ingresos por método de pago (incluye cargas de saldo por su método; SALDO informativo). */
+  incomeByMethod: {
+    method: "CASH" | "CARD" | "MERCADOPAGO" | "TRANSFER" | "SALDO"
+    amount: string
+  }[]
+  /** Tarea 10.3 — Ventas completadas por hora (shape de `analytics/dashboard`). */
+  salesByHour: { hour: number; label: string; revenue: number }[]
+  /** Tarea 10.3 — Top productos por unidades vendidas (shape de `bar-sales`). */
+  topProducts: { productName: string; quantitySold: number; revenue: string }[]
+  /** Tarea 10.3 — Rendimiento por barra/puesto ordenado por recaudado desc (null = "Puerta"). */
+  barPerformance: {
+    barId: string | null
+    barName: string
+    revenue: string
+    salesCount: number
+  }[]
+  /** Tarea 10.3 — Ventas por promotor (shape de `/promoter-sales`, tarea 9.2). */
+  byPromoter: PromoterSalesRow[]
   insumos: ClosingInsumo[]
+}
+
+/**
+ * Tarea 9.2 / 10.3 — Ventas por promotor (visión §2.8: "cuánto vendió cada promotor").
+ * Compartida por `GET /events/:id/promoter-sales` y por el cierre (10.3), que la congela en
+ * `closingReport.byPromoter` (mismo shape — el reporte y la API no divergen). Los agregados
+ * salen de `tickets.promoter_id` (no canceladas, valuadas al precio del tipo) y de
+ * `sales.promoter_id` (completadas, valuadas por líneas al precio de venta). Entran TODOS los
+ * promotores del tenant: los que no vendieron en este evento figuran en cero (el soft delete
+ * de 9.1 conserva a los inactivos con su historial). Ordenados por total, desempate por nombre.
+ */
+async function computePromoterSales(
+  db: ReturnType<typeof drizzle>,
+  eventId: string,
+  tenantId: string
+): Promise<PromoterSalesRow[]> {
+  const [ticketRows, barRows, promoterRows] = await Promise.all([
+    db
+      .select({
+        promoterId: tickets.promoterId,
+        count: count(),
+        revenue: sql<string>`coalesce(sum(cast(${ticketTypes.price} as decimal(14,2))), 0)`,
+      })
+      .from(tickets)
+      .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+      .where(
+        and(
+          eq(tickets.eventId, eventId),
+          eq(tickets.tenantId, tenantId),
+          ne(tickets.status, "CANCELLED"),
+          isNotNull(tickets.promoterId),
+          eq(ticketTypes.eventId, eventId),
+          eq(ticketTypes.tenantId, tenantId)
+        )
+      )
+      .groupBy(tickets.promoterId),
+    db
+      .select({
+        promoterId: sales.promoterId,
+        salesCount: countDistinct(sales.id),
+        itemsCount: sum(saleItems.quantity),
+        revenue: sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED"),
+          isNotNull(sales.promoterId)
+        )
+      )
+      .groupBy(sales.promoterId),
+    db
+      .select({
+        id: promoters.id,
+        name: promoters.name,
+        phone: promoters.phone,
+        isActive: promoters.isActive,
+      })
+      .from(promoters)
+      .where(eq(promoters.tenantId, tenantId)),
+  ])
+
+  const ticketByPromoter = new Map(ticketRows.map((r) => [r.promoterId, r]))
+  const barByPromoter = new Map(barRows.map((r) => [r.promoterId, r]))
+
+  return promoterRows
+    .map((p) => {
+      const t = ticketByPromoter.get(p.id)
+      const b = barByPromoter.get(p.id)
+      const ticketRevenue = decFromDb(t?.revenue ?? "0")
+      const barRevenue = decFromDb(b?.revenue ?? "0")
+      return {
+        id: p.id,
+        name: p.name,
+        phone: p.phone,
+        isActive: p.isActive,
+        ticketsCount: Number(t?.count ?? 0),
+        ticketRevenue: decToDb(ticketRevenue),
+        barSalesCount: Number(b?.salesCount ?? 0),
+        barItemsCount: Number(b?.itemsCount ?? 0),
+        barRevenue: decToDb(barRevenue),
+        totalRevenue: decToDb(ticketRevenue.plus(barRevenue)),
+      }
+    })
+    .sort(
+      (a, b) =>
+        decFromDb(b.totalRevenue).cmp(decFromDb(a.totalRevenue)) ||
+        a.name.localeCompare(b.name)
+    )
 }
 
 /** Stock en base units (ml/g/unidad) → unidad contable (botellas/latas/unidades). */
@@ -492,9 +689,14 @@ async function computeClosingData(
     barRevenueRow,
     operationalRow,
     merchandiseRow,
-    cashRow,
+    cashRows,
+    depositRows,
+    hourlyRows,
+    topProductRows,
+    barNameRows,
     invRows,
     purchaseRows,
+    pendingDeliveryRow,
   ] = await Promise.all([
     db
       .select({
@@ -546,9 +748,36 @@ async function computeClosingData(
           sql`${eventExpenses.purchaseId} is not null`
         )
       ),
+    // Tarea 10.1 — Caja POR PUESTO: agrupa las ventas completadas por (barra, método). La
+    // barra null = caja de puerta (ventas sin puesto: cargas de saldo en caja, etc.). De acá
+    // sale el esperado por barra (CASH para el cajón, desglose por método para "se ve dónde")
+    // y, en 10.3, el rendimiento por barra y los ingresos por método (incluye las cargas de
+    // saldo por su método: un depósito en efectivo es efectivo que entró al cajón).
     db
       .select({
-        total: sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
+        barId: sales.barId,
+        paymentMethod: sales.paymentMethod,
+        total:
+          sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
+        salesCount: count(),
+      })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      )
+      .groupBy(sales.barId, sales.paymentMethod),
+    // Tarea 10.3 — Cargas de saldo completadas (snapshot `kind: "deposit"`, sin items de
+    // producto): plata que ENTRÓ de verdad y no es ni entrada ni trago — la tercera pata de
+    // `incomeBySource` (visión §2.8: "entradas / tragos / saldo").
+    db
+      .select({
+        paymentMethod: sales.paymentMethod,
+        total:
+          sql<string>`coalesce(sum(cast(${sales.totalAmount} as decimal(14,2))), 0)`,
       })
       .from(sales)
       .where(
@@ -556,8 +785,51 @@ async function computeClosingData(
           eq(sales.eventId, eventId),
           eq(sales.tenantId, tenantId),
           eq(sales.status, "COMPLETED"),
-          eq(sales.paymentMethod, "CASH")
+          sql`${sales.guestCheckoutSnapshot}->>'$.kind' = 'deposit'`
         )
+      )
+      .groupBy(sales.paymentMethod),
+    // Tarea 10.3 — Ventas por hora: todas las ventas COMPLETED (mismo criterio que
+    // `analytics/dashboard`), agrupadas en JS por hora local.
+    db
+      .select({
+        createdAt: sales.createdAt,
+        totalAmount: sales.totalAmount,
+      })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      ),
+    // Tarea 10.3 — Top productos (mismo shape que `bar-sales`): unidades y recaudado por
+    // producto; el reporte muestra el top 10 por unidades vendidas.
+    db
+      .select({
+        productName: products.name,
+        quantitySold: sum(saleItems.quantity),
+        revenue:
+          sql<string>`coalesce(sum(cast(${saleItems.quantity} as decimal(14,4)) * cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .innerJoin(products, eq(saleItems.productId, products.id))
+      .where(
+        and(
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, tenantId),
+          eq(sales.status, "COMPLETED"),
+          eq(products.tenantId, tenantId)
+        )
+      )
+      .groupBy(saleItems.productId, products.id, products.name),
+    db
+      .select({ id: bars.id, name: bars.name })
+      .from(bars)
+      .where(
+        and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId))
       ),
     db
       .select({
@@ -593,12 +865,89 @@ async function computeClosingData(
         and(eq(purchases.eventId, eventId), eq(purchases.tenantId, tenantId))
       )
       .groupBy(purchases.inventoryItemId),
+    // Tarea 10.2 — Pendiente de entrega: tragos vendidos y NO retirados. Cada consumición
+    // PENDING vale su precio al momento (join 1:1 con `sale_items` por saleId+productId: tanto
+    // el checkout web como el POS crean una consumición por unidad vendida). Es plata cobrada
+    // que todavía se debe.
+    db
+      .select({
+        quantity: count(digitalConsumptions.id),
+        amount:
+          sql<string>`coalesce(sum(cast(${saleItems.priceAtTime} as decimal(14,4))), 0)`,
+      })
+      .from(digitalConsumptions)
+      .innerJoin(
+        saleItems,
+        and(
+          eq(saleItems.saleId, digitalConsumptions.saleId),
+          eq(saleItems.productId, digitalConsumptions.productId)
+        )
+      )
+      .where(
+        and(
+          eq(digitalConsumptions.eventId, eventId),
+          eq(digitalConsumptions.tenantId, tenantId),
+          eq(digitalConsumptions.status, "PENDING")
+        )
+      ),
   ])
 
   const ticketDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
   const barDec = decFromDb(barRevenueRow[0]?.total ?? "0")
   const grossDec = ticketDec.plus(barDec)
-  const cashDec = decFromDb(cashRow[0]?.total ?? "0")
+
+  // Tarea 10.1 — Caja por puesto: agrupa las ventas COMPLETED por (barra, método) y arma un
+  // cierre por barra con efectivo esperado (el cajón). `barId` null = caja de puerta (ventas
+  // sin puesto: cargas de saldo en caja, etc.). En 10.3 el mismo mapa alimenta el rendimiento
+  // por barra (recaudado + cantidad de ventas por puesto).
+  const METHOD_ORDER = ["CASH", "CARD", "MERCADOPAGO", "TRANSFER", "SALDO"] as const
+  const barNameById = new Map(barNameRows.map((r) => [r.id, r.name]))
+  const byBar = new Map<
+    string,
+    {
+      barId: string | null
+      barName: string
+      byMethod: Map<string, ReturnType<typeof dec>>
+      salesCount: number
+    }
+  >()
+  for (const row of cashRows) {
+    const key = row.barId ?? ""
+    let entry = byBar.get(key)
+    if (!entry) {
+      entry = {
+        barId: row.barId,
+        barName: row.barId
+          ? barNameById.get(row.barId) ?? "Puesto"
+          : "Puerta",
+        byMethod: new Map(),
+        salesCount: 0,
+      }
+      byBar.set(key, entry)
+    }
+    entry.byMethod.set(row.paymentMethod, decFromDb(row.total))
+    entry.salesCount += Number(row.salesCount ?? 0)
+  }
+
+  let cashDec = dec(0)
+  const cashes: ClosingData["cashes"] = []
+  for (const entry of byBar.values()) {
+    const cashExpected = entry.byMethod.get("CASH") ?? dec(0)
+    cashDec = cashDec.plus(cashExpected)
+    // Solo los puestos con efectivo esperado son cajas físicas para contar.
+    if (cashExpected.gt(0)) {
+      cashes.push({
+        barId: entry.barId,
+        barName: entry.barName,
+        expected: decToDb(cashExpected),
+        byMethod: METHOD_ORDER.filter((m) => entry.byMethod.has(m)).map((m) => ({
+          method: m,
+          expected: decToDb(entry.byMethod.get(m)!),
+        })),
+      })
+    }
+  }
+  cashes.sort((a, b) => a.barName.localeCompare(b.barName))
 
   const purchaseByItem = new Map(
     purchaseRows.map((r) => [r.inventoryItemId, { qty: r.qty, cost: r.cost }])
@@ -626,12 +975,94 @@ async function computeClosingData(
     }
   })
 
+  // Tarea 10.2 — Pendiente de entrega: cantidad de consumiciones PENDING y su valor al momento.
+  const pendingQuantity = Number(pendingDeliveryRow[0]?.quantity ?? 0)
+  const pendingAmountDec = decFromDb(pendingDeliveryRow[0]?.amount ?? "0")
+
+  // Tarea 10.3 — Ingresos por MÉTODO: todas las ventas COMPLETED por método (el mismo corte
+  // que la caja por puesto, sumado entre barras). Incluye las cargas de saldo por su método
+  // (un depósito en efectivo es efectivo que entró). SALDO figura por transparencia: no es
+  // plata nueva, son tragos pagados con saldo ya cargado (contados en `saldo` por origen).
+  const byMethodMap = new Map<string, ReturnType<typeof dec>>()
+  for (const row of cashRows) {
+    byMethodMap.set(
+      row.paymentMethod,
+      (byMethodMap.get(row.paymentMethod) ?? dec(0)).plus(decFromDb(row.total))
+    )
+  }
+  const incomeByMethod: ClosingData["incomeByMethod"] = METHOD_ORDER.filter(
+    (m) => byMethodMap.has(m)
+  ).map((m) => ({ method: m, amount: decToDb(byMethodMap.get(m)!) }))
+
+  // Tarea 10.3 — Ingresos por ORIGEN: `tickets` = entradas (ya calculado), `tragos` = barra
+  // por líneas (ya calculado; incluye los pagados con saldo — son tragos reales vendidos) y
+  // `saldo` = cargas de saldo completadas (snapshot `kind: "deposit"`, plata que entró y que
+  // las ventas por líneas NO ven: son sales sin items).
+  const saldoDec = depositRows.reduce(
+    (acc, r) => acc.plus(decFromDb(r.total)),
+    dec(0)
+  )
+  const incomeBySource: ClosingData["incomeBySource"] = {
+    tickets: decToDb(ticketDec),
+    tragos: decToDb(barDec),
+    saldo: decToDb(saldoDec),
+    total: decToDb(ticketDec.plus(barDec).plus(saldoDec)),
+  }
+
+  // Tarea 10.3 — Ventas por hora (shape de `analytics/dashboard`): buckets locales de 0 a 23.
+  const hourTotals = Array.from({ length: 24 }, () => dec(0))
+  for (const r of hourlyRows) {
+    const d = r.createdAt ? new Date(r.createdAt) : null
+    if (!d || Number.isNaN(d.getTime())) continue
+    hourTotals[d.getHours()] = hourTotals[d.getHours()]!.plus(
+      decFromDb(r.totalAmount)
+    )
+  }
+  const salesByHour: ClosingData["salesByHour"] = hourTotals.map((total, hour) => ({
+    hour,
+    label: `${String(hour).padStart(2, "0")}:00`,
+    revenue: Number(total.toFixed(2)),
+  }))
+
+  // Tarea 10.3 — Top productos (shape de `bar-sales`): unidades vendidas desc, top 10.
+  const topProducts: ClosingData["topProducts"] = topProductRows
+    .map((r) => ({
+      productName: r.productName,
+      quantitySold: Number(r.quantitySold ?? 0),
+      revenue: String(r.revenue ?? "0"),
+    }))
+    .filter((r) => r.quantitySold > 0)
+    .sort((a, b) => b.quantitySold - a.quantitySold)
+    .slice(0, 10)
+
+  // Tarea 10.3 — Rendimiento por barra/puesto: recaudado total + cantidad de ventas, ordenado
+  // por recaudado desc (la primera es "la barra que más rindió"; `barId` null = "Puerta").
+  const barPerformance: ClosingData["barPerformance"] = [...byBar.values()]
+    .map((entry) => ({
+      barId: entry.barId,
+      barName: entry.barName,
+      revenue: decToDb(
+        [...entry.byMethod.values()].reduce((acc, v) => acc.plus(v), dec(0))
+      ),
+      salesCount: entry.salesCount,
+    }))
+    .sort((a, b) => decFromDb(b.revenue).cmp(decFromDb(a.revenue)))
+
+  // Tarea 10.3 — Ventas por promotor: helper compartido con `GET /promoter-sales` (tarea 9.2).
+  const byPromoter = await computePromoterSales(db, eventId, tenantId)
+
   return {
     income: {
       tickets: decToDb(ticketDec),
       bar: decToDb(barDec),
       gross: decToDb(grossDec),
     },
+    incomeBySource,
+    incomeByMethod,
+    salesByHour,
+    topProducts,
+    barPerformance,
+    byPromoter,
     expenses: {
       operational: decToDb(decFromDb(operationalRow[0]?.total ?? "0")),
       merchandisePurchased: decToDb(decFromDb(merchandiseRow[0]?.total ?? "0")),
@@ -639,6 +1070,11 @@ async function computeClosingData(
     cash: {
       expected: decToDb(cashDec),
       hasCashSales: cashDec.gt(0),
+    },
+    cashes,
+    pendingDelivery: {
+      quantity: pendingQuantity,
+      amount: decToDb(pendingAmountDec),
     },
     insumos,
   }
@@ -925,7 +1361,6 @@ export const eventsRoute = new Hono()
       name: body.name,
       date: new Date(body.date),
       location: body.location ?? null,
-      isActive: true,
       status: "draft",
       createdAt: new Date(),
     })
@@ -940,7 +1375,7 @@ export const eventsRoute = new Hono()
   // sus precios/isActive, barras (default + puestos) con su menú (bar_products), y el equipo
   // (event_staff, con su puesto). NO clona los HECHOS del evento: ventas, entradas emitidas,
   // cortesías canjeadas, stock (event/bar inventory), compras ni gastos. El evento nuevo nace
-  // 'draft' (isActive true), sin slug (es único), sin fechas de apertura/cierre.
+  // 'draft', sin slug (es único), sin fechas de apertura/cierre.
   .post("/:id/duplicate", zValidator("json", duplicateEventSchema), async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -1009,7 +1444,6 @@ export const eventsRoute = new Hono()
         name: newName,
         date: newDate,
         location: newLocation,
-        isActive: true,
         status: "draft",
         designType: source.designType,
         imageUrl: source.imageUrl ?? null,
@@ -1390,14 +1824,21 @@ export const eventsRoute = new Hono()
     if (!ev) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
+    // Tarea 7.3 — join con staff para el "invitado por" (quién creó la cortesía).
     const rows = await db
-      .select()
+      .select({
+        courtesy: courtesies,
+        creatorName: staff.name,
+      })
       .from(courtesies)
+      .leftJoin(staff, eq(courtesies.createdBy, staff.id))
       .where(
         and(eq(courtesies.eventId, eventId), eq(courtesies.tenantId, tenantId))
       )
       .orderBy(desc(courtesies.createdAt))
-    return c.json({ courtesies: rows.map(sanitizeCourtesy) })
+    return c.json({
+      courtesies: rows.map((r) => sanitizeCourtesy(r.courtesy, r.creatorName)),
+    })
   })
   .post(
     "/:id/courtesies",
@@ -1434,6 +1875,30 @@ export const eventsRoute = new Hono()
       if (!tt) {
         return c.json({ error: "Tipo de entrada no encontrado" }, 404)
       }
+      // Tragos de regalo (tarea 7.1): todos tienen que estar activos en el menú de este evento.
+      const drinkLines = (body.drinkLines ?? []).filter((l) => l.quantity > 0)
+      if (drinkLines.length > 0) {
+        const drinkIds = [...new Set(drinkLines.map((l) => l.productId))]
+        const menu = await db
+          .select({ productId: eventProducts.productId })
+          .from(eventProducts)
+          .where(
+            and(
+              eq(eventProducts.eventId, eventId),
+              eq(eventProducts.tenantId, tenantId),
+              eq(eventProducts.isActive, true),
+              inArray(eventProducts.productId, drinkIds)
+            )
+          )
+        const available = new Set(menu.map((m) => m.productId))
+        const missing = drinkIds.filter((pid) => !available.has(pid))
+        if (missing.length > 0) {
+          return c.json(
+            { error: "Uno de los tragos de regalo no está activo en el menú del evento" },
+            400
+          )
+        }
+      }
       const email =
         body.guestEmail != null && body.guestEmail !== ""
           ? body.guestEmail
@@ -1447,6 +1912,7 @@ export const eventsRoute = new Hono()
         ticketTypeId: body.ticketTypeId,
         guestName: body.guestName,
         guestEmail: email,
+        drinkLines: drinkLines.length > 0 ? drinkLines : null,
         token,
         status: "PENDING",
         createdBy: ctx.staff.id,
@@ -1457,9 +1923,68 @@ export const eventsRoute = new Hono()
         .from(courtesies)
         .where(and(eq(courtesies.id, id), eq(courtesies.tenantId, tenantId)))
         .limit(1)
-      return c.json({ courtesy: sanitizeCourtesy(row) }, 201)
+      // Tarea 7.3 — si la invitación tiene email, se la mandamos apenas se crea.
+      // El fallo del envío no rompe la creación: queda visible en el panel (invite_sent_at null)
+      // y se puede reintentar con el botón "Enviar".
+      if (email) {
+        try {
+          await sendCourtesyInvitationEmail({ db, courtesyId: id, tenantId })
+        } catch (err) {
+          console.warn(
+            "[courtesies] invitación no enviada al crear:",
+            err instanceof Error ? err.message : err
+          )
+        }
+      }
+      const [finalRow] = await db
+        .select()
+        .from(courtesies)
+        .where(and(eq(courtesies.id, id), eq(courtesies.tenantId, tenantId)))
+        .limit(1)
+      return c.json({ courtesy: sanitizeCourtesy(finalRow) }, 201)
     }
   )
+  .post("/:id/courtesies/:courtesyId/send-invite", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const courtesyId = c.req.param("courtesyId")
+    const db = drizzle(pool)
+    const [row] = await db
+      .select()
+      .from(courtesies)
+      .where(
+        and(
+          eq(courtesies.id, courtesyId),
+          eq(courtesies.eventId, eventId),
+          eq(courtesies.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!row) {
+      return c.json({ error: "Cortesía no encontrada" }, 404)
+    }
+    try {
+      await sendCourtesyInvitationEmail({ db, courtesyId, tenantId })
+    } catch (err) {
+      return c.json(
+        {
+          error:
+            err instanceof Error ? err.message : "No se pudo enviar la invitación",
+        },
+        400
+      )
+    }
+    const [updated] = await db
+      .select()
+      .from(courtesies)
+      .where(and(eq(courtesies.id, courtesyId), eq(courtesies.tenantId, tenantId)))
+      .limit(1)
+    return c.json({ courtesy: sanitizeCourtesy(updated), sent: true })
+  })
   .post("/:id/courtesies/:courtesyId/revoke", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -1755,6 +2280,26 @@ export const eventsRoute = new Hono()
       digitalConsumptionsGenerated: digitalGenerated,
       digitalConsumptionsRedeemed: digitalRedeemed,
     })
+  })
+  .get("/:id/promoter-sales", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    // Tarea 9.2 — Reporte por promotor (visión §2.8). Lógica compartida con el cierre (10.3):
+    // `computePromoterSales` (mismo shape, congelado en `closingReport.byPromoter`).
+    const rows = await computePromoterSales(db, eventId, tenantId)
+
+    return c.json({ promoters: rows })
   })
   .get("/:id/bar-sales", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -3498,7 +4043,6 @@ export const eventsRoute = new Hono()
       const now = new Date()
       const setPayload: {
         status: EventStatus
-        isActive?: boolean
         salesOpenedAt?: Date
         wentLiveAt?: Date
         closedAt?: Date
@@ -3515,9 +4059,6 @@ export const eventsRoute = new Hono()
         if (next === "closed") setPayload.closedAt = now
         cursor = next
       }
-
-      // Sync legacy `isActive`: activo mientras vende/está en vivo, inactivo al cerrar.
-      setPayload.isActive = to !== "closed"
 
       await db
         .update(events)
@@ -3567,6 +4108,16 @@ export const eventsRoute = new Hono()
           })
         ),
         cashCounted: z.union([z.number(), z.string()]).nullable().optional(),
+        // Tarea 10.1 — Caja POR PUESTO: un conteo manual por barra (`barId` null = caja de
+        // puerta). Reemplaza al `cashCounted` único; este se mantiene por back-compat.
+        cashes: z
+          .array(
+            z.object({
+              barId: z.string().nullable(),
+              counted: z.union([z.number(), z.string()]).nullable().optional(),
+            })
+          )
+          .optional(),
       })
     ),
     async (c) => {
@@ -3576,7 +4127,7 @@ export const eventsRoute = new Hono()
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
       }
       const eventId = c.req.param("id")
-      const { counts, cashCounted } = c.req.valid("json")
+      const { counts, cashCounted, cashes } = c.req.valid("json")
       const db = drizzle(pool)
 
       const ev = await requireEventForTenant(db, eventId, tenantId)
@@ -3638,6 +4189,48 @@ export const eventsRoute = new Hono()
         .minus(operationalDec)
         .minus(merchandisePurchasedDec)
 
+      // Tarea 10.1 — Conteo de caja POR PUESTO: `cashes[]` trae el contado manual de cada
+      // barra (`null` = no se contó). Sin `cashes` (cliente viejo) se mantiene el
+      // `cashCounted` único a nivel evento: el agregado `cash` funciona igual y los cierres
+      // por puesto quedan sin contado.
+      const countedByBar = new Map<string, number | null>()
+      let cashAnyCounted = false
+      let reportCashCountedDec = dec(0)
+      if (cashes) {
+        for (const cs of cashes) {
+          let n: number | null = null
+          if (cs.counted != null) {
+            const parsed = Number(cs.counted)
+            if (Number.isFinite(parsed)) {
+              n = Math.max(0, parsed)
+              cashAnyCounted = true
+              reportCashCountedDec = reportCashCountedDec.plus(dec(n))
+            }
+          }
+          countedByBar.set(cs.barId ?? "", n)
+        }
+      } else if (cashCounted != null) {
+        const parsed = Number(cashCounted)
+        reportCashCountedDec = dec(Number.isFinite(parsed) ? Math.max(0, parsed) : 0)
+        cashAnyCounted = Number.isFinite(parsed)
+      }
+      const cashExpectedDec = decFromDb(data.cash.expected)
+      const reportCashes: EventClosingReport["cashes"] = data.cashes.map(
+        (bar) => {
+          const raw = countedByBar.get(bar.barId ?? "")
+          return {
+            barId: bar.barId,
+            barName: bar.barName,
+            expected: bar.expected,
+            counted: raw != null ? decToDb(dec(raw)) : null,
+            byMethod: bar.byMethod.map((m) => ({
+              method: m.method,
+              expected: m.expected,
+            })),
+          }
+        }
+      )
+
       const now = new Date()
       const report: EventClosingReport = {
         closedAt: now.toISOString(),
@@ -3650,13 +4243,26 @@ export const eventsRoute = new Hono()
         leftoverValue: decToDb(leftoverDec),
         netReal: decToDb(netRealDec),
         netProjected: decToDb(netProjectedDec),
+        // Tarea 10.1 — Caja por puesto: `cashes[]` es la fuente nueva; `cash` queda como
+        // agregado a nivel evento (suma de esperados y de contados) por back-compat.
+        cashes: reportCashes,
         cash:
-          data.cash.hasCashSales && cashCounted != null
+          data.cash.hasCashSales && cashAnyCounted
             ? {
-                expected: data.cash.expected,
-                counted: decToDb(dec(cashCounted)),
+                expected: decToDb(cashExpectedDec),
+                counted: decToDb(reportCashCountedDec),
               }
             : null,
+        // Tarea 10.2 — Pendiente de entrega: vendido y no retirado, congelado al cerrar.
+        pendingDelivery: data.pendingDelivery,
+        // Tarea 10.3 — Desgloses expandidos (visión §2.8): origen, método, hora, top, barra y
+        // promotores. Snapshot congelado al cerrar — no rederivables después.
+        incomeBySource: data.incomeBySource,
+        incomeByMethod: data.incomeByMethod,
+        salesByHour: data.salesByHour,
+        topProducts: data.topProducts,
+        barPerformance: data.barPerformance,
+        byPromoter: data.byPromoter,
         insumos: reportInsumos,
       }
 
@@ -3694,7 +4300,36 @@ export const eventsRoute = new Hono()
         .from(events)
         .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
         .limit(1)
-      return c.json({ event: sanitizeEvent(row), report })
+
+      // Tarea 10.1 — Ventas por puesto para imprimir el resumen de caja (`formatResumenCaja`)
+      // al confirmar: solo las barras con caja (cashes), con los campos que el formatter usa.
+      const barSalesRows = await db
+        .select({
+          barId: sales.barId,
+          paymentMethod: sales.paymentMethod,
+          totalAmount: sales.totalAmount,
+        })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.eventId, eventId),
+            eq(sales.tenantId, tenantId),
+            eq(sales.status, "COMPLETED")
+          )
+        )
+        .orderBy(asc(sales.createdAt))
+      const barSales = data.cashes.map((bar) => ({
+        barId: bar.barId,
+        barName: bar.barName,
+        sales: barSalesRows
+          .filter((r) => (r.barId ?? "") === (bar.barId ?? ""))
+          .map((r) => ({
+            paymentMethod: r.paymentMethod,
+            totalAmount: String(r.totalAmount),
+          })),
+      }))
+
+      return c.json({ event: sanitizeEvent(row), report, barSales })
     }
   )
   .patch("/:id", zValidator("json", patchEventSchema), async (c) => {
@@ -3721,6 +4356,8 @@ export const eventsRoute = new Hono()
       consumptionsAvailableFrom?: Date | null
       slug?: string | null
       designType?: "GLASS" | "MINIMAL"
+      allowReentry?: boolean
+      ageRestriction?: number | null
     } = {}
     if (body.ticketsAvailableFrom !== undefined) {
       setPayload.ticketsAvailableFrom =
@@ -3739,6 +4376,12 @@ export const eventsRoute = new Hono()
     }
     if (body.designType !== undefined) {
       setPayload.designType = body.designType
+    }
+    if (body.allowReentry !== undefined) {
+      setPayload.allowReentry = body.allowReentry
+    }
+    if (body.ageRestriction !== undefined) {
+      setPayload.ageRestriction = body.ageRestriction
     }
 
     await db
@@ -3889,6 +4532,486 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
     return c.json({ event: sanitizeEvent(row) })
+  })
+  // ---------------------------------------------------------------------------
+  // Blacklist / registro de admisión (tarea 1.2)
+  // ---------------------------------------------------------------------------
+  .get("/:id/blacklist", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const rows = await db
+      .select()
+      .from(admissionBlacklist)
+      .where(
+        and(
+          eq(admissionBlacklist.eventId, eventId),
+          eq(admissionBlacklist.tenantId, tenantId)
+        )
+      )
+      .orderBy(desc(admissionBlacklist.createdAt))
+
+    return c.json({ entries: rows.map(sanitizeBlacklistEntry) })
+  })
+  .post("/:id/blacklist", zValidator("json", createBlacklistEntrySchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const id = uuidv4()
+    await db.insert(admissionBlacklist).values({
+      id,
+      eventId,
+      tenantId,
+      dni: body.dni.trim(),
+      fullName: body.fullName?.trim() || null,
+      reason: body.reason.trim(),
+      createdBy: ctx.staff.id,
+      createdAt: new Date(),
+    })
+
+    const [row] = await db
+      .select()
+      .from(admissionBlacklist)
+      .where(eq(admissionBlacklist.id, id))
+      .limit(1)
+    return c.json({ entry: sanitizeBlacklistEntry(row) }, 201)
+  })
+  .patch(
+    "/:id/blacklist/:entryId",
+    zValidator("json", patchBlacklistEntrySchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const entryId = c.req.param("entryId")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const [existing] = await db
+        .select()
+        .from(admissionBlacklist)
+        .where(
+          and(
+            eq(admissionBlacklist.id, entryId),
+            eq(admissionBlacklist.eventId, eventId),
+            eq(admissionBlacklist.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!existing) {
+        return c.json({ error: "Entrada no encontrada" }, 404)
+      }
+
+      const setPayload: Partial<typeof admissionBlacklist.$inferInsert> = {}
+      if (body.dni !== undefined) setPayload.dni = body.dni.trim()
+      if (body.fullName !== undefined) {
+        setPayload.fullName = body.fullName?.trim() || null
+      }
+      if (body.photoUrl !== undefined) {
+        setPayload.photoUrl = body.photoUrl?.trim() || null
+      }
+      if (body.reason !== undefined) setPayload.reason = body.reason.trim()
+      if (body.isActive !== undefined) setPayload.isActive = body.isActive
+
+      await db
+        .update(admissionBlacklist)
+        .set(setPayload)
+        .where(
+          and(
+            eq(admissionBlacklist.id, entryId),
+            eq(admissionBlacklist.eventId, eventId),
+            eq(admissionBlacklist.tenantId, tenantId)
+          )
+        )
+
+      const [row] = await db
+        .select()
+        .from(admissionBlacklist)
+        .where(eq(admissionBlacklist.id, entryId))
+        .limit(1)
+      return c.json({ entry: sanitizeBlacklistEntry(row) })
+    }
+  )
+  .delete("/:id/blacklist/:entryId", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const entryId = c.req.param("entryId")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [existing] = await db
+      .select()
+      .from(admissionBlacklist)
+      .where(
+        and(
+          eq(admissionBlacklist.id, entryId),
+          eq(admissionBlacklist.eventId, eventId),
+          eq(admissionBlacklist.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Entrada no encontrada" }, 404)
+    }
+
+    if (existing.photoUrl) {
+      const key = keyFromPublicUrl(existing.photoUrl)
+      if (key) {
+        try {
+          await deleteFileByKey(key)
+        } catch {
+          /* seguimos limpiando la DB */
+        }
+      }
+    }
+
+    await db
+      .delete(admissionBlacklist)
+      .where(
+        and(
+          eq(admissionBlacklist.id, entryId),
+          eq(admissionBlacklist.eventId, eventId),
+          eq(admissionBlacklist.tenantId, tenantId)
+        )
+      )
+
+    return c.json({ message: "Entrada eliminada" })
+  })
+  .post("/:id/blacklist/:entryId/image", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const entryId = c.req.param("entryId")
+    const db = drizzle(pool)
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [existing] = await db
+      .select()
+      .from(admissionBlacklist)
+      .where(
+        and(
+          eq(admissionBlacklist.id, entryId),
+          eq(admissionBlacklist.eventId, eventId),
+          eq(admissionBlacklist.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+    if (!existing) {
+      return c.json({ error: "Entrada no encontrada" }, 404)
+    }
+
+    let body: Record<string, string | File>
+    try {
+      body = (await c.req.parseBody()) as Record<string, string | File>
+    } catch {
+      return c.json({ error: "No se pudo leer el formulario." }, 400)
+    }
+
+    const raw = body.image ?? body.file
+    if (!(raw instanceof File)) {
+      return c.json(
+        { error: "Adjuntá una imagen en el campo «image» (multipart/form-data)." },
+        400
+      )
+    }
+
+    if (raw.size > EVENT_IMAGE_MAX_BYTES) {
+      return c.json({ error: "La imagen no puede superar los 5 MB." }, 400)
+    }
+
+    const contentType = guessImageContentType(raw, raw.name)
+    if (!contentType) {
+      return c.json(
+        { error: "Formato no permitido. Usá JPEG, PNG, WebP o GIF." },
+        400
+      )
+    }
+
+    const segment = safeEventUploadFilename(raw.name)
+    const key = `blacklist/${eventId}/${entryId}/${Date.now()}-${segment}`
+
+    let publicUrl: string
+    try {
+      const buf = Buffer.from(await raw.arrayBuffer())
+      await uploadFile(buf, key, contentType)
+      publicUrl = publicUrlForKey(key)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Error al subir la imagen"
+      if (msg.includes("Missing required environment variable")) {
+        return c.json(
+          { error: "Almacenamiento no configurado (variables R2)." },
+          503
+        )
+      }
+      return c.json({ error: "No se pudo subir la imagen al almacenamiento." }, 502)
+    }
+
+    if (publicUrl.length > 512) {
+      return c.json({ error: "La URL pública generada supera el límite permitido." }, 400)
+    }
+
+    if (existing.photoUrl) {
+      const oldKey = keyFromPublicUrl(existing.photoUrl)
+      if (oldKey) {
+        try {
+          await deleteFileByKey(oldKey)
+        } catch {
+          /* reemplazo best-effort */
+        }
+      }
+    }
+
+    await db
+      .update(admissionBlacklist)
+      .set({ photoUrl: publicUrl })
+      .where(eq(admissionBlacklist.id, entryId))
+
+    const [row] = await db
+      .select()
+      .from(admissionBlacklist)
+      .where(eq(admissionBlacklist.id, entryId))
+      .limit(1)
+    return c.json({ entry: sanitizeBlacklistEntry(row) })
+  })
+  // ─── Saldo (tarea 6.1, visión §2.7) ─────────────────────────────────────────────
+  // Carga de REGALO: la productora acredita saldo a un cliente (por DNI) sin que entre plata
+  // (mismo criterio "contado aparte" que las cortesías de entrada: sin sale, solo movimiento).
+  .post(
+    "/:id/balance/gift",
+    zValidator(
+      "json",
+      z.object({
+        dni: z.string().min(6).max(20),
+        amount: z.string().min(1),
+        name: z.string().max(255).optional(),
+        note: z.string().max(255).optional(),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      let amt
+      try {
+        amt = dec(body.amount)
+      } catch {
+        return c.json({ error: "Monto inválido" }, 400)
+      }
+      if (amt.isNaN() || !amt.isFinite() || amt.lte(0)) {
+        return c.json({ error: "Monto inválido" }, 400)
+      }
+      const amountStr = decToDb(amt)
+
+      const balance = await db.transaction(async (tx) => {
+        // Si la persona nunca compró, el DNI crea el customer (email sintético, como la caja).
+        const customerId = await findOrCreateCustomer(tx, {
+          name: body.name?.trim() || "Invitado",
+          email: "",
+          phone: "",
+          dni: body.dni,
+        })
+        return creditBalance(tx, {
+          customerId,
+          eventId,
+          tenantId,
+          amount: amountStr,
+          type: "REGALO",
+          staffId: ctx.staff.id,
+          note: body.note?.trim() || "Regalo de la productora",
+        })
+      })
+
+      return c.json({ ok: true, dni: body.dni, balance })
+    }
+  )
+  // Carga en CAJA física (efectivo/tarjeta): entra plata de verdad → se crea UNA venta POS
+  // COMPLETED sin items (el cierre la separa como carga de saldo por el snapshot
+  // `kind: "deposit"`) y se acredita el saldo del DNI con el movimiento CAJA.
+  .post(
+    "/:id/balance/charge-cash",
+    zValidator(
+      "json",
+      z.object({
+        dni: z.string().min(6).max(20),
+        amount: z.string().min(1),
+        paymentMethod: z.enum(["CASH", "CARD"]),
+        name: z.string().max(255).optional(),
+        note: z.string().max(255).optional(),
+      })
+    ),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      let amt
+      try {
+        amt = dec(body.amount)
+      } catch {
+        return c.json({ error: "Monto inválido" }, 400)
+      }
+      if (amt.isNaN() || !amt.isFinite() || amt.lte(0)) {
+        return c.json({ error: "Monto inválido" }, 400)
+      }
+      const amountStr = decToDb(amt)
+
+      const outcome = await db.transaction(async (tx) => {
+        const customerId = await findOrCreateCustomer(tx, {
+          name: body.name?.trim() || "Cliente de caja",
+          email: "",
+          phone: "",
+          dni: body.dni,
+        })
+        const saleId = uuidv4()
+        const receiptToken = randomUUID()
+        await tx.insert(sales).values({
+          id: saleId,
+          eventId,
+          tenantId,
+          staffId: ctx.staff.id,
+          customerId,
+          receiptToken,
+          source: "POS",
+          totalAmount: amountStr,
+          paymentMethod: body.paymentMethod,
+          status: "COMPLETED",
+          // Snapshot tipo depósito: identifica la venta como carga de saldo (el cierre, F10,
+          // separa "entradas / tragos / saldo" mirando este `kind`). Sin items de producto.
+          guestCheckoutSnapshot: {
+            kind: "deposit",
+            ticketLines: [],
+            drinkLines: [],
+            contact: { name: body.name?.trim() || "Cliente de caja", email: "", phone: "", dni: body.dni },
+          },
+          createdAt: new Date(),
+        })
+        const balance = await creditBalance(tx, {
+          customerId,
+          eventId,
+          tenantId,
+          amount: amountStr,
+          type: "CAJA",
+          paymentMethod: body.paymentMethod,
+          staffId: ctx.staff.id,
+          saleId,
+          note: body.note?.trim() || "Carga de saldo en caja",
+        })
+        return { saleId, receiptToken, balance }
+      })
+
+      return c.json(
+        {
+          ok: true,
+          dni: body.dni,
+          saleId: outcome.saleId,
+          receiptToken: outcome.receiptToken,
+          balance: outcome.balance,
+        },
+        201
+      )
+    }
+  )
+  // Consulta de saldo por DNI para la caja (tarea 6.3): el POS muestra el saldo del cliente
+  // mientras se tipea el DNI y permite cobrar contra saldo si alcanza. Evento scoped al
+  // tenant (el cliente es global — una persona es una persona, `customers.dni` único).
+  .get("/:id/balance", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const eventId = c.req.param("id")
+    const dni = c.req.query("dni")
+    const db = drizzle(pool)
+
+    if (!dni || !/^\d{6,9}$/.test(dni)) {
+      return c.json({ amount: "0.00", customer: null })
+    }
+
+    const ev = await requireEventForTenant(db, eventId, tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+
+    const [customer] = await db
+      .select({ id: customers.id, name: customers.name })
+      .from(customers)
+      .where(eq(customers.dni, dni))
+      .limit(1)
+    if (!customer) {
+      return c.json({ amount: "0.00", customer: null })
+    }
+
+    const amount = await getBalance(db, customer.id, eventId)
+    return c.json({
+      amount,
+      customer: { id: customer.id, name: customer.name },
+    })
   })
   .get("/:id", async (c) => {
     const ctx = c as AuthenticatedContext

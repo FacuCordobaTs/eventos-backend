@@ -17,6 +17,7 @@ import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
 import { executeTicketPurchase, PurchaseError } from "./ticket-purchase"
 import { dec, decFromDb, decToDb } from "./decimal-money"
+import { debitBalance, fulfillPendingBalanceDeposit, getBalance } from "./balance"
 
 type Tx = MySql2Transaction<typeof schema, typeof schema>
 
@@ -25,6 +26,8 @@ export type ClientCheckoutDrinkLine = { productId: string; quantity: number }
 
 export type ClientCheckoutContact = {
   name: string
+  /** Email. Vacío ("") = desconocido (venta de caja en POS, tarea 5.1): no se pisa el email
+   * real de un cliente existente y los nuevos se crean con un email sintético. */
   email: string
   phone: string
   /** Tarea 1.1 — DNI del comprador (identidad dentro del evento). Opcional: hoy no se pide en el checkout; lo manda F2. */
@@ -53,6 +56,8 @@ export type ClientCheckoutResult = {
   pendingMercadoPago?: boolean
   /** Tarjeta (Brick): venta PENDING hasta pagar en `/receipt`. */
   payOnReceipt?: boolean
+  /** Tarea 6.1 — Saldo resultante tras pagar con saldo (solo cuando `paymentMethod === "SALDO"`). */
+  balance?: string
 }
 
 function assertWindow(
@@ -83,7 +88,12 @@ async function countIssuedForType(
   return Number(row?.n ?? 0)
 }
 
-async function findOrCreateCustomer(
+/**
+ * Tarea 1.1 + 5.1 — Resuelve (upsert) el customer por DNI primero, luego por email/teléfono.
+ * El DNI es la identidad del cliente dentro del evento (una persona = un cliente,
+ * `customers.dni` único global). Exportado para la venta de caja del POS (5.1).
+ */
+export async function findOrCreateCustomer(
   tx: Tx,
   contact: ClientCheckoutContact
 ): Promise<string> {
@@ -105,34 +115,42 @@ async function findOrCreateCustomer(
     if (byDni) {
       await tx
         .update(customers)
-        .set({ name, email, phone: phone || byDni.phone })
+        .set({
+          name,
+          // Tarea 5.1 — Email vacío = no se conoce (caja): no pisar el email real.
+          ...(email !== "" ? { email } : {}),
+          phone: phone || byDni.phone,
+          ...(birthDate !== null ? { birthDate } : {}),
+        })
         .where(eq(customers.id, byDni.id))
       return byDni.id
     }
   }
 
-  const [byEmail] = await tx
-    .select()
-    .from(customers)
-    .where(eq(customers.email, email))
-    .limit(1)
+  if (email !== "") {
+    const [byEmail] = await tx
+      .select()
+      .from(customers)
+      .where(eq(customers.email, email))
+      .limit(1)
 
-  if (byEmail) {
-    // Si acá llegamos, ningún cliente tiene ese DNI (el lookup por dni falló arriba), así que
-    // solo se asigna a un cliente cuyo dni esté libre — si el cliente ya tiene OTRO dni, el
-    // email estaría en disputa entre dos personas y el unique key de `customers.dni` no se
-    // toca (se prefiere la identidad ya registrada).
-    const canClaimDni = dni === null || byEmail.dni == null || byEmail.dni === dni
-    await tx
-      .update(customers)
-      .set({
-        name,
-        phone: phone || byEmail.phone,
-        ...(canClaimDni ? { dni } : {}),
-        ...(birthDate !== null ? { birthDate } : {}),
-      })
-      .where(eq(customers.id, byEmail.id))
-    return byEmail.id
+    if (byEmail) {
+      // Si acá llegamos, ningún cliente tiene ese DNI (el lookup por dni falló arriba), así que
+      // solo se asigna a un cliente cuyo dni esté libre — si el cliente ya tiene OTRO dni, el
+      // email estaría en disputa entre dos personas y el unique key de `customers.dni` no se
+      // toca (se prefiere la identidad ya registrada).
+      const canClaimDni = dni === null || byEmail.dni == null || byEmail.dni === dni
+      await tx
+        .update(customers)
+        .set({
+          name,
+          phone: phone || byEmail.phone,
+          ...(canClaimDni ? { dni } : {}),
+          ...(birthDate !== null ? { birthDate } : {}),
+        })
+        .where(eq(customers.id, byEmail.id))
+      return byEmail.id
+    }
   }
 
   if (phone !== "") {
@@ -147,7 +165,7 @@ async function findOrCreateCustomer(
         .update(customers)
         .set({
           name,
-          email,
+          ...(email !== "" ? { email } : {}),
           ...(canClaimDni ? { dni } : {}),
           ...(birthDate !== null ? { birthDate } : {}),
         })
@@ -160,7 +178,9 @@ async function findOrCreateCustomer(
   await tx.insert(customers).values({
     id,
     name,
-    email,
+    // Tarea 5.1 — Sin email (caja POS): email sintético determinístico por DNI (o id).
+    // El checkout web posterior (por DNI) lo reemplaza por el email real.
+    email: email !== "" ? email : `pos-${dni ?? id}@crow.local`,
     phone: phone || null,
     ...(dni !== null ? { dni } : {}),
     ...(birthDate !== null ? { birthDate } : {}),
@@ -203,7 +223,8 @@ async function prepareGuestCheckout(
   if (!ev) {
     throw new PurchaseError("EVENT_NOT_FOUND")
   }
-  if (ev.isActive === false) {
+  // Tarea 11.3 — `isActive` retirado: el evento no disponible es el cerrado.
+  if (ev.status === "closed") {
     throw new PurchaseError("EVENT_INACTIVE")
   }
 
@@ -303,6 +324,20 @@ export async function executeClientCheckout(
   params: ClientCheckoutParams
 ): Promise<ClientCheckoutResult> {
   const prep = await prepareGuestCheckout(tx, params)
+
+  // Tarea 6.1 — Pago con saldo (visión §2.7): el saldo está atado al DNI (identidad dentro del
+  // evento) — sin DNI no hay saldo que gastar. El débito se hace tras insertar la sale, porque
+  // el movimiento lo referencia. Si no alcanza, la compra no avanza.
+  if (params.paymentMethod === "SALDO") {
+    const dni = params.contact.dni?.trim()
+    if (!dni) {
+      throw new PurchaseError("BALANCE_REQUIRES_DNI")
+    }
+    const balance = dec(await getBalance(tx, prep.customerId, params.eventId))
+    if (balance.lt(prep.total)) {
+      throw new PurchaseError("INSUFFICIENT_BALANCE")
+    }
+  }
 
   if (
     params.paymentMethod === "MERCADOPAGO" ||
@@ -429,12 +464,27 @@ export async function executeClientCheckout(
     }
   }
 
+  // Tarea 6.1 — El saldo se descuenta recién acá: la venta ya existe (el movimiento de CONSUMO
+  // la referencia) y el saldo se chequeó arriba (BALANCE_REQUIRES_DNI / INSUFFICIENT_BALANCE).
+  let balanceAfter: string | null = null
+  if (params.paymentMethod === "SALDO") {
+    balanceAfter = await debitBalance(tx, {
+      customerId: prep.customerId,
+      eventId: params.eventId,
+      tenantId: prep.tenantId,
+      amount: prep.serverTotalStr,
+      saleId,
+      note: "Compra con saldo",
+    })
+  }
+
   return {
     saleId,
     receiptToken,
     ticketIds,
     consumptionIds,
     tenantId: prep.tenantId,
+    ...(balanceAfter != null ? { balance: balanceAfter } : {}),
   }
 }
 
@@ -470,6 +520,14 @@ export async function fulfillPendingGuestCheckout(
   const snap = sale.guestCheckoutSnapshot
   if (snap == null) {
     throw new Error("FULFILL_NO_SNAPSHOT")
+  }
+
+  // Tarea 6.1 — Depósito de saldo (visión §2.7): una sale de carga de saldo se cumple
+  // acreditando `customer_balances`, no emitiendo tickets/consumos. El webhook despacha por
+  // `snapshot.kind` (mismo camino que el checkout: misma transacción, misma dedupe).
+  if (snap.kind === "deposit") {
+    const dep = await fulfillPendingBalanceDeposit(tx, saleId)
+    return { ...dep, ticketIds: [], consumptionIds: [] }
   }
 
   const customerId = sale.customerId

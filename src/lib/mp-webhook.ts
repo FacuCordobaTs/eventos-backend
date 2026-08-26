@@ -11,7 +11,8 @@ import { PurchaseError } from "./ticket-purchase"
 
 export const MP_EXTERNAL_REF_PREFIX = "totem-sale-"
 
-function isMysqlDuplicateKey(e: unknown): boolean {
+/** ER_DUP_ENTRY / errno 1062 — usado por webhook y process-brick para deduplicar notificaciones. */
+export function isMysqlDuplicateKey(e: unknown): boolean {
   if (e == null || typeof e !== "object") return false
   const err = e as { code?: string; errno?: number }
   return err.code === "ER_DUP_ENTRY" || err.errno === 1062

@@ -1,7 +1,7 @@
 import QRCode from "qrcode"
 
 const baseUrl = () =>
-  (process.env.TICKET_QR_BASE_URL ?? "https://totem.app/v").replace(/\/$/, "")
+  (process.env.TICKET_QR_BASE_URL ?? "https://crow.ar/v").replace(/\/$/, "")
 
 /** URL de validación futura (escáner puede resolver el hash). */
 export function ticketValidationUrl(qrHash: string): string {
