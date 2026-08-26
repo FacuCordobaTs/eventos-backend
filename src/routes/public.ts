@@ -913,6 +913,7 @@ export const publicRoute = new Hono()
     }
 
     const saleId = header.sale.id
+    const checkoutSnapshot = header.sale.guestCheckoutSnapshot
 
     // Tarea 6.1 — Saldo del cliente en este evento (visión §2.7): "0.00" si nunca cargó.
     // El comprobante (y el client) lo muestran; la caja también lo lee por DNI (6.3).
@@ -938,6 +939,7 @@ export const publicRoute = new Hono()
           status: tickets.status,
           ticketTypeName: ticketTypes.name,
           ticketTypePrice: ticketTypes.price,
+          buyerName: tickets.buyerName,
         })
         .from(tickets)
         .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
@@ -992,6 +994,10 @@ export const publicRoute = new Hono()
 
     return c.json({
       receiptToken: header.sale.receiptToken,
+      customerName:
+        checkoutSnapshot?.contact?.name?.trim() ||
+        ticketRows.find((ticket) => ticket.buyerName?.trim())?.buyerName?.trim() ||
+        "Invitado",
       balance: { amount: balanceAmount },
       sale: {
         id: header.sale.id,
