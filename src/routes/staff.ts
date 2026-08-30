@@ -23,6 +23,7 @@ import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
+import { sendWhatsAppTemplateMessage } from "../lib/whatsapp-service"
 
 const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.crow.ar").replace(/\/$/, "")
 
@@ -35,6 +36,7 @@ const roleEnum = z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY"])
 const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos")
 
 const createInvitationSchema = z.object({
+  name: z.string().trim().min(1).max(255),
   role: roleEnum,
   expiresInDays: z.number().int().positive().max(365).optional(),
 })
@@ -58,6 +60,7 @@ const createPosSessionSchema = z.object({
 const posPinSchema = z.object({ pin: pinSchema })
 
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000
+const STAFF_INVITATION_TEMPLATE = "crow_invitacion_staff"
 
 /**
  * ¿Ese PIN ya lo usa OTRA persona activa del tenant? El alta/rotación por PIN requiere que el
@@ -167,6 +170,8 @@ async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffR
 function sanitizeInvitation(row: typeof staffInvitations.$inferSelect) {
   return {
     id: row.id,
+    name: row.inviteeName ?? "Nuevo empleado",
+    phone: row.inviteePhone ?? "",
     role: row.role,
     token: row.token,
     url: `${ADMIN_URL}/unirse/${row.token}`,
@@ -422,6 +427,7 @@ export const staffRoute = new Hono()
       await db.insert(staffInvitations).values({
         id,
         tenantId,
+        inviteeName: body.name,
         role: body.role,
         token,
         status: "PENDING",
@@ -476,6 +482,50 @@ export const staffRoute = new Hono()
       .update(staffInvitations)
       .set({ status: "REVOKED" })
       .where(eq(staffInvitations.id, id))
+    return c.json({ ok: true })
+  })
+  .post("/invitations/:id/send", authMiddleware, adminOnly, async (c) => {
+    const db = drizzle(pool)
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId ?? null
+    const id = c.req.param("id")
+    const [invitation] = await db
+      .select()
+      .from(staffInvitations)
+      .where(eq(staffInvitations.id, id))
+      .limit(1)
+    if (!invitation || !tenantMatches(tenantId, invitation.tenantId)) {
+      return c.json({ error: "Invitación no encontrada" }, 404)
+    }
+    if (invitation.status !== "PENDING") {
+      return c.json({ error: "La invitación ya no está pendiente" }, 400)
+    }
+    if (!invitation.inviteePhone?.trim()) {
+      return c.json({ error: "Esta invitación no tiene un número de WhatsApp" }, 400)
+    }
+    const [tenant] = await db
+      .select({
+        whatsappEnabled: tenants.whatsappEnabled,
+        whatsappToken: tenants.whatsappToken,
+        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId!))
+      .limit(1)
+    if (!tenant?.whatsappEnabled || !tenant.whatsappToken || !tenant.whatsappPhoneNumberId) {
+      return c.json({ error: "Configurá WhatsApp en la productora antes de enviar invitaciones." }, 400)
+    }
+    const result = await sendWhatsAppTemplateMessage({
+      token: tenant.whatsappToken,
+      phoneNumberId: tenant.whatsappPhoneNumberId,
+      to: invitation.inviteePhone,
+      templateName: STAFF_INVITATION_TEMPLATE,
+      bodyParameters: [invitation.inviteeName ?? "", invitation.role],
+      urlButton: { parameter: invitation.token },
+    })
+    if (!result.ok) {
+      return c.json({ error: `No se pudo enviar por WhatsApp: ${result.error ?? "error desconocido"}` }, 502)
+    }
     return c.json({ ok: true })
   })
   // Público (sin auth): la persona abre el link para ver e aceptar la invitación.

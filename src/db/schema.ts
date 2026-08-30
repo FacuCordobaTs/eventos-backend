@@ -237,13 +237,16 @@ export const events = mysqlTable(
     name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
     slug: varchar('slug', { length: 100 }).unique(), // URL-friendly: crow.ar/e/divino
     date: timestamp('date').notNull(),
+    /** Nombre visible del lugar, ej. "Salón del Puerto". */
+    venue: varchar('venue', { length: 255 }),
+    /** Dirección geográfica usada para el mapa y "Cómo llegar". */
     location: varchar('location', { length: 255 }),
     ticketsAvailableFrom: timestamp('tickets_available_from'),
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
     createdAt: timestamp('created_at').defaultNow(),
     imageUrl: varchar('image_url', { length: 512 }),
-    /** Diseño de la página pública del evento. GLASS = glassmorphism (default), MINIMAL = plano/minimalista. */
-    designType: mysqlEnum('design_type', ['GLASS', 'MINIMAL']).notNull().default('GLASS'),
+    /** Diseño de la página pública del evento. MINIMAL = clásico (default), GLASS = glassmorphism. */
+    designType: mysqlEnum('design_type', ['GLASS', 'MINIMAL']).notNull().default('MINIMAL'),
     /**
      * Estado del ciclo de vida del evento. Fuente de verdad de la máquina de estados
      * (ver `backend/src/lib/event-status.ts`). Los valores DEBEN coincidir con
@@ -467,6 +470,9 @@ export const courtesies = mysqlTable(
     guestName: varchar('guest_name', { length: 255 }).notNull(),
     // Email opcional del invitado (para mandarle el QR al canjear).
     guestEmail: varchar('guest_email', { length: 255 }),
+    // DNI opcional: permite que la entrada emitida conserve la identidad del invitado y que
+    // una cortesía pueda incluir saldo de regalo para esa misma persona.
+    guestDni: varchar('guest_dni', { length: 20 }),
     // Token del link público de canje. Único.
     token: varchar('token', { length: 64 }).notNull().unique(),
     status: mysqlEnum('status', ['PENDING', 'REDEEMED', 'REVOKED']).notNull().default('PENDING'),
@@ -1028,6 +1034,9 @@ export const staffInvitations = mysqlTable(
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
+    // Datos del destinatario: permiten identificar la invitación y enviarla por WhatsApp.
+    inviteeName: varchar('invitee_name', { length: 255 }),
+    inviteePhone: varchar('invitee_phone', { length: 32 }),
     // Token del link/QR público de aceptación. Único.
     token: varchar('token', { length: 64 }).notNull().unique(),
     status: mysqlEnum('status', ['PENDING', 'ACCEPTED', 'REVOKED']).notNull().default('PENDING'),

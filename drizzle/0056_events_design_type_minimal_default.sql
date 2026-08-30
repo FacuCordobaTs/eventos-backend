@@ -1,0 +1,1 @@
+ALTER TABLE `events` ALTER COLUMN `design_type` SET DEFAULT 'MINIMAL';

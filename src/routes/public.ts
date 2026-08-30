@@ -29,6 +29,23 @@ import { obtenerTokenValido } from "../lib/mercadopago-utils"
 import { qrCodeDataUrl } from "../lib/qr"
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
+import { sendCustomerProfileEmail } from "../lib/send-customer-profile-email"
+import {
+  CUSTOMER_PROFILE_TEMPLATE,
+  normalizeWhatsAppPhone,
+  sendWhatsAppTemplateMessage,
+} from "../lib/whatsapp-service"
+
+const customerAccessSchema = z.object({
+  type: z.enum(["email", "phone", "dni"]),
+  value: z.string().trim().min(1).max(255),
+})
+
+const CLIENT_URL = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(/\/$/, "")
+
+function isDeliverableEmail(email: string): boolean {
+  return !email.toLowerCase().endsWith("@crow.local")
+}
 
 async function countIssued(
   db: ReturnType<typeof drizzle>,
@@ -170,6 +187,155 @@ function mapAsignarAliasError(reason: string): string {
 }
 
 export const publicRoute = new Hono()
+  .post("/customers/access", zValidator("json", customerAccessSchema), async (c) => {
+    const { type, value } = c.req.valid("json")
+    const db = drizzle(pool)
+    const cleanValue = value.trim()
+
+    let customer: typeof customers.$inferSelect | undefined
+    if (type === "email") {
+      ;[customer] = await db
+        .select()
+        .from(customers)
+        .where(eq(customers.email, cleanValue.toLowerCase()))
+        .limit(1)
+    } else if (type === "dni") {
+      ;[customer] = await db
+        .select()
+        .from(customers)
+        .where(eq(customers.dni, cleanValue.replace(/\D/g, "")))
+        .limit(1)
+    } else {
+      const normalized = normalizeWhatsAppPhone(cleanValue)
+      const candidates = [...new Set([cleanValue, cleanValue.replace(/\D/g, ""), normalized].filter(Boolean))] as string[]
+      ;[customer] = await db
+        .select()
+        .from(customers)
+        .where(inArray(customers.phone, candidates))
+        .limit(1)
+    }
+
+    // Respuesta uniforme para impedir que este formulario permita enumerar clientes.
+    if (!customer?.isActive) return c.json({ ok: true })
+
+    const [latest] = await db
+      .select({
+        saleId: sales.id,
+        receiptToken: sales.receiptToken,
+        whatsappEnabled: tenants.whatsappEnabled,
+        whatsappToken: tenants.whatsappToken,
+        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
+      })
+      .from(sales)
+      .innerJoin(tenants, eq(sales.tenantId, tenants.id))
+      .where(and(eq(sales.customerId, customer.id), eq(sales.status, "COMPLETED")))
+      .orderBy(desc(sales.createdAt))
+      .limit(1)
+
+    if (!latest) return c.json({ ok: true })
+    const profileUrl = `${CLIENT_URL}/mi-cuenta/${encodeURIComponent(latest.receiptToken)}`
+    const canWhatsApp = Boolean(
+      customer.phone && latest.whatsappEnabled && latest.whatsappToken && latest.whatsappPhoneNumberId
+    )
+    const preferWhatsApp = type === "phone" || (type === "dni" && canWhatsApp)
+
+    let deliveredByWhatsApp = false
+    if (preferWhatsApp && canWhatsApp) {
+      try {
+        const result = await sendWhatsAppTemplateMessage({
+          token: latest.whatsappToken!,
+          phoneNumberId: latest.whatsappPhoneNumberId!,
+          to: customer.phone!,
+          templateName: CUSTOMER_PROFILE_TEMPLATE,
+          bodyParameters: [customer.name],
+          urlButton: { parameter: `mi-cuenta/${latest.receiptToken}` },
+        })
+        deliveredByWhatsApp = result.ok
+        if (!result.ok) console.error("[customer-profile] WhatsApp rechazó el mensaje", result.error)
+      } catch (error) {
+        console.error("[customer-profile] no se pudo enviar por WhatsApp", error)
+      }
+    }
+    if (!deliveredByWhatsApp && isDeliverableEmail(customer.email)) {
+      try {
+        await sendCustomerProfileEmail({ to: customer.email, name: customer.name, url: profileUrl })
+      } catch (error) {
+        console.error("[customer-profile] no se pudo enviar por email", error)
+      }
+    }
+    return c.json({ ok: true })
+  })
+  .get("/customers/profile/:token", async (c) => {
+    const db = drizzle(pool)
+    const [credential] = await db
+      .select({ customerId: sales.customerId })
+      .from(sales)
+      .where(eq(sales.receiptToken, c.req.param("token")))
+      .limit(1)
+
+    if (!credential?.customerId) return c.json({ error: "El enlace no es válido" }, 404)
+    const [customer] = await db
+      .select({ id: customers.id, name: customers.name })
+      .from(customers)
+      .where(and(eq(customers.id, credential.customerId), eq(customers.isActive, true)))
+      .limit(1)
+    if (!customer) return c.json({ error: "El enlace no es válido" }, 404)
+
+    const saleRows = await db
+      .select({
+        saleId: sales.id,
+        eventId: events.id,
+        eventName: events.name,
+        eventDate: events.date,
+        eventVenue: events.venue,
+        eventLocation: events.location,
+        eventImageUrl: events.imageUrl,
+        eventStatus: events.status,
+        productoraName: tenants.name,
+        receiptToken: sales.receiptToken,
+        snapshot: sales.guestCheckoutSnapshot,
+        createdAt: sales.createdAt,
+      })
+      .from(sales)
+      .innerJoin(events, eq(sales.eventId, events.id))
+      .innerJoin(tenants, eq(sales.tenantId, tenants.id))
+      .where(and(eq(sales.customerId, customer.id), eq(sales.status, "COMPLETED")))
+      .orderBy(desc(events.date), desc(sales.createdAt))
+
+    const ticketRows = await db
+      .select({ eventId: tickets.eventId, saleId: tickets.saleId, status: tickets.status })
+      .from(tickets)
+      .where(eq(tickets.customerId, customer.id))
+    const consumptionRows = await db
+      .select({ eventId: digitalConsumptions.eventId, status: digitalConsumptions.status })
+      .from(digitalConsumptions)
+      .where(eq(digitalConsumptions.customerId, customer.id))
+
+    const ticketSaleIds = new Set(ticketRows.map((row) => row.saleId).filter(Boolean))
+    const grouped = new Map<string, (typeof saleRows)[number]>()
+    for (const row of saleRows) {
+      const current = grouped.get(row.eventId)
+      const useful = ticketSaleIds.has(row.saleId) || row.snapshot?.kind !== "deposit"
+      if (!current || (current.snapshot?.kind === "deposit" && useful)) grouped.set(row.eventId, row)
+    }
+
+    return c.json({
+      customer: { name: customer.name },
+      events: [...grouped.values()].map((row) => ({
+        id: row.eventId,
+        name: row.eventName,
+        date: row.eventDate,
+        venue: row.eventVenue,
+        location: row.eventLocation,
+        imageUrl: row.eventImageUrl,
+        status: row.eventStatus,
+        productoraName: row.productoraName,
+        receiptToken: row.receiptToken,
+        tickets: ticketRows.filter((item) => item.eventId === row.eventId && item.status !== "CANCELLED").length,
+        pendingConsumptions: consumptionRows.filter((item) => item.eventId === row.eventId && item.status === "PENDING").length,
+      })),
+    })
+  })
   .get("/events", async (c) => {
     const db = drizzle(pool)
     const tenantFilter = c.req.query("productoraId")
@@ -190,6 +356,7 @@ export const publicRoute = new Hono()
         id: events.id,
         name: events.name,
         date: events.date,
+        venue: events.venue,
         location: events.location,
         tenantId: events.tenantId,
         productoraName: tenants.name,
@@ -204,6 +371,7 @@ export const publicRoute = new Hono()
         id: r.id,
         name: r.name,
         date: r.date,
+        venue: r.venue,
         location: r.location,
         productora: { id: r.tenantId, name: r.productoraName },
       })),
@@ -344,9 +512,10 @@ export const publicRoute = new Hono()
         slug: ev.slug ?? null,
         name: ev.name,
         date: ev.date,
+        venue: ev.venue ?? null,
         location: ev.location,
         imageUrl: ev.imageUrl ?? null,
-        designType: ev.designType ?? "GLASS",
+        designType: ev.designType ?? "MINIMAL",
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },
@@ -384,6 +553,7 @@ export const publicRoute = new Hono()
         id: ev.id,
         name: ev.name,
         date: ev.date,
+        venue: ev.venue ?? null,
         location: ev.location,
       },
       report: ev.closingReport,
@@ -898,6 +1068,7 @@ export const publicRoute = new Hono()
         sale: sales,
         eventName: events.name,
         eventDate: events.date,
+        eventVenue: events.venue,
         eventLocation: events.location,
         productoraName: tenants.name,
         mpPublicKey: tenants.mpPublicKey,
@@ -944,7 +1115,13 @@ export const publicRoute = new Hono()
         .from(tickets)
         .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
         .where(
-          and(eq(tickets.saleId, saleId), eq(tickets.tenantId, header.sale.tenantId))
+          header.sale.customerId && header.sale.paid
+            ? and(
+                eq(tickets.customerId, header.sale.customerId),
+                eq(tickets.eventId, header.sale.eventId),
+                eq(tickets.tenantId, header.sale.tenantId)
+              )
+            : and(eq(tickets.saleId, saleId), eq(tickets.tenantId, header.sale.tenantId))
         )
         .orderBy(ticketTypes.name, tickets.createdAt),
       db
@@ -1014,6 +1191,7 @@ export const publicRoute = new Hono()
         id: header.sale.eventId,
         name: header.eventName,
         date: header.eventDate,
+        venue: header.eventVenue,
         location: header.eventLocation,
       },
       productora: {
@@ -1308,6 +1486,7 @@ export const publicRoute = new Hono()
         courtesy: courtesies,
         eventName: events.name,
         eventDate: events.date,
+        eventVenue: events.venue,
         eventLocation: events.location,
         ticketTypeName: ticketTypes.name,
       })
@@ -1357,6 +1536,7 @@ export const publicRoute = new Hono()
         id: row.courtesy.eventId,
         name: row.eventName,
         date: row.eventDate,
+        venue: row.eventVenue,
         location: row.eventLocation,
       },
       ticketTypeName: row.ticketTypeName,
@@ -1435,6 +1615,7 @@ export const publicRoute = new Hono()
         status: "PENDING",
         buyerName: cty.guestName,
         buyerEmail: cty.guestEmail ?? null,
+        buyerDni: cty.guestDni ?? null,
         createdAt: new Date(),
       })
 

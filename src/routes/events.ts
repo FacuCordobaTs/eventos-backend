@@ -5,9 +5,12 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   admissionBlacklist,
+  accountPool,
+  balanceMovements,
   barInventory,
   barProducts,
   bars,
+  customerBalances,
   courtesies,
   customers,
   digitalConsumptions,
@@ -18,7 +21,11 @@ import {
   type EventClosingReport,
   type PromoterSalesRow,
   eventStaff,
+  gateLogs,
   inventoryItems,
+  mpProcessedPayments,
+  pickupOrders,
+  posSessions,
   products,
   promoters,
   purchases,
@@ -82,6 +89,7 @@ function requireTenantId(c: AuthenticatedContext): string | null {
 const createEventSchema = z.object({
   name: z.string().min(1).max(255),
   date: z.string().min(1),
+  venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
 })
 
@@ -91,6 +99,7 @@ const createEventSchema = z.object({
 const duplicateEventSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   date: z.string().min(1).optional(),
+  venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
 })
 
@@ -187,6 +196,7 @@ const createCourtesySchema = z.object({
   ticketTypeId: z.string().min(1).max(36),
   guestName: z.string().min(1).max(255),
   guestEmail: z.union([z.string().email(), z.literal(""), z.null()]).optional(),
+  guestDni: z.union([z.string().min(6).max(20), z.literal(""), z.null()]).optional(),
   // Tragos de regalo (tarea 7.1): opcional; [] o ausente = invitación solo con entrada.
   drinkLines: z
     .array(
@@ -353,6 +363,7 @@ function sanitizeCourtesy(
     ticketTypeId: row.ticketTypeId,
     guestName: row.guestName,
     guestEmail: row.guestEmail ?? null,
+    guestDni: row.guestDni ?? null,
     token: row.token,
     status: row.status,
     ticketId: row.ticketId ?? null,
@@ -374,6 +385,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     name: row.name,
     slug: row.slug ?? null,
     date: row.date,
+    venue: row.venue ?? null,
     location: row.location,
     status: row.status ?? "draft",
     doorsAt: row.doorsAt ? row.doorsAt.toISOString() : null,
@@ -383,7 +395,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     closingReport: row.closingReport ?? null,
     createdAt: row.createdAt,
     imageUrl: row.imageUrl ?? null,
-    designType: row.designType ?? "GLASS",
+    designType: row.designType ?? "MINIMAL",
     allowReentry: row.allowReentry ?? false,
     ageRestriction: row.ageRestriction ?? null,
     ticketsAvailableFrom: row.ticketsAvailableFrom
@@ -1360,6 +1372,7 @@ export const eventsRoute = new Hono()
       tenantId,
       name: body.name,
       date: new Date(body.date),
+      venue: body.venue ?? null,
       location: body.location ?? null,
       status: "draft",
       createdAt: new Date(),
@@ -1369,6 +1382,74 @@ export const eventsRoute = new Hono()
       .from(events)
       .where(and(eq(events.id, id), eq(events.tenantId, tenantId)))
     return c.json({ event: sanitizeEvent(row) }, 201)
+  })
+  // El evento es una unidad operativa completa. Su borrado es físico y transaccional: elimina
+  // todos los hechos/configuraciones que pertenecen a él, pero conserva los datos compartidos
+  // del tenant (clientes, personal, catálogo, insumos y promotores).
+  .delete("/:id", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    if (ctx.staff.role !== "ADMIN") {
+      return c.json({ error: "Solo un administrador puede eliminar eventos." }, 403)
+    }
+
+    const eventId = c.req.param("id")
+    const db = drizzle(pool)
+    const event = await requireEventForTenant(db, eventId, tenantId)
+    if (!event) return c.json({ error: "Evento no encontrado" }, 404)
+
+    await db.transaction(async (tx) => {
+      const eventSales = await tx
+        .select({ id: sales.id })
+        .from(sales)
+        .where(and(eq(sales.eventId, eventId), eq(sales.tenantId, tenantId)))
+      const saleIds = eventSales.map((sale) => sale.id)
+
+      await tx.delete(posSessions).where(and(eq(posSessions.eventId, eventId), eq(posSessions.tenantId, tenantId)))
+      await tx.delete(pickupOrders).where(and(eq(pickupOrders.eventId, eventId), eq(pickupOrders.tenantId, tenantId)))
+      await tx.delete(balanceMovements).where(and(eq(balanceMovements.eventId, eventId), eq(balanceMovements.tenantId, tenantId)))
+      await tx.delete(customerBalances).where(and(eq(customerBalances.eventId, eventId), eq(customerBalances.tenantId, tenantId)))
+      await tx.delete(digitalConsumptions).where(and(eq(digitalConsumptions.eventId, eventId), eq(digitalConsumptions.tenantId, tenantId)))
+      await tx.delete(gateLogs).where(and(eq(gateLogs.eventId, eventId), eq(gateLogs.tenantId, tenantId)))
+      await tx.delete(courtesies).where(and(eq(courtesies.eventId, eventId), eq(courtesies.tenantId, tenantId)))
+      if (saleIds.length > 0) {
+        await tx.delete(saleItems).where(inArray(saleItems.saleId, saleIds))
+        await tx.delete(mpProcessedPayments).where(inArray(mpProcessedPayments.saleId, saleIds))
+        await tx
+          .update(accountPool)
+          .set({ status: "available", saleIdAssigned: null, updatedAt: new Date() })
+          .where(and(eq(accountPool.tenantId, tenantId), inArray(accountPool.saleIdAssigned, saleIds)))
+      }
+
+      await tx.delete(tickets).where(and(eq(tickets.eventId, eventId), eq(tickets.tenantId, tenantId)))
+      await tx.delete(sales).where(and(eq(sales.eventId, eventId), eq(sales.tenantId, tenantId)))
+      await tx.delete(ticketTiers).where(and(eq(ticketTiers.eventId, eventId), eq(ticketTiers.tenantId, tenantId)))
+
+      // Gastos salen antes que compras porque event_expenses.purchase_id las referencia.
+      await tx.delete(eventExpenses).where(and(eq(eventExpenses.eventId, eventId), eq(eventExpenses.tenantId, tenantId)))
+      await tx.delete(purchases).where(and(eq(purchases.eventId, eventId), eq(purchases.tenantId, tenantId)))
+      await tx.delete(eventStaff).where(and(eq(eventStaff.eventId, eventId), eq(eventStaff.tenantId, tenantId)))
+
+      const eventBars = await tx
+        .select({ id: bars.id })
+        .from(bars)
+        .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
+      const barIds = eventBars.map((bar) => bar.id)
+      if (barIds.length > 0) {
+        await tx.delete(barProducts).where(inArray(barProducts.barId, barIds))
+        await tx.delete(barInventory).where(inArray(barInventory.barId, barIds))
+      }
+      await tx.delete(bars).where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
+
+      await tx.delete(eventProducts).where(and(eq(eventProducts.eventId, eventId), eq(eventProducts.tenantId, tenantId)))
+      await tx.delete(eventInventory).where(and(eq(eventInventory.eventId, eventId), eq(eventInventory.tenantId, tenantId)))
+      await tx.delete(admissionBlacklist).where(and(eq(admissionBlacklist.eventId, eventId), eq(admissionBlacklist.tenantId, tenantId)))
+      await tx.delete(ticketTypes).where(and(eq(ticketTypes.eventId, eventId), eq(ticketTypes.tenantId, tenantId)))
+      await tx.delete(events).where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+    })
+
+    return c.json({ success: true })
   })
   // Tarea 1.9 — Duplicar evento ("Partir de: [último evento]"). Clona la CONFIGURACIÓN del
   // evento origen en un nuevo BORRADOR: tipos de entrada + tandas, menú (event_products) con
@@ -1431,6 +1512,7 @@ export const eventsRoute = new Hono()
     const newEventId = uuidv4()
     const newName = body.name?.trim() || `${source.name} (copia)`
     const newDate = body.date ? new Date(body.date) : source.date
+    const newVenue = body.venue ?? source.venue ?? null
     const newLocation = body.location ?? source.location ?? null
 
     // Mapas id origen → id nuevo para remapear las FKs entre tablas.
@@ -1443,6 +1525,7 @@ export const eventsRoute = new Hono()
         tenantId,
         name: newName,
         date: newDate,
+        venue: newVenue,
         location: newLocation,
         status: "draft",
         designType: source.designType,
@@ -1903,6 +1986,10 @@ export const eventsRoute = new Hono()
         body.guestEmail != null && body.guestEmail !== ""
           ? body.guestEmail
           : null
+      const dni =
+        body.guestDni != null && body.guestDni !== ""
+          ? body.guestDni.trim()
+          : null
       const id = uuidv4()
       const token = uuidv4()
       await db.insert(courtesies).values({
@@ -1912,6 +1999,7 @@ export const eventsRoute = new Hono()
         ticketTypeId: body.ticketTypeId,
         guestName: body.guestName,
         guestEmail: email,
+        guestDni: dni,
         drinkLines: drinkLines.length > 0 ? drinkLines : null,
         token,
         status: "PENDING",
@@ -2103,11 +2191,15 @@ export const eventsRoute = new Hono()
         createdAt: tickets.createdAt,
         scannedAt: tickets.scannedAt,
         emailSentAt: tickets.emailSentAt,
+        customerId: tickets.customerId,
+        promoterId: tickets.promoterId,
+        promoterName: promoters.name,
         ticketTypeId: tickets.ticketTypeId,
         ticketTypeName: ticketTypes.name,
       })
       .from(tickets)
       .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+      .leftJoin(promoters, eq(tickets.promoterId, promoters.id))
       .where(and(...conditions))
       .orderBy(orderFn(orderColumn))
 
@@ -2121,6 +2213,9 @@ export const eventsRoute = new Hono()
         createdAt: r.createdAt,
         scannedAt: r.scannedAt,
         emailSentAt: r.emailSentAt,
+        customerId: r.customerId,
+        promoterId: r.promoterId,
+        promoterName: r.promoterName,
         ticketTypeId: r.ticketTypeId,
         ticketTypeName: r.ticketTypeName,
       })),

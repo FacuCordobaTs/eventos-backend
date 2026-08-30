@@ -21,6 +21,11 @@ const GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 export const REMINDER_TEMPLATE = "crow_recordatorio"
 /** Template del mensaje de prueba desde Configuración. */
 export const TEST_TEMPLATE = "crow_prueba"
+/**
+ * Template UTILITY `crow_acceso_perfil` (es_AR): cuerpo con {{1}} = nombre y botón URL
+ * dinámico "Ver mis eventos" configurado como `https://crow.ar/{{1}}`.
+ */
+export const CUSTOMER_PROFILE_TEMPLATE = "crow_acceso_perfil"
 
 /**
  * Normaliza un número argentino a formato internacional de WhatsApp (sin +):

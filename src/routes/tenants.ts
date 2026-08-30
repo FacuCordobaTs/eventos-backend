@@ -21,6 +21,10 @@ const setupSchema = z.object({
   name: z.string().min(1).max(255),
 })
 
+const tenantNameSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+})
+
 const cucuruPutSchema = z.object({
   cucuruApiKey: z.string().min(1).max(255),
   cucuruCollectorId: z.string().min(1).max(255),
@@ -111,6 +115,24 @@ export const tenantsRoute = new Hono()
       }
       throw e
     }
+  })
+  .put("/me", authMiddleware, zValidator("json", tenantNameSchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN") {
+      return c.json({ error: "Solo administradores pueden editar la productora." }, 403)
+    }
+    if (ctx.staff.tenantId == null || ctx.staff.tenantId === "") {
+      return c.json({ error: "Productora no configurada" }, 400)
+    }
+
+    const name = c.req.valid("json").name
+    const db = drizzle(pool)
+    await db
+      .update(tenants)
+      .set({ name, updatedAt: new Date() })
+      .where(eq(tenants.id, ctx.staff.tenantId))
+
+    return c.json({ tenant: { id: ctx.staff.tenantId, name } })
   })
   .get("/me/cucuru", authMiddleware, async (c) => {
     const ctx = c as AuthenticatedContext
