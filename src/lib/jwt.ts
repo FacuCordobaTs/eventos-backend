@@ -9,12 +9,16 @@ export type AccessTokenPayload = {
   aud: TokenAudience
 }
 
-export function createAccessToken(sub: string, _aud: TokenAudience = "staff"): Promise<string> {
+export function createAccessToken(
+  sub: string,
+  _aud: TokenAudience = "staff",
+  expiresIn: "365d" | "60d" = "365d"
+): Promise<string> {
   return new Promise((resolve, reject) => {
     jwt.sign(
       { sub, aud: "staff" as const },
       secret(),
-      { expiresIn: "365d" },
+      { expiresIn },
       (err, token) => {
         if (err) reject(err)
         else if (!token) reject(new Error("Token vacío"))

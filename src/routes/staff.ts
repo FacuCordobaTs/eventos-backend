@@ -41,10 +41,7 @@ const createInvitationSchema = z.object({
   expiresInDays: z.number().int().positive().max(365).optional(),
 })
 
-const acceptInvitationSchema = z.object({
-  name: z.string().min(1),
-  pin: pinSchema,
-})
+const acceptInvitationSchema = z.object({})
 
 const magicLinkRequestSchema = z.object({ email: z.string().email() })
 const magicLinkConsumeSchema = z.object({
@@ -142,14 +139,17 @@ const adminOnly: MiddlewareHandler = async (c, next) => {
   await next()
 }
 
-const cookieOptions = (c: { req: { header: (name: string) => string | undefined } }) => {
+const cookieOptions = (
+  c: { req: { header: (name: string) => string | undefined } },
+  maxAge = 365 * 24 * 60 * 60
+) => {
   const isHttps =
     c.req.header("x-forwarded-proto") === "https" || process.env.NODE_ENV === "production"
   return {
     path: "/",
     sameSite: "Lax" as const,
     secure: isHttps,
-    maxAge: 365 * 24 * 60 * 60,
+    maxAge,
     httpOnly: true,
   }
 }
@@ -565,7 +565,6 @@ export const staffRoute = new Hono()
     async (c) => {
       const db = drizzle(pool)
       const token = c.req.param("token")
-      const body = c.req.valid("json")
       const [inv] = await db
         .select()
         .from(staffInvitations)
@@ -580,25 +579,18 @@ export const staffRoute = new Hono()
       if (inv.expiresAt != null && inv.expiresAt.getTime() < Date.now()) {
         return c.json({ error: "La invitación venció" }, 410)
       }
-      if (await pinTaken(db, inv.tenantId, body.pin)) {
-        return c.json(
-          { error: "Ese PIN ya lo usa otra persona del equipo. Probá otro." },
-          409
-        )
-      }
-      // Alta por PIN: sin email/contraseña reales. Email sintético + hash random para
-      // respetar los NOT NULL de `staff` sin habilitar login por contraseña.
+      // Alta sin contraseña ni PIN: el enlace de un solo uso es la credencial inicial.
+      // Conservamos email/hash sintéticos para respetar las columnas NOT NULL de `staff`.
       const staffId = uuidv4()
-      const syntheticEmail = `pin-${staffId}@staff.local`
+      const syntheticEmail = `invite-${staffId}@staff.local`
       const passwordHash = await bcrypt.hash(genToken(), 10)
       await db.insert(staff).values({
         id: staffId,
         tenantId: inv.tenantId,
-        name: body.name,
+        name: inv.inviteeName ?? "Nuevo empleado",
         email: syntheticEmail,
         passwordHash,
         role: inv.role,
-        pinCode: body.pin,
         isActive: true,
         createdAt: new Date(),
       })
@@ -611,8 +603,9 @@ export const staffRoute = new Hono()
         })
         .where(eq(staffInvitations.id, inv.id))
       const [row] = await db.select().from(staff).where(eq(staff.id, staffId)).limit(1)
-      const jwt = await createAccessToken(row.id, "staff")
-      setCookie(c, "token", jwt, cookieOptions(c))
+      const invitationSessionSeconds = 60 * 24 * 60 * 60
+      const jwt = await createAccessToken(row.id, "staff", "60d")
+      setCookie(c, "token", jwt, cookieOptions(c, invitationSessionSeconds))
       return c.json(
         {
           message: "Cuenta creada",
