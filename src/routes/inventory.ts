@@ -268,6 +268,8 @@ const createSaleSchema = z.object({
     (v) => (v === null || v === "" ? undefined : v),
     z.string().min(1).max(36).optional()
   ),
+  /** Caja: registra la venta aun si el inventario quedó desactualizado o en cero. */
+  allowNegativeStock: z.boolean().optional().default(false),
   /** Tarea 6.1 — SALDO: la caja cobra contra el saldo del DNI (requiere `customerDni`). */
   paymentMethod: z.enum(["CASH", "CARD", "MERCADOPAGO", "TRANSFER", "SALDO"]),
   items: z
@@ -1602,7 +1604,7 @@ export const inventoryRoute = new Hono()
             const entry = epStockByProductId.get(productId)
             if (!entry) continue // null directStock = unlimited
             const avail = decFromDb(entry.stock)
-            if (avail.lt(dec(qty))) {
+            if (!body.allowNegativeStock && avail.lt(dec(qty))) {
               const prod = prodRows.find((p) => p.id === productId)!
               return { kind: "insufficient_direct_stock" as const, productName: prod.name }
             }
@@ -1686,30 +1688,32 @@ export const inventoryRoute = new Hono()
             }
           }
 
-          for (const [invId, need] of Array.from(needs.entries())) {
-            const evRow = evInvByItem.get(invId)
-            const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
-            if (!saleBarId) {
-              if (cap.lt(need)) {
-                const meta = invMetaById.get(invId)!
-                throw new InsufficientStockError(
-                  "Stock insuficiente",
-                  meta.id,
-                  meta.name
-                )
-              }
-            } else {
-              const sumAll = sumBarsByInv.get(invId) ?? dec(0)
-              const bRow = barRowByInv.get(invId)
-              const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
-              const unalloc = cap.minus(sumAll)
-              if (need.gt(barAvail.plus(unalloc))) {
-                const meta = invMetaById.get(invId)!
-                throw new InsufficientStockError(
-                  "Stock insuficiente",
-                  meta.id,
-                  meta.name
-                )
+          if (!body.allowNegativeStock) {
+            for (const [invId, need] of Array.from(needs.entries())) {
+              const evRow = evInvByItem.get(invId)
+              const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
+              if (!saleBarId) {
+                if (cap.lt(need)) {
+                  const meta = invMetaById.get(invId)!
+                  throw new InsufficientStockError(
+                    "Stock insuficiente",
+                    meta.id,
+                    meta.name
+                  )
+                }
+              } else {
+                const sumAll = sumBarsByInv.get(invId) ?? dec(0)
+                const bRow = barRowByInv.get(invId)
+                const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
+                const unalloc = cap.minus(sumAll)
+                if (need.gt(barAvail.plus(unalloc))) {
+                  const meta = invMetaById.get(invId)!
+                  throw new InsufficientStockError(
+                    "Stock insuficiente",
+                    meta.id,
+                    meta.name
+                  )
+                }
               }
             }
           }
@@ -1834,7 +1838,10 @@ export const inventoryRoute = new Hono()
         if (needs.size > 0) {
           for (const [invId, need] of Array.from(needs.entries())) {
             if (!need.gt(dec(0))) continue
-            const evRow = evInvByItem.get(invId)!
+            const evRow = evInvByItem.get(invId)
+            // Si aún no se cargó este insumo en el evento, la venta de caja se
+            // registra igual y queda como diferencia a regularizar en inventario.
+            if (!evRow) continue
             const cap = decFromDb(evRow.stockAllocated)
             const newCap = cap.minus(need)
             await tx

@@ -35,6 +35,7 @@ import {
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import { broadcastPickupUpdate, broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
 import { pickupItemsWithNames } from "../lib/pickup-items"
 import { InsufficientStockError } from "./inventory"
 import {
@@ -418,6 +419,7 @@ export const barsRoute = new Hono()
         id: products.id,
         name: products.name,
         price: products.price,
+        directStock: eventProducts.directStock,
         barProductId: barProducts.id,
         barIsActive: barProducts.isActive,
         categoryId: products.categoryId,
@@ -488,6 +490,7 @@ export const barsRoute = new Hono()
         id: r.id,
         name: r.name,
         price: String(r.price),
+        directStock: r.directStock == null ? null : String(r.directStock),
         isActiveForBar:
           r.barProductId != null && r.barIsActive === true,
         categoryId: r.categoryId ?? null,
@@ -866,6 +869,7 @@ export const barsRoute = new Hono()
         kind: "no_bar" | "invalid_qr" | "used" | "wrong_event" | "wrong_bar" | "race_used" | "ok"
         productName?: string
         eventId?: string
+        receiptToken?: string
         inventoryItemIds?: string[]
       }
       try {
@@ -955,6 +959,7 @@ export const barsRoute = new Hono()
           kind: "ok" as const,
           productName: row.productName,
           eventId: bar.eventId,
+          receiptToken: row.sale.receiptToken,
           inventoryItemIds,
         }
         })
@@ -996,6 +1001,9 @@ export const barsRoute = new Hono()
           eventItemIds: result.inventoryItemIds,
           barDeltas: { barId, itemIds: result.inventoryItemIds },
         })
+      }
+      if (result.kind === "ok" && result.receiptToken) {
+        broadcastReceiptUpdate(result.receiptToken)
       }
 
       return c.json({
@@ -1080,6 +1088,8 @@ export const barsRoute = new Hono()
       items?: { productId: string; productName: string; quantity: number }[]
       totalAmount?: string
       eventId?: string
+      customerId?: string
+      pickupToken?: string
       inventoryItemIds?: string[]
     }
     try {
@@ -1252,6 +1262,8 @@ export const barsRoute = new Hono()
           items: groupedItems,
           totalAmount: decToDb(total),
           eventId: bar.eventId,
+          customerId: order.customerId,
+          pickupToken: order.token,
           inventoryItemIds,
         }
       })
@@ -1293,6 +1305,21 @@ export const barsRoute = new Hono()
         eventItemIds: result.inventoryItemIds,
         barDeltas: { barId, itemIds: result.inventoryItemIds },
       })
+    }
+    if (result.kind === "ok") {
+      broadcastPickupUpdate(result.pickupToken!)
+      const customerReceipts = await db
+        .select({ receiptToken: sales.receiptToken })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.customerId, result.customerId!),
+            eq(sales.eventId, result.eventId!)
+          )
+        )
+      for (const receipt of customerReceipts) {
+        broadcastReceiptUpdate(receipt.receiptToken)
+      }
     }
 
     return c.json({

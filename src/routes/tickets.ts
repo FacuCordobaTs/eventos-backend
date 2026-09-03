@@ -3,7 +3,7 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, gateLogs, ticketTypes, tickets } from "../db/schema"
+import { events, gateLogs, sales, ticketTypes, tickets } from "../db/schema"
 import { and, asc, eq, ne } from "drizzle-orm"
 import { randomUUID } from "node:crypto"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
@@ -15,6 +15,7 @@ import {
 import { qrCodeDataUrl } from "../lib/qr"
 import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
 import { findActiveBlacklistEntry } from "../lib/admission-blacklist"
+import { broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
 
 // Venta manual (spec §4.2): pide lo mínimo — tipo → cobrar → listo. Nombre, correo y DNI opcionales.
 // El DNI (tarea 1.1/1.2) se guarda como snapshot en `tickets.buyer_dni`: es lo que la puerta
@@ -90,6 +91,7 @@ function sanitizeValidatedTicket(row: typeof tickets.$inferSelect) {
 type GateRow = {
   id: string
   eventId: string
+  saleId: string | null
   /** `tickets.status` es nullable en el schema (default PENDING) — null se trata como no usado. */
   status: string | null
   buyerDni: string | null
@@ -97,6 +99,17 @@ type GateRow = {
   /** Tarea 3.2 — `ticketTypeId` llega al scanner para el mapa de color por tipo de entrada. */
   ticketTypeId: string
   ticketTypeName: string
+}
+
+async function notifyTicketOwner(ticketId: string) {
+  const db = drizzle(pool)
+  const [row] = await db
+    .select({ receiptToken: sales.receiptToken })
+    .from(tickets)
+    .innerJoin(sales, eq(tickets.saleId, sales.id))
+    .where(eq(tickets.id, ticketId))
+    .limit(1)
+  if (row?.receiptToken) broadcastReceiptUpdate(row.receiptToken)
 }
 
 type GateOutcome =
@@ -297,6 +310,7 @@ export const ticketsRoute = new Hono()
         .select({
           id: tickets.id,
           eventId: tickets.eventId,
+          saleId: tickets.saleId,
           status: tickets.status,
           buyerName: tickets.buyerName,
           buyerEmail: tickets.buyerEmail,
@@ -352,6 +366,8 @@ export const ticketsRoute = new Hono()
       return c.json({ error: outcome.error }, outcome.status)
     }
 
+    void notifyTicketOwner(outcome.ticket.id)
+
     return c.json({
       message: outcome.reentry ? "Reingreso permitido" : "Entrada válida",
       ticket: outcome.ticket,
@@ -386,6 +402,7 @@ export const ticketsRoute = new Hono()
         .select({
           id: tickets.id,
           eventId: tickets.eventId,
+          saleId: tickets.saleId,
           status: tickets.status,
           buyerDni: tickets.buyerDni,
           qrHash: tickets.qrHash,
@@ -434,6 +451,8 @@ export const ticketsRoute = new Hono()
       }
       return c.json({ error: outcome.error }, outcome.status)
     }
+
+    void notifyTicketOwner(outcome.ticket.id)
 
     return c.json({
       message: outcome.reentry ? "Reingreso permitido" : "Entrada válida",

@@ -1102,7 +1102,7 @@ export const publicRoute = new Hono()
       productPrice: products.price,
     }
 
-    const [ticketRows, consumptionRows] = await Promise.all([
+    const [ticketRows, consumptionRows, pickupRows] = await Promise.all([
       db
         .select({
           id: tickets.id,
@@ -1135,6 +1135,25 @@ export const publicRoute = new Hono()
           )
         )
         .orderBy(products.name, digitalConsumptions.createdAt),
+      header.sale.customerId
+        ? db
+            .select({
+              token: pickupOrders.token,
+              status: pickupOrders.status,
+              createdAt: pickupOrders.createdAt,
+              deliveredAt: pickupOrders.deliveredAt,
+              itemsJson: pickupOrders.itemsJson,
+            })
+            .from(pickupOrders)
+            .where(
+              and(
+                eq(pickupOrders.customerId, header.sale.customerId),
+                eq(pickupOrders.eventId, header.sale.eventId),
+                eq(pickupOrders.tenantId, header.sale.tenantId)
+              )
+            )
+            .orderBy(desc(pickupOrders.createdAt))
+        : Promise.resolve([]),
     ])
 
     // Addon consumptions: other paid sales for same customer+event
@@ -1168,6 +1187,16 @@ export const publicRoute = new Hono()
           .orderBy(digitalConsumptions.createdAt)
       }
     }
+
+    const pickups = await Promise.all(
+      pickupRows.map(async (pickup) => ({
+        token: pickup.token,
+        status: pickup.status,
+        createdAt: pickup.createdAt ?? null,
+        deliveredAt: pickup.deliveredAt ?? null,
+        items: await pickupItemsWithNames(db, pickup.itemsJson),
+      }))
+    )
 
     return c.json({
       receiptToken: header.sale.receiptToken,
@@ -1220,6 +1249,7 @@ export const publicRoute = new Hono()
           isAddon: false as const,
         })),
       ],
+      pickups,
     })
   })
   .post("/receipts/:token/consumptions-checkout", async (c) => {

@@ -11,6 +11,7 @@ import { barsRoute } from "./routes/bars"
 import { salesRoute } from "./routes/sales"
 import { promotersRoute } from "./routes/promoters"
 import { mountStockWebSocket } from "./routes/ws-stock"
+import { mountPublicQrWebSocket } from "./routes/ws-public-qr"
 import { startJobsRunner } from "./lib/jobs-runner"
 import { mercadopagoRoute } from "./routes/mercadopago"
 import { webhookRoute } from "./routes/webhook"
@@ -55,6 +56,7 @@ app.route("/promoters", promotersRoute)
 app.route("/api/mp", mercadopagoRoute)
 app.route("/api/webhook", webhookRoute)
 mountStockWebSocket(app)
+mountPublicQrWebSocket(app)
 
 // Tarea 8.2 — Runner de jobs de fondo (visión §2.3): recordatorio de WhatsApp 1 h antes y
 // transición on_sale → live a la hora de puertas. Tick inmediato + cada minuto. El estado
