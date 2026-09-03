@@ -17,7 +17,7 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { randomBytes } from "crypto"
 import { setCookie } from "hono/cookie"
-import { and, desc, eq, gt, isNull, ne, type SQL } from "drizzle-orm"
+import { and, desc, eq, gt, inArray, isNull, ne, type SQL } from "drizzle-orm"
 import { createAccessToken } from "../lib/jwt"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
@@ -456,7 +456,7 @@ export const staffRoute = new Hono()
       .where(
         and(
           eq(staffInvitations.tenantId, tenantId),
-          eq(staffInvitations.status, "PENDING")
+          inArray(staffInvitations.status, ["PENDING", "ACCEPTED"])
         )
       )
       .orderBy(desc(staffInvitations.createdAt))
@@ -475,8 +475,8 @@ export const staffRoute = new Hono()
     if (!inv || !tenantMatches(tenantId, inv.tenantId)) {
       return c.json({ error: "Invitación no encontrada" }, 404)
     }
-    if (inv.status !== "PENDING") {
-      return c.json({ error: "La invitación ya no está pendiente" }, 400)
+    if (inv.status === "REVOKED") {
+      return c.json({ error: "La invitación ya fue revocada" }, 400)
     }
     await db
       .update(staffInvitations)
@@ -528,7 +528,7 @@ export const staffRoute = new Hono()
     }
     return c.json({ ok: true })
   })
-  // Público (sin auth): la persona abre el link para ver e aceptar la invitación.
+  // Público (sin auth): la persona abre el link para ver y usar su acceso por invitación.
   .get("/invitations/:token", async (c) => {
     const db = drizzle(pool)
     const token = c.req.param("token")
@@ -540,7 +540,12 @@ export const staffRoute = new Hono()
     if (!inv) {
       return c.json({ error: "Invitación no encontrada" }, 404)
     }
-    const expired = inv.expiresAt != null && inv.expiresAt.getTime() < Date.now()
+    // El vencimiento limita la aceptación inicial; una vez creada la cuenta, el link queda
+    // como acceso persistente hasta que un administrador lo revoque.
+    const expired =
+      inv.status === "PENDING" &&
+      inv.expiresAt != null &&
+      inv.expiresAt.getTime() < Date.now()
     let tenantName: string | null = null
     if (inv.tenantId) {
       const [t] = await db
@@ -573,46 +578,79 @@ export const staffRoute = new Hono()
       if (!inv) {
         return c.json({ error: "Invitación no encontrada" }, 404)
       }
-      if (inv.status !== "PENDING") {
-        return c.json({ error: "Esta invitación ya no está disponible" }, 410)
+      if (inv.status === "REVOKED") {
+        return c.json({ error: "Esta invitación fue revocada" }, 410)
       }
-      if (inv.expiresAt != null && inv.expiresAt.getTime() < Date.now()) {
-        return c.json({ error: "La invitación venció" }, 410)
-      }
-      // Alta sin contraseña ni PIN: el enlace de un solo uso es la credencial inicial.
-      // Conservamos email/hash sintéticos para respetar las columnas NOT NULL de `staff`.
-      const staffId = uuidv4()
-      const syntheticEmail = `invite-${staffId}@staff.local`
-      const passwordHash = await bcrypt.hash(genToken(), 10)
-      await db.insert(staff).values({
-        id: staffId,
-        tenantId: inv.tenantId,
-        name: inv.inviteeName ?? "Nuevo empleado",
-        email: syntheticEmail,
-        passwordHash,
-        role: inv.role,
-        isActive: true,
-        createdAt: new Date(),
-      })
-      await db
-        .update(staffInvitations)
-        .set({
-          status: "ACCEPTED",
-          acceptedStaffId: staffId,
-          acceptedAt: new Date(),
+
+      let row: StaffRow | undefined
+      let created = false
+
+      if (inv.status === "PENDING") {
+        if (inv.expiresAt != null && inv.expiresAt.getTime() < Date.now()) {
+          return c.json({ error: "La invitación venció" }, 410)
+        }
+
+        // El nombre y el rol se definieron al crear la invitación. El enlace crea la cuenta
+        // en el primer acceso, sin pedir nombre, contraseña ni PIN.
+        // Conservamos email/hash sintéticos para respetar las columnas NOT NULL de `staff`.
+        const staffId = uuidv4()
+        const syntheticEmail = `invite-${staffId}@staff.local`
+        const passwordHash = await bcrypt.hash(genToken(), 10)
+        await db.insert(staff).values({
+          id: staffId,
+          tenantId: inv.tenantId,
+          name: inv.inviteeName ?? "Nuevo empleado",
+          email: syntheticEmail,
+          passwordHash,
+          role: inv.role,
+          isActive: true,
+          createdAt: new Date(),
         })
-        .where(eq(staffInvitations.id, inv.id))
-      const [row] = await db.select().from(staff).where(eq(staff.id, staffId)).limit(1)
+        await db
+          .update(staffInvitations)
+          .set({
+            status: "ACCEPTED",
+            acceptedStaffId: staffId,
+            acceptedAt: new Date(),
+          })
+          .where(eq(staffInvitations.id, inv.id))
+        const [createdStaff] = await db
+          .select()
+          .from(staff)
+          .where(eq(staff.id, staffId))
+          .limit(1)
+        row = createdStaff
+        created = true
+      } else {
+        // Una invitación aceptada conserva el mismo enlace como credencial de acceso. Así,
+        // aunque el empleado cierre sesión o cambie de dispositivo, vuelve a entrar por este URL.
+        if (!inv.acceptedStaffId) {
+          return c.json({ error: "La invitación no tiene una cuenta asociada" }, 409)
+        }
+        const [acceptedStaff] = await db
+          .select()
+          .from(staff)
+          .where(and(eq(staff.id, inv.acceptedStaffId), eq(staff.tenantId, inv.tenantId)))
+          .limit(1)
+        row = acceptedStaff
+        if (!row || !row.isActive) {
+          return c.json({ error: "El acceso de este empleado ya no está disponible" }, 410)
+        }
+      }
+
+      if (!row) {
+        return c.json({ error: "No se pudo crear el acceso del empleado" }, 500)
+      }
       const invitationSessionSeconds = 60 * 24 * 60 * 60
       const jwt = await createAccessToken(row.id, "staff", "60d")
       setCookie(c, "token", jwt, cookieOptions(c, invitationSessionSeconds))
       return c.json(
         {
-          message: "Cuenta creada",
+          message: created ? "Cuenta creada" : "Sesión iniciada",
           token: jwt,
           staff: await staffPayloadForClient(db, row),
         },
-        201
+        created ? 201 : 200
       )
     }
   )

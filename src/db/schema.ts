@@ -1023,10 +1023,10 @@ export const accountPool = mysqlTable("account_pool", {
 // 4.b STAFF SIN FRICCIÓN (spec §1) — invitaciones, magic link y sesión de puesto
 // -----------------------------------------------------------------------------
 
-// Invitación de staff (spec §1): "el administrador lo invita desde Equipo con un link o un QR.
-// La persona abre el link, pone su nombre y un PIN de 4-6 dígitos, y ya existe con su rol."
-// Cada fila es un link nominado a un rol dentro del tenant; al aceptarse crea una fila en `staff`
-// (email sintético + hash random: el alta es por PIN, no por contraseña) y queda enlazada por
+// Invitación de staff (spec §1): el administrador define nombre y rol y comparte un link o QR.
+// Cada fila es un link nominado dentro del tenant; el primer acceso crea una fila en `staff`
+// y los accesos posteriores vuelven a iniciar sesión con ese mismo link, sin nombre ni PIN.
+// Usa email/hash sintéticos para respetar las columnas NOT NULL y queda enlazada por
 // `accepted_staff_id`. Aditiva: no toca `staff` ni datos existentes.
 export const staffInvitations = mysqlTable(
   'staff_invitations',
