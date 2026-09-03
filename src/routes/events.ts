@@ -1351,10 +1351,28 @@ export const eventsRoute = new Hono()
       )
     }
     const db = drizzle(pool)
+    const eventVisibility =
+      ctx.staff.role === "SECURITY"
+        ? and(
+            eq(events.tenantId, tenantId),
+            exists(
+              db
+                .select({ id: eventStaff.id })
+                .from(eventStaff)
+                .where(
+                  and(
+                    eq(eventStaff.eventId, events.id),
+                    eq(eventStaff.staffId, ctx.staff.id),
+                    eq(eventStaff.tenantId, tenantId)
+                  )
+                )
+            )
+          )
+        : eq(events.tenantId, tenantId)
     const rows = await db
       .select()
       .from(events)
-      .where(eq(events.tenantId, tenantId))
+      .where(eventVisibility)
       .orderBy(desc(events.date))
     return c.json({ events: rows.map(sanitizeEvent) })
   })

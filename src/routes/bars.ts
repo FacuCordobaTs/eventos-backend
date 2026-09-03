@@ -251,6 +251,140 @@ async function deductRecipeStock(
   return [...new Set(changedItemIds)]
 }
 
+type PickupStockShortage = {
+  inventoryItemId: string
+  inventoryItemName: string
+  required: string
+  available: string
+}
+
+/**
+ * Calcula el faltante completo de un pedido antes de intentar entregarlo. Las recetas se
+ * agregan por insumo: así, si dos productos usan la misma Coca, se informa el faltante real
+ * una sola vez y no sólo el primer insumo que fallaría al descontar.
+ */
+async function findPickupStockShortages(
+  db: ReturnType<typeof drizzle>,
+  params: { tenantId: string; eventId: string; barId: string },
+  items: { productId: string; quantity: number }[]
+): Promise<PickupStockShortage[]> {
+  const productIds = [...new Set(items.map((item) => item.productId))]
+  if (productIds.length === 0) return []
+
+  const [productRows, recipeRows] = await Promise.all([
+    db
+      .select({ id: products.id, saleType: products.saleType })
+      .from(products)
+      .where(inArray(products.id, productIds)),
+    db
+      .select()
+      .from(productRecipes)
+      .where(inArray(productRecipes.productId, productIds)),
+  ])
+  const saleTypeByProductId = new Map(productRows.map((product) => [product.id, product.saleType]))
+  const quantityByProductId = new Map<string, number>()
+  for (const item of items) {
+    quantityByProductId.set(
+      item.productId,
+      (quantityByProductId.get(item.productId) ?? 0) + item.quantity
+    )
+  }
+
+  const inventoryItemIds = [...new Set(recipeRows.map((recipe) => recipe.inventoryItemId))]
+  if (inventoryItemIds.length === 0) return []
+
+  const [inventoryRows, eventRows, barRows, allocatedRows] = await Promise.all([
+    db
+      .select()
+      .from(inventoryItems)
+      .where(and(inArray(inventoryItems.id, inventoryItemIds), eq(inventoryItems.tenantId, params.tenantId))),
+    db
+      .select()
+      .from(eventInventory)
+      .where(
+        and(
+          eq(eventInventory.eventId, params.eventId),
+          eq(eventInventory.tenantId, params.tenantId),
+          inArray(eventInventory.inventoryItemId, inventoryItemIds)
+        )
+      ),
+    db
+      .select()
+      .from(barInventory)
+      .where(
+        and(
+          eq(barInventory.barId, params.barId),
+          eq(barInventory.tenantId, params.tenantId),
+          inArray(barInventory.inventoryItemId, inventoryItemIds)
+        )
+      ),
+    db
+      .select({
+        inventoryItemId: barInventory.inventoryItemId,
+        total: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+      })
+      .from(barInventory)
+      .innerJoin(bars, eq(barInventory.barId, bars.id))
+      .where(
+        and(
+          eq(bars.eventId, params.eventId),
+          eq(bars.tenantId, params.tenantId),
+          eq(barInventory.tenantId, params.tenantId),
+          inArray(barInventory.inventoryItemId, inventoryItemIds)
+        )
+      )
+      .groupBy(barInventory.inventoryItemId),
+  ])
+
+  const inventoryById = new Map(inventoryRows.map((item) => [item.id, item]))
+  const eventByInventoryId = new Map(eventRows.map((row) => [row.inventoryItemId, row]))
+  const barByInventoryId = new Map(barRows.map((row) => [row.inventoryItemId, row]))
+  const allocatedByInventoryId = new Map(allocatedRows.map((row) => [row.inventoryItemId, row.total]))
+  const requiredByInventoryId = new Map<string, ReturnType<typeof dec>>()
+
+  for (const recipe of recipeRows) {
+    const inventoryItem = inventoryById.get(recipe.inventoryItemId)
+    if (!inventoryItem) continue
+    const quantity = quantityByProductId.get(recipe.productId) ?? 0
+    const required = recipeStockDeduction(
+      recipe.quantityUsed,
+      quantity,
+      saleTypeByProductId.get(recipe.productId) ?? "GLASS",
+      inventoryItem
+    )
+    requiredByInventoryId.set(
+      recipe.inventoryItemId,
+      (requiredByInventoryId.get(recipe.inventoryItemId) ?? dec(0)).plus(required)
+    )
+  }
+
+  const shortages: PickupStockShortage[] = []
+  for (const [inventoryItemId, required] of requiredByInventoryId) {
+    if (!required.gt(0)) continue
+    const inventoryItem = inventoryById.get(inventoryItemId)
+    if (!inventoryItem) continue
+    const barAvailable = decFromDb(barByInventoryId.get(inventoryItemId)?.currentStock ?? "0")
+    const eventRow = eventByInventoryId.get(inventoryItemId)
+    const unallocated = eventRow
+      ? decFromDb(eventRow.stockAllocated).minus(
+          decFromDb(allocatedByInventoryId.get(inventoryItemId) ?? "0")
+        )
+      : dec(0)
+    const available = eventRow
+      ? barAvailable.plus(unallocated.lt(0) ? dec(0) : unallocated)
+      : barAvailable
+    if (required.gt(available)) {
+      shortages.push({
+        inventoryItemId,
+        inventoryItemName: inventoryItem.name,
+        required: decToDb(required),
+        available: decToDb(available),
+      })
+    }
+  }
+  return shortages
+}
+
 export const barsRoute = new Hono()
   .use("*", authMiddleware)
   .get("/:barId/products", async (c) => {
@@ -905,13 +1039,17 @@ export const barsRoute = new Hono()
       return c.json({ error: "Este pedido no pertenece a este evento" }, 400)
     }
 
-    const items = await pickupItemsWithNames(db, order.itemsJson)
+    const [items, stockShortages] = await Promise.all([
+      pickupItemsWithNames(db, order.itemsJson),
+      findPickupStockShortages(db, { tenantId, eventId: bar.eventId, barId }, order.itemsJson ?? []),
+    ])
     return c.json({
       token: order.token,
       status: order.status,
       createdAt: order.createdAt ?? null,
       deliveredAt: order.deliveredAt ?? null,
       items,
+      stockShortages,
     })
   })
   // Entrega de pedido de retiro (tarea 4.2): el barman escanea el QR del pedido, ve la
