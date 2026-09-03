@@ -31,7 +31,7 @@ import {
   yieldPerPackageFromQuantityUsed,
 } from "../lib/inventory-deduction"
 import { findOrCreateCustomer } from "../lib/client-checkout"
-import { debitBalance, getBalance } from "../lib/balance"
+import { creditBalance, debitBalance, getBalance } from "../lib/balance"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
   deleteFileByKey,
@@ -279,7 +279,13 @@ const createSaleSchema = z.object({
         quantity: z.coerce.number().int().positive(),
       })
     )
-    .min(1),
+    .default([]),
+  /** Importe de saldo que se cobra junto con los productos. Contablemente se registra como
+   * una venta/deposito independiente, pero ambas operaciones se confirman atómicamente. */
+  balanceCharge: z.preprocess(
+    (v) => (v === null || v === "" ? undefined : v),
+    z.string().min(1).max(20).optional()
+  ),
   /** Tarea 5.1 — Venta de caja registrada a nombre del cliente: DNI opcional (identidad del
    * evento, visión §2.0). Si viene, el backend resuelve/persiste el customer y setea `sales.customerId`. */
   customerDni: z.preprocess(
@@ -296,6 +302,28 @@ const createSaleSchema = z.object({
     (v) => (v === null || v === "" ? undefined : v),
     z.string().max(36).optional()
   ),
+}).superRefine((data, ctx) => {
+  if (data.items.length === 0 && data.balanceCharge == null) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["items"],
+      message: "Agregá un producto o una carga de saldo",
+    })
+  }
+  if (data.balanceCharge != null && data.customerDni == null) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["customerDni"],
+      message: "Cargar saldo requiere el DNI del cliente",
+    })
+  }
+  if (data.balanceCharge != null && data.paymentMethod === "SALDO") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["paymentMethod"],
+      message: "No se puede cargar saldo pagando con saldo",
+    })
+  }
 })
 
 const productListed = or(eq(products.isActive, true), isNull(products.isActive))
@@ -1507,12 +1535,15 @@ export const inventoryRoute = new Hono()
         }
 
         const productIds = [...new Set(body.items.map((i) => i.productId))]
-        const prodRows = await tx
-          .select()
-          .from(products)
-          .where(
-            and(inArray(products.id, productIds), eq(products.tenantId, tenantId))
-          )
+        const prodRows =
+          productIds.length === 0
+            ? []
+            : await tx
+                .select()
+                .from(products)
+                .where(
+                  and(inArray(products.id, productIds), eq(products.tenantId, tenantId))
+                )
         if (prodRows.length !== productIds.length) {
           return { kind: "bad_product" as const }
         }
@@ -1528,10 +1559,25 @@ export const inventoryRoute = new Hono()
           total = total.plus(decFromDb(p.price).times(line.quantity))
         }
 
-        const recipeRows = await tx
-          .select()
-          .from(productRecipes)
-          .where(inArray(productRecipes.productId, productIds))
+        let balanceCharge = dec(0)
+        if (body.balanceCharge != null) {
+          try {
+            balanceCharge = dec(body.balanceCharge)
+          } catch {
+            return { kind: "invalid_balance_charge" as const }
+          }
+          if (balanceCharge.isNaN() || !balanceCharge.isFinite() || balanceCharge.lte(0)) {
+            return { kind: "invalid_balance_charge" as const }
+          }
+        }
+
+        const recipeRows =
+          productIds.length === 0
+            ? []
+            : await tx
+                .select()
+                .from(productRecipes)
+                .where(inArray(productRecipes.productId, productIds))
 
         const recipeInvIds = [...new Set(recipeRows.map((r) => r.inventoryItemId))]
         const invForRecipes =
@@ -1765,19 +1811,19 @@ export const inventoryRoute = new Hono()
           }
         }
 
-        const saleId = uuidv4()
+        const productSaleId = body.items.length > 0 ? uuidv4() : null
         // Tarea 5.2 — El token del recibo se devuelve en la respuesta: el ticket impreso en caja
         // lleva el comprobante y los QRs de las consumiciones para canjear en barra.
-        const receiptToken = randomUUID()
-        await tx.insert(sales).values({
-          id: saleId,
+        const productReceiptToken = productSaleId ? randomUUID() : null
+        if (productSaleId != null) await tx.insert(sales).values({
+          id: productSaleId,
           eventId: body.eventId,
           tenantId,
           barId: saleBarId,
           staffId: ctx.staff.id,
           customerId,
           promoterId,
-          receiptToken,
+          receiptToken: productReceiptToken!,
           totalAmount: decToDb(total),
           paymentMethod: body.paymentMethod,
           status: "COMPLETED",
@@ -1788,7 +1834,7 @@ export const inventoryRoute = new Hono()
           const p = prodRows.find((x) => x.id === line.productId)!
           await tx.insert(saleItems).values({
             id: uuidv4(),
-            saleId,
+            saleId: productSaleId!,
             productId: line.productId,
             quantity: line.quantity,
             priceAtTime: p.price,
@@ -1811,7 +1857,7 @@ export const inventoryRoute = new Hono()
               eventId: body.eventId,
               tenantId,
               productId: line.productId,
-              saleId,
+              saleId: productSaleId!,
               qrHash,
               status: "PENDING",
               createdAt: new Date(),
@@ -1830,8 +1876,52 @@ export const inventoryRoute = new Hono()
             tenantId,
             amount: decToDb(total),
             staffId: ctx.staff.id,
-            saleId,
+            saleId: productSaleId!,
             note: "Venta de caja con saldo",
+          })
+        }
+
+        // La carga conserva su venta POS y movimiento de saldo propios, igual que una carga
+        // aislada. Al estar dentro de esta transacción se confirma junto a los productos.
+        let depositSaleId: string | null = null
+        let depositReceiptToken: string | null = null
+        if (balanceCharge.gt(0) && customerId != null) {
+          depositSaleId = uuidv4()
+          depositReceiptToken = randomUUID()
+          await tx.insert(sales).values({
+            id: depositSaleId,
+            eventId: body.eventId,
+            tenantId,
+            staffId: ctx.staff.id,
+            customerId,
+            receiptToken: depositReceiptToken,
+            source: "POS",
+            totalAmount: decToDb(balanceCharge),
+            paymentMethod: body.paymentMethod,
+            status: "COMPLETED",
+            guestCheckoutSnapshot: {
+              kind: "deposit",
+              ticketLines: [],
+              drinkLines: [],
+              contact: {
+                name: body.customerName?.trim() || "Cliente de caja",
+                email: "",
+                phone: "",
+                dni: body.customerDni,
+              },
+            },
+            createdAt: new Date(),
+          })
+          balanceAfter = await creditBalance(tx, {
+            customerId,
+            eventId: body.eventId,
+            tenantId,
+            amount: decToDb(balanceCharge),
+            type: "CAJA",
+            paymentMethod: body.paymentMethod,
+            staffId: ctx.staff.id,
+            saleId: depositSaleId,
+            note: "Carga de saldo junto a venta de caja",
           })
         }
 
@@ -1887,15 +1977,19 @@ export const inventoryRoute = new Hono()
 
         return {
           kind: "ok" as const,
-          saleId,
-          receiptToken,
-          totalAmount: decToDb(total),
+          saleId: productSaleId ?? depositSaleId!,
+          receiptToken: productReceiptToken ?? depositReceiptToken!,
+          totalAmount: decToDb(total.plus(balanceCharge)),
+          productTotalAmount: decToDb(total),
           eventId: body.eventId,
           barId: saleBarId,
           customerId,
           consumptions: printedConsumptions,
           inventoryItemIds:
             needs.size > 0 ? [...needs.keys()] : ([] as string[]),
+          ...(depositSaleId != null
+            ? { depositSaleId, balanceCharge: decToDb(balanceCharge) }
+            : {}),
           ...(balanceAfter != null ? { balance: balanceAfter } : {}),
         }
       })
@@ -1920,6 +2014,9 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_inventory") {
         return c.json({ error: "Error al verificar inventario." }, 400)
+      }
+      if (result.kind === "invalid_balance_charge") {
+        return c.json({ error: "Monto de carga de saldo inválido" }, 400)
       }
       if (result.kind === "saldo_requires_dni") {
         return c.json(

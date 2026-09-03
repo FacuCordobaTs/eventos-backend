@@ -30,6 +30,7 @@ import { qrCodeDataUrl } from "../lib/qr"
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
 import { sendCustomerProfileEmail } from "../lib/send-customer-profile-email"
+import { broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
 import {
   CUSTOMER_PROFILE_TEMPLATE,
   normalizeWhatsAppPhone,
@@ -1480,6 +1481,7 @@ export const publicRoute = new Hono()
     })
 
     const items = await pickupItemsWithNames(db, itemsJson)
+    broadcastReceiptUpdate(body.receiptToken)
     return c.json({ token, status: "PENDING", items }, 201)
   })
   // Vista del pedido para el QR del client (tarea 4.1). Sin auth — el token ES la credencial.
