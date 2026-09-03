@@ -30,6 +30,10 @@ app.use(
       "https://admin.crow.ar",
       "http://localhost:5173",
       "http://127.0.0.1:5173",
+      // Tauri no sirve el frontend desde admin.crow.ar: en Windows WebView2 usa
+      // https://tauri.localhost y en otros runtimes tauri://localhost.
+      "https://tauri.localhost",
+      "tauri://localhost",
     ],  
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
