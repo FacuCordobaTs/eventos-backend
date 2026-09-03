@@ -38,6 +38,8 @@ const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 d
 const createInvitationSchema = z.object({
   name: z.string().trim().min(1).max(255),
   role: roleEnum,
+  // Desde el dashboard el alta también queda asignada al evento actual.
+  eventId: z.string().min(1).optional(),
   expiresInDays: z.number().int().positive().max(365).optional(),
 })
 
@@ -176,6 +178,8 @@ function sanitizeInvitation(row: typeof staffInvitations.$inferSelect) {
     token: row.token,
     url: `${ADMIN_URL}/unirse/${row.token}`,
     status: row.status,
+    // Permite volver a abrir el mismo enlace desde el equipo, sin crear otra cuenta.
+    acceptedStaffId: row.acceptedStaffId,
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
   }
@@ -420,10 +424,36 @@ export const staffRoute = new Hono()
       }
       const body = c.req.valid("json")
       const id = uuidv4()
+      const staffId = uuidv4()
       const token = genToken()
       const expiresAt = body.expiresInDays
         ? new Date(Date.now() + body.expiresInDays * 24 * 60 * 60 * 1000)
         : null
+      if (body.eventId) {
+        const [event] = await db
+          .select({ id: events.id })
+          .from(events)
+          .where(and(eq(events.id, body.eventId), eq(events.tenantId, tenantId)))
+          .limit(1)
+        if (!event) {
+          return c.json({ error: "Evento no encontrado" }, 404)
+        }
+      }
+
+      // El empleado existe desde que se genera la invitación. El primer acceso al link solo
+      // activa su sesión; así se muestra y queda asignado al evento inmediatamente.
+      const syntheticEmail = `invite-${staffId}@staff.local`
+      const passwordHash = await bcrypt.hash(genToken(), 10)
+      await db.insert(staff).values({
+        id: staffId,
+        tenantId,
+        name: body.name,
+        email: syntheticEmail,
+        passwordHash,
+        role: body.role,
+        isActive: true,
+        createdAt: new Date(),
+      })
       await db.insert(staffInvitations).values({
         id,
         tenantId,
@@ -433,8 +463,18 @@ export const staffRoute = new Hono()
         status: "PENDING",
         expiresAt,
         createdBy: ctx.staff.id,
+        acceptedStaffId: staffId,
         createdAt: new Date(),
       })
+      if (body.eventId) {
+        await db.insert(eventStaff).values({
+          id: uuidv4(),
+          eventId: body.eventId,
+          tenantId,
+          staffId,
+          createdAt: new Date(),
+        })
+      }
       const [row] = await db
         .select()
         .from(staffInvitations)
@@ -585,7 +625,22 @@ export const staffRoute = new Hono()
       let row: StaffRow | undefined
       let created = false
 
-      if (inv.status === "PENDING") {
+      if (inv.status === "PENDING" && inv.acceptedStaffId) {
+        // Las invitaciones nuevas ya provisionan la cuenta; este primer acceso solo inicia sesión.
+        const [provisionedStaff] = await db
+          .select()
+          .from(staff)
+          .where(and(eq(staff.id, inv.acceptedStaffId), eq(staff.tenantId, inv.tenantId)))
+          .limit(1)
+        if (!provisionedStaff || !provisionedStaff.isActive) {
+          return c.json({ error: "El acceso de este empleado ya no está disponible" }, 410)
+        }
+        await db
+          .update(staffInvitations)
+          .set({ status: "ACCEPTED", acceptedAt: new Date() })
+          .where(eq(staffInvitations.id, inv.id))
+        row = provisionedStaff
+      } else if (inv.status === "PENDING") {
         if (inv.expiresAt != null && inv.expiresAt.getTime() < Date.now()) {
           return c.json({ error: "La invitación venció" }, 410)
         }
