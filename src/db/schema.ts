@@ -43,7 +43,7 @@ export const staff = mysqlTable(
     name: varchar('name', { length: 255 }).notNull(),
     email: varchar('email', { length: 255 }).notNull(),
     passwordHash: varchar('password_hash', { length: 255 }).notNull(),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
@@ -71,11 +71,14 @@ export const promoters = mysqlTable(
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     name: varchar('name', { length: 255 }).notNull(),
     phone: varchar('phone', { length: 32 }),
+    /** Cuenta operativa del promotor. Los registros anteriores a este rol pueden no tenerla. */
+    staffId: varchar('staff_id', { length: 36 }).references(() => staff.id),
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({
     tenantIdIdx: index('promoters_tenant_id_idx').on(table.tenantId),
+    staffIdUnique: uniqueIndex('promoters_staff_id_unique').on(table.staffId),
   })
 );
 
@@ -1045,7 +1048,7 @@ export const staffInvitations = mysqlTable(
   {
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER']).notNull(),
     // Datos del destinatario: permiten identificar la invitación y enviarla por WhatsApp.
     inviteeName: varchar('invitee_name', { length: 255 }),
     inviteePhone: varchar('invitee_phone', { length: 32 }),

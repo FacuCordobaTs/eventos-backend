@@ -2,9 +2,9 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, eq } from "drizzle-orm"
+import { and, asc, desc, eq } from "drizzle-orm"
 import { pool } from "../db"
-import { promoters } from "../db/schema"
+import { events, eventStaff, promoters, ticketTypes, tickets } from "../db/schema"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 
@@ -58,7 +58,79 @@ function sanitizePromoter(row: typeof promoters.$inferSelect) {
   }
 }
 
+async function currentStaffPromoter(
+  db: any,
+  ctx: AuthenticatedContext,
+  tenantId: string
+) {
+  if (ctx.staff.role !== "PROMOTER") return null
+  const [row] = await db
+    .select({ id: promoters.id, name: promoters.name })
+    .from(promoters)
+    .where(and(eq(promoters.staffId, ctx.staff.id), eq(promoters.tenantId, tenantId), eq(promoters.isActive, true)))
+    .limit(1)
+  return row ?? null
+}
+
 export const promotersRoute = new Hono()
+  // Espacio privado del promotor: sólo eventos a los que fue asignado y sus propias entradas.
+  .get("/me/events", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    const db = drizzle(pool)
+    const promoter = await currentStaffPromoter(db, ctx, tenantId)
+    if (!promoter) return c.json({ error: "Este acceso no corresponde a un promotor activo." }, 403)
+
+    const rows = await db
+      .select({ id: events.id, name: events.name, date: events.date, status: events.status })
+      .from(eventStaff)
+      .innerJoin(events, eq(events.id, eventStaff.eventId))
+      .where(and(eq(eventStaff.staffId, ctx.staff.id), eq(eventStaff.tenantId, tenantId), eq(events.tenantId, tenantId)))
+      .orderBy(desc(events.date))
+    return c.json({ promoter, events: rows })
+  })
+  .get("/me/events/:eventId", authMiddleware, async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    const db = drizzle(pool)
+    const promoter = await currentStaffPromoter(db, ctx, tenantId)
+    if (!promoter) return c.json({ error: "Este acceso no corresponde a un promotor activo." }, 403)
+    const eventId = c.req.param("eventId") ?? ""
+
+    const [event] = await db
+      .select({ id: events.id, name: events.name, date: events.date, status: events.status })
+      .from(events)
+      .innerJoin(eventStaff, and(eq(eventStaff.eventId, events.id), eq(eventStaff.staffId, ctx.staff.id)))
+      .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId), eq(eventStaff.tenantId, tenantId)))
+      .limit(1)
+    if (!event) return c.json({ error: "No estás asignado a este evento." }, 403)
+
+    const rows = await db
+      .select({
+        id: tickets.id,
+        status: tickets.status,
+        buyerName: tickets.buyerName,
+        buyerEmail: tickets.buyerEmail,
+        createdAt: tickets.createdAt,
+        ticketTypeName: ticketTypes.name,
+        price: ticketTypes.price,
+      })
+      .from(tickets)
+      .innerJoin(ticketTypes, eq(ticketTypes.id, tickets.ticketTypeId))
+      .where(and(eq(tickets.eventId, eventId), eq(tickets.tenantId, tenantId), eq(tickets.promoterId, promoter.id)))
+      .orderBy(desc(tickets.createdAt))
+
+    const active = rows.filter((ticket) => ticket.status !== "CANCELLED")
+    const ticketRevenue = active.reduce((total, ticket) => total + Number(ticket.price), 0)
+    return c.json({
+      promoter,
+      event,
+      stats: { ticketsCount: active.length, ticketRevenue: ticketRevenue.toFixed(2) },
+      tickets: rows.map((ticket) => ({ ...ticket, price: String(ticket.price) })),
+    })
+  })
   .get("/", authMiddleware, async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)

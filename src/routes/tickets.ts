@@ -3,7 +3,7 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { events, gateLogs, sales, ticketTypes, tickets } from "../db/schema"
+import { events, eventStaff, gateLogs, promoters, sales, ticketTypes, tickets } from "../db/schema"
 import { and, asc, eq, ne } from "drizzle-orm"
 import { randomUUID } from "node:crypto"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
@@ -263,6 +263,41 @@ export const ticketsRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
+    // El promotor nunca puede acreditar la venta a otra persona ni vender en un evento ajeno:
+    // su identidad comercial se toma de su cuenta y el evento debe estar asignado en Equipo.
+    let effectivePromoterId = body.promoterId
+    if (ctx.staff.role === "PROMOTER") {
+      const [promoter] = await db
+        .select({ id: promoters.id })
+        .from(promoters)
+        .where(
+          and(
+            eq(promoters.staffId, ctx.staff.id),
+            eq(promoters.tenantId, tenantId),
+            eq(promoters.isActive, true)
+          )
+        )
+        .limit(1)
+      if (!promoter) {
+        return c.json({ error: "Tu perfil de promotor no está activo." }, 403)
+      }
+      const [assignment] = await db
+        .select({ id: eventStaff.id })
+        .from(eventStaff)
+        .where(
+          and(
+            eq(eventStaff.staffId, ctx.staff.id),
+            eq(eventStaff.eventId, body.eventId),
+            eq(eventStaff.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+      if (!assignment) {
+        return c.json({ error: "No estás asignado a este evento." }, 403)
+      }
+      effectivePromoterId = promoter.id
+    }
+
     try {
       const result = await db.transaction(async (tx) =>
         executeTicketPurchase(tx, {
@@ -271,7 +306,7 @@ export const ticketsRoute = new Hono()
           buyerName: body.buyerName?.trim() || null,
           buyerEmail: body.buyerEmail?.trim() || null,
           buyerDni: body.buyerDni?.trim() || null,
-          ...(body.promoterId !== undefined ? { promoterId: body.promoterId } : {}),
+          ...(effectivePromoterId !== undefined ? { promoterId: effectivePromoterId } : {}),
           enforceTenantId: tenantId,
         })
       )

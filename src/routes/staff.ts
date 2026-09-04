@@ -10,6 +10,7 @@ import {
   eventStaff,
   magicLinks,
   posSessions,
+  promoters,
   staff,
   staffInvitations,
   tenants,
@@ -32,7 +33,7 @@ function genToken(): string {
   return randomBytes(24).toString("hex")
 }
 
-const roleEnum = z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY"])
+const roleEnum = z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY", "PROMOTER"])
 const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos")
 
 const createInvitationSchema = z.object({
@@ -94,13 +95,13 @@ const createTeamMemberSchema = z.object({
   name: z.string().min(1),
   email: z.string().email(),
   password: z.string().min(8),
-  role: z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY"]),
+  role: roleEnum,
 })
 
 const updateTeamMemberSchema = z
   .object({
     name: z.string().min(1).optional(),
-    role: z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY"]).optional(),
+    role: roleEnum.optional(),
     password: z.string().min(8).optional(),
     // PIN de 4-6 dígitos para rotación en la sesión de puesto (spec §1). null lo borra.
     pin: z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos").nullable().optional(),
@@ -167,6 +168,37 @@ async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffR
     .where(eq(tenants.id, row.tenantId))
     .limit(1)
   return { ...base, tenantName: t?.name ?? null }
+}
+
+/** Mantiene la identidad comercial del promotor ligada a su cuenta de staff. */
+async function ensurePromoterAccount(
+  db: any,
+  input: { staffId: string; tenantId: string; name: string; isActive?: boolean }
+) {
+  const [existing] = await db
+    .select({ id: promoters.id })
+    .from(promoters)
+    .where(eq(promoters.staffId, input.staffId))
+    .limit(1)
+
+  if (existing) {
+    await db
+      .update(promoters)
+      .set({ name: input.name, ...(input.isActive !== undefined ? { isActive: input.isActive } : {}) })
+      .where(eq(promoters.id, existing.id))
+    return existing.id
+  }
+
+  const id = uuidv4()
+  await db.insert(promoters).values({
+    id,
+    tenantId: input.tenantId,
+    staffId: input.staffId,
+    name: input.name,
+    isActive: input.isActive ?? true,
+    createdAt: new Date(),
+  })
+  return id
 }
 
 function sanitizeInvitation(row: typeof staffInvitations.$inferSelect) {
@@ -303,6 +335,10 @@ export const staffRoute = new Hono()
 
       const imported = existingElsewhere.length > 0
 
+      if (body.role === "PROMOTER" && !currentTenantId) {
+        return c.json({ error: "Un promotor debe pertenecer a una productora." }, 400)
+      }
+
       const id = uuidv4()
       await db.insert(staff).values({
         id,
@@ -314,6 +350,9 @@ export const staffRoute = new Hono()
         isActive: true,
         createdAt: new Date(),
       })
+      if (body.role === "PROMOTER" && currentTenantId) {
+        await ensurePromoterAccount(db, { staffId: id, tenantId: currentTenantId, name: body.name })
+      }
 
       const [inserted] = await db.select().from(staff).where(eq(staff.id, id))
       return c.json({ staff: sanitizeStaff(inserted), imported }, 201)
@@ -360,6 +399,21 @@ export const staffRoute = new Hono()
         })
         .where(eq(staff.id, id))
 
+      const nextRole = body.role ?? target.role
+      if (nextRole === "PROMOTER" && target.tenantId) {
+        await ensurePromoterAccount(db, {
+          staffId: target.id,
+          tenantId: target.tenantId,
+          name: body.name ?? target.name,
+          isActive: target.isActive !== false,
+        })
+      } else if (target.role === "PROMOTER" && body.role !== undefined) {
+        await db
+          .update(promoters)
+          .set({ isActive: false })
+          .where(eq(promoters.staffId, target.id))
+      }
+
       const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
       return c.json({ staff: sanitizeStaff(updated) })
     }
@@ -385,6 +439,9 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: false }).where(eq(staff.id, id))
+    if (target.role === "PROMOTER") {
+      await db.update(promoters).set({ isActive: false }).where(eq(promoters.staffId, id))
+    }
     return c.json({ ok: true })
   })
   .post("/team/:id/reactivate", authMiddleware, adminOnly, async (c) => {
@@ -404,6 +461,9 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: true }).where(eq(staff.id, id))
+    if (target.role === "PROMOTER" && target.tenantId) {
+      await ensurePromoterAccount(db, { staffId: id, tenantId: target.tenantId, name: target.name, isActive: true })
+    }
     const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
     return c.json({ staff: sanitizeStaff(updated) })
   })
@@ -454,6 +514,9 @@ export const staffRoute = new Hono()
         isActive: true,
         createdAt: new Date(),
       })
+      if (body.role === "PROMOTER") {
+        await ensurePromoterAccount(db, { staffId, tenantId, name: body.name })
+      }
       await db.insert(staffInvitations).values({
         id,
         tenantId,
@@ -661,6 +724,13 @@ export const staffRoute = new Hono()
           isActive: true,
           createdAt: new Date(),
         })
+        if (inv.role === "PROMOTER" && inv.tenantId) {
+          await ensurePromoterAccount(db, {
+            staffId,
+            tenantId: inv.tenantId,
+            name: inv.inviteeName ?? "Nuevo promotor",
+          })
+        }
         await db
           .update(staffInvitations)
           .set({
