@@ -67,6 +67,10 @@ import {
   type EventStatus,
 } from "../lib/event-status"
 import {
+  eventSupportsConsumptions,
+  type EventOperationMode,
+} from "../lib/event-operation-mode"
+import {
   bottleLoadStockDelta,
   stockAllocatedToBaseUnits,
 } from "../lib/inventory-deduction"
@@ -91,6 +95,10 @@ const createEventSchema = z.object({
   date: z.string().min(1),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
+  operationMode: z
+    .enum(["TICKETS_ONLY", "TICKETS_AND_CONSUMPTIONS", "FULL_OPERATION"])
+    .optional()
+    .default("FULL_OPERATION"),
 })
 
 // Tarea 1.9 — "Partir de: [último evento]". Duplica la CONFIGURACIÓN de un evento en un
@@ -101,6 +109,9 @@ const duplicateEventSchema = z.object({
   date: z.string().min(1).optional(),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
+  operationMode: z
+    .enum(["TICKETS_ONLY", "TICKETS_AND_CONSUMPTIONS", "FULL_OPERATION"])
+    .optional(),
 })
 
 /** ISO 8601 instant from client (UTC or offset); null clears the window. */
@@ -387,6 +398,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     date: row.date,
     venue: row.venue ?? null,
     location: row.location,
+    operationMode: row.operationMode ?? "FULL_OPERATION",
     status: row.status ?? "draft",
     doorsAt: row.doorsAt ? row.doorsAt.toISOString() : null,
     salesOpenedAt: row.salesOpenedAt ? row.salesOpenedAt.toISOString() : null,
@@ -1392,6 +1404,7 @@ export const eventsRoute = new Hono()
       date: new Date(body.date),
       venue: body.venue ?? null,
       location: body.location ?? null,
+      operationMode: body.operationMode,
       status: "draft",
       createdAt: new Date(),
     })
@@ -1532,6 +1545,9 @@ export const eventsRoute = new Hono()
     const newDate = body.date ? new Date(body.date) : source.date
     const newVenue = body.venue ?? source.venue ?? null
     const newLocation = body.location ?? source.location ?? null
+    const newOperationMode: EventOperationMode =
+      body.operationMode ?? source.operationMode ?? "FULL_OPERATION"
+    const supportsConsumptions = newOperationMode !== "TICKETS_ONLY"
 
     // Mapas id origen → id nuevo para remapear las FKs entre tablas.
     const typeIdMap = new Map<string, string>()
@@ -1545,6 +1561,7 @@ export const eventsRoute = new Hono()
         date: newDate,
         venue: newVenue,
         location: newLocation,
+        operationMode: newOperationMode,
         status: "draft",
         designType: source.designType,
         imageUrl: source.imageUrl ?? null,
@@ -1586,7 +1603,7 @@ export const eventsRoute = new Hono()
 
       // Menú del evento con precios de evento. NO se clona el stock (directStock queda null):
       // el stock es un hecho del evento, no configuración.
-      for (const ep of srcEventProducts) {
+      for (const ep of supportsConsumptions ? srcEventProducts : []) {
         await tx.insert(eventProducts).values({
           id: uuidv4(),
           eventId: newEventId,
@@ -1600,7 +1617,7 @@ export const eventsRoute = new Hono()
       }
 
       // Barras (default + puestos) — sin stock (bar_inventory no se clona).
-      for (const b of srcBars) {
+      for (const b of supportsConsumptions ? srcBars : []) {
         const id = uuidv4()
         barIdMap.set(b.id, id)
         await tx.insert(bars).values({
@@ -1615,7 +1632,7 @@ export const eventsRoute = new Hono()
       }
 
       // Menú de cada barra/puesto remapeado a la barra nueva.
-      for (const bp of srcBarProductsForEvent) {
+      for (const bp of supportsConsumptions ? srcBarProductsForEvent : []) {
         const newBarId = barIdMap.get(bp.barId)
         if (!newBarId) continue
         await tx.insert(barProducts).values({
@@ -1629,7 +1646,7 @@ export const eventsRoute = new Hono()
       }
 
       // Equipo: cada persona con su puesto (barId remapeado si estaba asignada a uno).
-      for (const es of srcEventStaff) {
+      for (const es of supportsConsumptions ? srcEventStaff : []) {
         const newBarId = es.barId ? barIdMap.get(es.barId) ?? null : null
         await tx.insert(eventStaff).values({
           id: uuidv4(),
@@ -1978,6 +1995,15 @@ export const eventsRoute = new Hono()
       }
       // Tragos de regalo (tarea 7.1): todos tienen que estar activos en el menú de este evento.
       const drinkLines = (body.drinkLines ?? []).filter((l) => l.quantity > 0)
+      if (
+        drinkLines.length > 0 &&
+        !eventSupportsConsumptions(ev.operationMode ?? "FULL_OPERATION")
+      ) {
+        return c.json(
+          { error: "Este evento está configurado para vender solo entradas" },
+          400
+        )
+      }
       if (drinkLines.length > 0) {
         const drinkIds = [...new Set(drinkLines.map((l) => l.productId))]
         const menu = await db
@@ -4957,6 +4983,12 @@ export const eventsRoute = new Hono()
       const ev = await requireEventForTenant(db, eventId, tenantId)
       if (!ev) {
         return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      if (!eventSupportsConsumptions(ev.operationMode ?? "FULL_OPERATION")) {
+        return c.json(
+          { error: "Este evento está configurado para vender solo entradas" },
+          400
+        )
       }
 
       let amt

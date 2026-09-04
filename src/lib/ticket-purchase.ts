@@ -13,6 +13,7 @@ export type PurchaseErrorCode =
   | "PRODUCT_NOT_FOUND"
   | "TICKETS_NOT_YET_AVAILABLE"
   | "CONSUMPTIONS_NOT_YET_AVAILABLE"
+  | "CONSUMPTIONS_DISABLED"
   | "CHECKOUT_TOTAL_MISMATCH"
   | "EMPTY_CART"
   | "BALANCE_REQUIRES_DNI"
@@ -198,6 +199,11 @@ export function purchaseErrorStatus(
       return {
         status: 403,
         body: { error: "La venta de consumos aún no está habilitada" },
+      }
+    case "CONSUMPTIONS_DISABLED":
+      return {
+        status: 400,
+        body: { error: "Este evento está configurado para vender solo entradas" },
       }
     case "CHECKOUT_TOTAL_MISMATCH":
       return { status: 400, body: { error: "El total no coincide con el servidor" } }

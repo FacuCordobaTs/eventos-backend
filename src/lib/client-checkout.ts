@@ -18,6 +18,7 @@ import { randomUUID } from "node:crypto"
 import { executeTicketPurchase, PurchaseError } from "./ticket-purchase"
 import { dec, decFromDb, decToDb } from "./decimal-money"
 import { debitBalance, fulfillPendingBalanceDeposit, getBalance } from "./balance"
+import { eventSupportsConsumptions } from "./event-operation-mode"
 
 type Tx = MySql2Transaction<typeof schema, typeof schema>
 
@@ -226,6 +227,13 @@ async function prepareGuestCheckout(
   // Tarea 11.3 — `isActive` retirado: el evento no disponible es el cerrado.
   if (ev.status === "closed") {
     throw new PurchaseError("EVENT_INACTIVE")
+  }
+
+  if (
+    normalizedDrinks.length > 0 &&
+    !eventSupportsConsumptions(ev.operationMode ?? "FULL_OPERATION")
+  ) {
+    throw new PurchaseError("CONSUMPTIONS_DISABLED")
   }
 
   const tenantId = ev.tenantId

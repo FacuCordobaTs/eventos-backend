@@ -39,6 +39,10 @@ import {
   publicUrlForKey,
   uploadFile,
 } from "../lib/s3-client"
+import {
+  eventSupportsConsumptions,
+  eventTracksStock,
+} from "../lib/event-operation-mode"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -1315,7 +1319,6 @@ export const inventoryRoute = new Hono()
         if (!ev) {
           return { kind: "bad_event" as const }
         }
-
         const [evInv] = await tx
           .select()
           .from(eventInventory)
@@ -1514,6 +1517,15 @@ export const inventoryRoute = new Hono()
         if (!ev) {
           return { kind: "bad_event" as const }
         }
+        if (
+          body.items.length > 0 &&
+          !eventSupportsConsumptions(ev.operationMode ?? "FULL_OPERATION")
+        ) {
+          return { kind: "consumptions_disabled" as const }
+        }
+        const tracksStock = eventTracksStock(
+          ev.operationMode ?? "FULL_OPERATION"
+        )
 
         let saleBarId: string | null = null
         if (body.barId != null && body.barId !== "") {
@@ -1572,7 +1584,7 @@ export const inventoryRoute = new Hono()
         }
 
         const recipeRows =
-          productIds.length === 0
+          !tracksStock || productIds.length === 0
             ? []
             : await tx
                 .select()
@@ -1595,7 +1607,7 @@ export const inventoryRoute = new Hono()
         const invById = new Map(invForRecipes.map((i) => [i.id, i]))
 
         const needs = new Map<string, ReturnType<typeof dec>>()
-        for (const line of body.items) {
+        for (const line of tracksStock ? body.items : []) {
           const p = prodRows.find((x) => x.id === line.productId)!
           const saleType = p.saleType
           const lines = recipeRows.filter((r) => r.productId === line.productId)
@@ -1616,7 +1628,7 @@ export const inventoryRoute = new Hono()
         // Products without recipes: check directStock if set on eventProducts
         const productsWithRecipes = new Set(recipeRows.map((r) => r.productId))
         const directNeeds = new Map<string, number>()
-        for (const line of body.items) {
+        for (const line of tracksStock ? body.items : []) {
           if (!productsWithRecipes.has(line.productId)) {
             directNeeds.set(line.productId, (directNeeds.get(line.productId) ?? 0) + line.quantity)
           }
@@ -1999,6 +2011,12 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_bar") {
         return c.json({ error: "Barra no válida para este evento" }, 400)
+      }
+      if (result.kind === "consumptions_disabled") {
+        return c.json(
+          { error: "Este evento está configurado para vender solo entradas" },
+          400
+        )
       }
       if (result.kind === "bad_promoter") {
         return c.json({ error: "Promotor no válido para esta venta" }, 400)

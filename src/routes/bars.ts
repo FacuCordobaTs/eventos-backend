@@ -43,6 +43,7 @@ import {
   stockAllocatedToBaseUnits,
   type ProductSaleType,
 } from "../lib/inventory-deduction"
+import { eventTracksStock } from "../lib/event-operation-mode"
 
 function requireTenantId(ctx: AuthenticatedContext): string | null {
   const id = ctx.staff.tenantId
@@ -115,6 +116,23 @@ async function deductRecipeStock(
   params: { tenantId: string; eventId: string; barId: string },
   lines: DeductionLine[]
 ): Promise<string[]> {
+  const [event] = await tx
+    .select({ operationMode: events.operationMode })
+    .from(events)
+    .where(
+      and(
+        eq(events.id, params.eventId),
+        eq(events.tenantId, params.tenantId)
+      )
+    )
+    .limit(1)
+  if (
+    !event ||
+    !eventTracksStock(event.operationMode ?? "FULL_OPERATION")
+  ) {
+    return []
+  }
+
   const changedItemIds: string[] = []
   for (const line of lines) {
     const recipes = await tx
@@ -269,6 +287,14 @@ async function findPickupStockShortages(
   params: { tenantId: string; eventId: string; barId: string },
   items: { productId: string; quantity: number }[]
 ): Promise<PickupStockShortage[]> {
+  const event = await requireEventForTenant(db, params.eventId, params.tenantId)
+  if (
+    !event ||
+    !eventTracksStock(event.operationMode ?? "FULL_OPERATION")
+  ) {
+    return []
+  }
+
   const productIds = [...new Set(items.map((item) => item.productId))]
   if (productIds.length === 0) return []
 
@@ -413,6 +439,7 @@ export const barsRoute = new Hono()
     if (!ev) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
+    const tracksStock = eventTracksStock(ev.operationMode ?? "FULL_OPERATION")
 
     const rows = await db
       .select({
@@ -461,7 +488,7 @@ export const barsRoute = new Hono()
 
     const productIds = rows.map((r) => r.id)
     const recipeRows =
-      productIds.length === 0
+      !tracksStock || productIds.length === 0
         ? []
         : await db
             .select({
@@ -486,11 +513,13 @@ export const barsRoute = new Hono()
     }
 
     return c.json({
+      tracksStock,
       products: rows.map((r) => ({
         id: r.id,
         name: r.name,
         price: String(r.price),
-        directStock: r.directStock == null ? null : String(r.directStock),
+        directStock:
+          !tracksStock || r.directStock == null ? null : String(r.directStock),
         isActiveForBar:
           r.barProductId != null && r.barIsActive === true,
         categoryId: r.categoryId ?? null,

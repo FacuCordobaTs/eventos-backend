@@ -36,6 +36,7 @@ import {
   normalizeWhatsAppPhone,
   sendWhatsAppTemplateMessage,
 } from "../lib/whatsapp-service"
+import { eventSupportsConsumptions } from "../lib/event-operation-mode"
 
 const customerAccessSchema = z.object({
   type: z.enum(["email", "phone", "dni"]),
@@ -417,7 +418,9 @@ export const publicRoute = new Hono()
     console.log("types")
     console.log(types)
 
-    const consumptionRows = await db
+    const consumptionRows = eventSupportsConsumptions(
+      ev.operationMode ?? "FULL_OPERATION"
+    ) ? await db
       .select({
         id: products.id,
         name: products.name,
@@ -448,6 +451,7 @@ export const publicRoute = new Hono()
         )
       )
       .orderBy(products.name)
+      : []
 
     const ticketTypesOut = []
     for (const t of types) {
@@ -517,6 +521,7 @@ export const publicRoute = new Hono()
         location: ev.location,
         imageUrl: ev.imageUrl ?? null,
         designType: ev.designType ?? "MINIMAL",
+        operationMode: ev.operationMode ?? "FULL_OPERATION",
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },

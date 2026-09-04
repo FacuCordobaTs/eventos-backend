@@ -243,6 +243,18 @@ export const events = mysqlTable(
     location: varchar('location', { length: 255 }),
     ticketsAvailableFrom: timestamp('tickets_available_from'),
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
+    /**
+     * Alcance operativo elegido al crear el evento.
+     * - TICKETS_ONLY: entradas, acceso, página y promotores.
+     * - TICKETS_AND_CONSUMPTIONS: suma menú/barra, sin control ni descuento de stock.
+     * - FULL_OPERATION: operación completa con recetas, compras e inventario.
+     * El default conserva el comportamiento de todos los eventos anteriores a esta columna.
+     */
+    operationMode: mysqlEnum('operation_mode', [
+      'TICKETS_ONLY',
+      'TICKETS_AND_CONSUMPTIONS',
+      'FULL_OPERATION',
+    ]).notNull().default('FULL_OPERATION'),
     createdAt: timestamp('created_at').defaultNow(),
     imageUrl: varchar('image_url', { length: 512 }),
     /** Diseño de la página pública del evento. MINIMAL = clásico (default), GLASS = glassmorphism. */
