@@ -402,7 +402,11 @@ export const publicRoute = new Hono()
     }
 
     const [productoraRow] = await db
-      .select({ name: tenants.name })
+      .select({
+        name: tenants.name,
+        mpConnected: tenants.mpConnected,
+        cucuruEnabled: tenants.cucuruEnabled,
+      })
       .from(tenants)
       .where(eq(tenants.id, ev.tenantId))
       .limit(1)
@@ -512,6 +516,10 @@ export const publicRoute = new Hono()
       productora: {
         id: ev.tenantId,
         name: productoraRow?.name ?? "Productora",
+        paymentMethods: {
+          mercadoPago: Boolean(productoraRow?.mpConnected),
+          transfer: Boolean(productoraRow?.cucuruEnabled),
+        },
       },
       event: {
         id: ev.id,
