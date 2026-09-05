@@ -3059,6 +3059,7 @@ export const eventsRoute = new Hono()
         isActive: staff.isActive,
         assignmentId: eventStaff.id,
         barId: eventStaff.barId,
+        promoterId: promoters.id,
       })
       .from(staff)
       .leftJoin(
@@ -3067,6 +3068,14 @@ export const eventsRoute = new Hono()
           eq(eventStaff.staffId, staff.id),
           eq(eventStaff.eventId, eventId),
           eq(eventStaff.tenantId, tenantId)
+        )
+      )
+      .leftJoin(
+        promoters,
+        and(
+          eq(promoters.staffId, staff.id),
+          eq(promoters.tenantId, tenantId),
+          eq(promoters.isActive, true)
         )
       )
       .where(and(eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
@@ -3080,6 +3089,7 @@ export const eventsRoute = new Hono()
         role: r.role,
         isAssigned: r.assignmentId != null,
         barId: r.barId ?? null,
+        promoterId: r.promoterId ?? null,
       })),
     })
   })

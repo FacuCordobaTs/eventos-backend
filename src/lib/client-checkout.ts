@@ -5,9 +5,11 @@ import type { GuestCheckoutSnapshotJson } from "../db/schema"
 import {
   customers,
   digitalConsumptions,
+  eventStaff,
   eventProducts,
   events,
   products,
+  promoters,
   saleItems,
   sales,
   ticketTypes,
@@ -45,6 +47,8 @@ export type ClientCheckoutParams = {
   clientTotal: string
   ticketLines: ClientCheckoutTicketLine[]
   drinkLines: ClientCheckoutDrinkLine[]
+  /** Promotor del enlace público compartido. Ausente en compras sin referido. */
+  promoterId?: string
 }
 
 export type ClientCheckoutResult = {
@@ -238,6 +242,33 @@ async function prepareGuestCheckout(
 
   const tenantId = ev.tenantId
 
+  // El identificador llega desde un link público, así que nunca se acepta a ciegas:
+  // debe ser un promotor activo de la misma productora y estar asignado al evento. Esto
+  // protege el aislamiento multi-tenant y evita atribuciones a perfiles desactivados o
+  // no habilitados para este evento.
+  if (params.promoterId !== undefined) {
+    const [promoter] = await tx
+      .select({ id: promoters.id })
+      .from(promoters)
+      .innerJoin(
+        eventStaff,
+        and(
+          eq(eventStaff.staffId, promoters.staffId),
+          eq(eventStaff.eventId, params.eventId),
+          eq(eventStaff.tenantId, tenantId)
+        )
+      )
+      .where(
+        and(
+          eq(promoters.id, params.promoterId),
+          eq(promoters.tenantId, tenantId),
+          eq(promoters.isActive, true)
+        )
+      )
+      .limit(1)
+    if (!promoter) throw new PurchaseError("PROMOTER_NOT_FOUND")
+  }
+
   if (normalizedTickets.length > 0) {
     assertWindow(ev.ticketsAvailableFrom, "TICKETS_NOT_YET_AVAILABLE")
   }
@@ -378,6 +409,7 @@ export async function executeClientCheckout(
       eventId: params.eventId,
       tenantId: prep.tenantId,
       customerId: prep.customerId,
+      ...(params.promoterId !== undefined ? { promoterId: params.promoterId } : {}),
       receiptToken,
       source: "WEB",
       totalAmount: prep.serverTotalStr,
@@ -417,6 +449,7 @@ export async function executeClientCheckout(
     eventId: params.eventId,
     tenantId: prep.tenantId,
     customerId: prep.customerId,
+    ...(params.promoterId !== undefined ? { promoterId: params.promoterId } : {}),
     receiptToken,
     source: "WEB",
     totalAmount: prep.serverTotalStr,
@@ -447,6 +480,7 @@ export async function executeClientCheckout(
         buyerDni: params.contact.dni?.trim() || null,
         customerId: prep.customerId,
         saleId,
+        ...(params.promoterId !== undefined ? { promoterId: params.promoterId } : {}),
       })
       ticketIds.push(ticket.id)
     }
@@ -620,6 +654,7 @@ export async function fulfillPendingGuestCheckout(
         buyerDni: contact.dni?.trim() || null,
         customerId,
         saleId,
+        ...(sale.promoterId != null ? { promoterId: sale.promoterId } : {}),
       })
       ticketIds.push(ticket.id)
     }

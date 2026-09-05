@@ -132,6 +132,8 @@ const balanceDepositSchema = z.object({
 
 const guestCheckoutSchema = z.object({
   eventId: z.string().min(1),
+  /** Promotor referido por el enlace público del evento. */
+  promoterId: z.string().uuid().optional(),
   /** Tarea 6.1 — SALDO: pago con el saldo cargado del cliente (visión §2.7). Requiere DNI en el contacto. */
   paymentMethod: z.enum(["TRANSFER", "CARD", "MERCADOPAGO", "SALDO"]),
   clientTotal: z.string().min(1),
@@ -616,6 +618,7 @@ export const publicRoute = new Hono()
           clientTotal: body.clientTotal.trim(),
           ticketLines: body.ticketLines ?? [],
           drinkLines: body.drinkLines ?? [],
+          ...(body.promoterId !== undefined ? { promoterId: body.promoterId } : {}),
         })
       )
 

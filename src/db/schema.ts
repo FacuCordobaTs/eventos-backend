@@ -1289,6 +1289,10 @@ export const salesRelations = relations(sales, ({ one, many }) => ({
     fields: [sales.barId],
     references: [bars.id],
   }),
+  promoter: one(promoters, {
+    fields: [sales.promoterId],
+    references: [promoters.id],
+  }),
   items: many(saleItems),
 }));
 

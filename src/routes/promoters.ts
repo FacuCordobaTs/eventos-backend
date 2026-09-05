@@ -83,7 +83,7 @@ export const promotersRoute = new Hono()
     if (!promoter) return c.json({ error: "Este acceso no corresponde a un promotor activo." }, 403)
 
     const rows = await db
-      .select({ id: events.id, name: events.name, date: events.date, status: events.status })
+      .select({ id: events.id, slug: events.slug, name: events.name, date: events.date, status: events.status })
       .from(eventStaff)
       .innerJoin(events, eq(events.id, eventStaff.eventId))
       .where(and(eq(eventStaff.staffId, ctx.staff.id), eq(eventStaff.tenantId, tenantId), eq(events.tenantId, tenantId)))
@@ -100,7 +100,7 @@ export const promotersRoute = new Hono()
     const eventId = c.req.param("eventId") ?? ""
 
     const [event] = await db
-      .select({ id: events.id, name: events.name, date: events.date, status: events.status })
+      .select({ id: events.id, slug: events.slug, name: events.name, date: events.date, status: events.status })
       .from(events)
       .innerJoin(eventStaff, and(eq(eventStaff.eventId, events.id), eq(eventStaff.staffId, ctx.staff.id)))
       .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId), eq(eventStaff.tenantId, tenantId)))
