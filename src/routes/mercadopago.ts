@@ -15,12 +15,10 @@ import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-emai
 import { isMysqlDuplicateKey, processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
 import { fulfillPendingGuestCheckout } from "../lib/client-checkout"
 import { PurchaseError } from "../lib/ticket-purchase"
+import { buildMpAuthorizationUrl, getMpOAuthConfig } from "../lib/mp-oauth-config"
 
 const MP_MARKETPLACE_FEE_RATE = 0.01
 const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.crow.ar'
-const MP_CLIENT_ID = process.env.MP_CLIENT_ID
-const MP_CLIENT_SECRET = process.env.MP_CLIENT_SECRET
-const MP_REDIRECT_URI = process.env.MP_REDIRECT_URI
 
 function marketplaceFeeFromAmount(amount: number): number {
   const n = Number(amount)
@@ -29,6 +27,24 @@ function marketplaceFeeFromAmount(amount: number): number {
 }
 
 export const mercadopagoRoute = new Hono()
+  .get("/auth-url", authMiddleware, async (c) => {
+    const { tenantId } = (c as unknown as AuthenticatedContext).staff
+    c.header("Cache-Control", "no-store")
+    if (!tenantId) return c.json({ error: "Productora no configurada" }, 400)
+
+    try {
+      const config = getMpOAuthConfig()
+      console.info("[MP OAuth] Inicio de vinculación", {
+        tenantId,
+        clientId: config.clientId,
+        redirectUri: config.redirectUri,
+      })
+      return c.json({ url: buildMpAuthorizationUrl(tenantId, config) })
+    } catch (error) {
+      console.error("[MP OAuth] Configuración inválida:", error instanceof Error ? error.message : "Error desconocido")
+      return c.json({ error: "Mercado Pago no está configurado correctamente. Contactá al administrador de Crow." }, 503)
+    }
+  })
   .get("/callback", async (c) => {
     const code = c.req.query("code")
     const rawState = c.req.query("state") || ""
@@ -38,6 +54,15 @@ export const mercadopagoRoute = new Hono()
     const source = stateParts[1] || "perfil"
     const basePath = source === "onboarding" ? "/onboarding" : "/dashboard/perfil"
 
+    const authorizationError = c.req.query("error")
+    if (authorizationError) {
+      const denied = authorizationError === "access_denied"
+      console.warn("[MP OAuth] Autorización rechazada", {
+        reason: denied ? "access_denied" : "authorization_failed",
+      })
+      return c.redirect(`${ADMIN_URL}${basePath}?mp_status=error&mp_error=${denied ? "access_denied" : "authorization_failed"}`)
+    }
+
     if (!code || !tenantId) {
       console.error("❌ MP Callback: Faltan code o state")
       return c.redirect(
@@ -45,8 +70,10 @@ export const mercadopagoRoute = new Hono()
       )
     }
 
-    if (!MP_CLIENT_ID || !MP_CLIENT_SECRET || !MP_REDIRECT_URI) {
-      console.error("❌ MP Callback: Faltan credenciales o MP_REDIRECT_URI de MercadoPago")
+    try {
+      getMpOAuthConfig()
+    } catch {
+      console.error("❌ MP Callback: Configuración de Mercado Pago inválida")
       return c.redirect(
         `${ADMIN_URL}${basePath}?mp_status=error&mp_error=config_error`
       )

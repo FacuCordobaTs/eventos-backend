@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { eq } from "drizzle-orm"
 import { pool } from "../db"
 import { tenants } from "../db/schema"
+import { getMpOAuthConfig } from "./mp-oauth-config"
 
 const MP_OAUTH_TOKEN_URL = "https://api.mercadopago.com/oauth/token"
 const MP_USERS_ME_URL = "https://api.mercadopago.com/users/me"
@@ -14,13 +15,13 @@ type MpTokenResponse = {
 }
 
 function mpClientId(): string {
-  const v = process.env.MP_CLIENT_ID
+  const v = process.env.MP_CLIENT_ID?.trim()
   if (!v) throw new Error("MP_CLIENT_ID no configurado")
   return v
 }
 
 function mpClientSecret(): string {
-  const v = process.env.MP_CLIENT_SECRET
+  const v = process.env.MP_CLIENT_SECRET?.trim()
   if (!v) throw new Error("MP_CLIENT_SECRET no configurado")
   return v
 }
@@ -147,21 +148,27 @@ export async function intercambiarCodigoPorTokens(params: {
   code: string
   tenantId: string
 }): Promise<{ accessToken: string; refreshToken: string; publicKey?: string; userId?: string } | null> {
-  const redirectUri = process.env.MP_REDIRECT_URI
-  if (!redirectUri) {
-    throw new Error("MP_REDIRECT_URI no configurado")
-  }
+  const { clientId, clientSecret, redirectUri } = getMpOAuthConfig()
 
   const body = new URLSearchParams({
     grant_type: "authorization_code",
-    client_id: mpClientId(),
-    client_secret: mpClientSecret(),
+    client_id: clientId,
+    client_secret: clientSecret,
     code: params.code,
     redirect_uri: redirectUri,
   })
 
   const res = await postMpOAuth(body)
   if (!res.ok) {
+    // No registrar el body completo: puede contener códigos o credenciales.
+    const failure = await res.json().catch(() => null) as { error?: unknown } | null
+    const knownErrors = ["invalid_client", "invalid_grant", "invalid_request", "unauthorized_client", "unsupported_grant_type", "invalid_scope"]
+    const reason = typeof failure?.error === "string" && knownErrors.includes(failure.error)
+      ? failure.error
+      : "oauth_failed"
+    console.error("[MP OAuth] Falló el intercambio de código", {
+      status: res.status, reason, clientId, redirectUri,
+    })
     return null
   }
 
