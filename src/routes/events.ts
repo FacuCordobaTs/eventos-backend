@@ -60,6 +60,7 @@ import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, getBalance } from "../lib/balance"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
+import { admissionWindowFields, isAdmissionWindowOrdered } from "../lib/ticket-admission"
 import {
   EVENT_STATUSES,
   eventStatusRank,
@@ -167,6 +168,7 @@ const patchEventSchema = z
   })
 
 const createTicketTypeSchema = z.object({
+  ...admissionWindowFields,
   name: z.string().min(1).max(100),
   price: z.coerce.number().nonnegative(),
   stockLimit: z
@@ -177,6 +179,7 @@ const createTicketTypeSchema = z.object({
 // Edición de un tipo de entrada (spec §4.2: persiste al blur, sin "Guardar" global).
 // Todos los campos opcionales: el front manda solo lo que cambió.
 const patchTicketTypeSchema = z.object({
+  ...admissionWindowFields,
   name: z.string().min(1).max(100).optional(),
   price: z.coerce.number().nonnegative().optional(),
   stockLimit: z
@@ -1340,6 +1343,8 @@ function sanitizeTicketType(
     price: row.price,
     stockLimit: row.stockLimit,
     sold,
+    validFrom: row.validFrom?.toISOString() ?? null,
+    validUntil: row.validUntil?.toISOString() ?? null,
     remaining,
     // Cortesías canjeadas de este tipo, contadas aparte de `sold`.
     courtesies: courtesyCount,
@@ -1579,6 +1584,8 @@ export const eventsRoute = new Hono()
           name: t.name,
           price: t.price,
           stockLimit: t.stockLimit,
+          validFrom: t.validFrom ? new Date(t.validFrom.getTime() + newDate.getTime() - source.date.getTime()) : null,
+          validUntil: t.validUntil ? new Date(t.validUntil.getTime() + newDate.getTime() - source.date.getTime()) : null,
         })
       }
 
@@ -1732,6 +1739,9 @@ export const eventsRoute = new Hono()
     }
     const id = uuidv4()
     const priceStr = body.price.toFixed(2)
+    if (!isAdmissionWindowOrdered(body)) {
+      return c.json({ error: "El horario hasta debe ser posterior al horario desde." }, 400)
+    }
     await db.insert(ticketTypes).values({
       id,
       eventId,
@@ -1739,6 +1749,8 @@ export const eventsRoute = new Hono()
       name: body.name,
       price: priceStr,
       stockLimit: body.stockLimit ?? null,
+      validFrom: body.validFrom ? new Date(body.validFrom) : null,
+      validUntil: body.validUntil ? new Date(body.validUntil) : null,
     })
     const [row] = await db
       .select()
@@ -1778,6 +1790,11 @@ export const eventsRoute = new Hono()
       if (body.name !== undefined) patch.name = body.name
       if (body.price !== undefined) patch.price = body.price.toFixed(2)
       if (body.stockLimit !== undefined) patch.stockLimit = body.stockLimit
+      if (body.validFrom !== undefined) patch.validFrom = body.validFrom ? new Date(body.validFrom) : null
+      if (body.validUntil !== undefined) patch.validUntil = body.validUntil ? new Date(body.validUntil) : null
+      if (!isAdmissionWindowOrdered({ ...row, ...patch })) {
+        return c.json({ error: "El horario hasta debe ser posterior al horario desde." }, 400)
+      }
       if (Object.keys(patch).length > 0) {
         await db
           .update(ticketTypes)

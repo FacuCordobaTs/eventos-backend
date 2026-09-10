@@ -320,6 +320,9 @@ export const ticketTypes = mysqlTable(
     name: varchar('name', { length: 100 }).notNull(), // "General", "VIP", "Mesa"
     price: decimal('price', { precision: 10, scale: 2 }).notNull(),
     stockLimit: int('stock_limit'), // null = ilimitado
+    // Ventana de ingreso/reingreso, instantes UTC. null = sin límite en ese extremo.
+    validFrom: timestamp('valid_from'),
+    validUntil: timestamp('valid_until'),
   },
   (table) => ({
     tenantIdIdx: index('ticket_types_tenant_id_idx').on(table.tenantId),

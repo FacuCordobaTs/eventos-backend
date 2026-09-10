@@ -218,6 +218,13 @@
       "when": 1781801718085,
       "tag": "0030_fast_silver_centurion",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "5",
+      "when": 1788998400000,
+      "tag": "0059_ticket_type_admission_window",
+      "breakpoints": true
     }
   ]
 }

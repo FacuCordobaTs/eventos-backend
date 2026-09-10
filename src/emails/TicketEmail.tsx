@@ -14,6 +14,7 @@ import {
 } from "@react-email/components"
 
 export type TicketEmailItem = {
+  admissionWindow?: string | null
   id: string
   name: string
 }
@@ -198,6 +199,7 @@ export function TicketEmail({
               >
                 {item.name}
               </Text>
+              {item.admissionWindow && <Text style={{ margin: "0 0 20px", fontSize: "14px", color: color.paper }}>{item.admissionWindow}</Text>}
               <Img
                 src={`cid:${item.id}`}
                 width={200}

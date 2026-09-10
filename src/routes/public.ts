@@ -469,6 +469,8 @@ export const publicRoute = new Hono()
         name: t.name,
         price: t.price,
         stockLimit: t.stockLimit,
+        validFrom: t.validFrom?.toISOString() ?? null,
+        validUntil: t.validUntil?.toISOString() ?? null,
         sold,
         remaining,
         availableForPurchase: limit == null || sold < limit,
@@ -1127,6 +1129,8 @@ export const publicRoute = new Hono()
           status: tickets.status,
           ticketTypeName: ticketTypes.name,
           ticketTypePrice: ticketTypes.price,
+          validFrom: ticketTypes.validFrom,
+          validUntil: ticketTypes.validUntil,
           buyerName: tickets.buyerName,
         })
         .from(tickets)
@@ -1248,7 +1252,8 @@ export const publicRoute = new Hono()
         id: r.id,
         qrHash: r.qrHash,
         status: r.status,
-        ticketType: { name: r.ticketTypeName, price: r.ticketTypePrice },
+        ticketType: { name: r.ticketTypeName, price: r.ticketTypePrice,
+          validFrom: r.validFrom?.toISOString() ?? null, validUntil: r.validUntil?.toISOString() ?? null },
       })),
       consumptions: [
         ...addonConsumptionRows.map((r) => ({

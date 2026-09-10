@@ -16,6 +16,7 @@ import { qrCodeDataUrl } from "../lib/qr"
 import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
 import { findActiveBlacklistEntry } from "../lib/admission-blacklist"
 import { broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
+import { admissionWindowError, selectAdmissionTicket, type AdmissionWindow } from "../lib/ticket-admission"
 
 // Venta manual (spec §4.2): pide lo mínimo — tipo → cobrar → listo. Nombre, correo y DNI opcionales.
 // El DNI (tarea 1.1/1.2) se guarda como snapshot en `tickets.buyer_dni`: es lo que la puerta
@@ -88,7 +89,7 @@ function sanitizeValidatedTicket(row: typeof tickets.$inferSelect) {
 }
 
 /** Fila mínima de ticket + su tipo que `applyGateValidation` necesita para operar. */
-type GateRow = {
+type GateRow = AdmissionWindow & {
   id: string
   eventId: string
   saleId: string | null
@@ -117,6 +118,7 @@ type GateOutcome =
       kind: "err"
       status: 400 | 403 | 404 | 409
       error: string
+      code?: "TICKET_OUTSIDE_ADMISSION_WINDOW"
       blacklist?: {
         motivo: string
         foto: string | null
@@ -130,6 +132,8 @@ type GateOutcome =
       /** Tarea 3.2 — id del tipo de entrada (para el mapa de color de la puerta). */
       ticketTypeId: string
       ticketTypeName: string
+      validFrom: string | null
+      validUntil: string | null
       reentry?: boolean
       gatePassCount?: number
     }
@@ -172,6 +176,11 @@ async function applyGateValidation(
     return { kind: "err" as const, status: 404 as const, error: "Ticket inválido" }
   }
 
+  const scheduleError = admissionWindowError(row)
+  if (scheduleError) {
+    return { kind: "err", status: 403, error: scheduleError, code: "TICKET_OUTSIDE_ADMISSION_WINDOW" }
+  }
+
   // Tarea 1.3 — Reingreso: un ticket USED vuelve a pasar SOLO si el evento tiene
   // `allowReentry` (visión §2.4: "Si ya entró con esa entrada, avisa"). Se registra otro
   // pase IN en `gate_logs` y la respuesta avisa `reentry: true` — la pantalla de puerta
@@ -211,6 +220,8 @@ async function applyGateValidation(
       ticket: sanitizeValidatedTicket(updated),
       ticketTypeId: row.ticketTypeId,
       ticketTypeName: row.ticketTypeName,
+      validFrom: row.validFrom ? new Date(row.validFrom).toISOString() : null,
+      validUntil: row.validUntil ? new Date(row.validUntil).toISOString() : null,
       reentry: true,
       gatePassCount: await countInPasses(tx, row.id),
     }
@@ -250,6 +261,8 @@ async function applyGateValidation(
     ticket: sanitizeValidatedTicket(updated),
     ticketTypeId: row.ticketTypeId,
     ticketTypeName: row.ticketTypeName,
+    validFrom: row.validFrom ? new Date(row.validFrom).toISOString() : null,
+    validUntil: row.validUntil ? new Date(row.validUntil).toISOString() : null,
   }
 }
 
@@ -352,6 +365,8 @@ export const ticketsRoute = new Hono()
           buyerDni: tickets.buyerDni,
           qrHash: tickets.qrHash,
           ticketTypeName: ticketTypes.name,
+          validFrom: ticketTypes.validFrom,
+          validUntil: ticketTypes.validUntil,
           // Tarea 3.2 — el scanner colorea la entrada por tipo (VIP = dorado, General = blanco).
           ticketTypeId: ticketTypes.id,
           typeEventId: ticketTypes.eventId,
@@ -398,7 +413,7 @@ export const ticketsRoute = new Hono()
           403
         )
       }
-      return c.json({ error: outcome.error }, outcome.status)
+      return c.json({ error: outcome.error, ...("code" in outcome ? { code: outcome.code } : {}) }, outcome.status)
     }
 
     void notifyTicketOwner(outcome.ticket.id)
@@ -409,6 +424,8 @@ export const ticketsRoute = new Hono()
       // Tarea 3.2 — id del tipo para el mapa de color de la puerta (VIP dorado, General blanco).
       ticketTypeId: outcome.ticketTypeId,
       ticketTypeName: outcome.ticketTypeName,
+      validFrom: outcome.validFrom,
+      validUntil: outcome.validUntil,
       ...(outcome.reentry
         ? { reentry: true as const, gatePassCount: outcome.gatePassCount }
         : {}),
@@ -442,6 +459,8 @@ export const ticketsRoute = new Hono()
           buyerDni: tickets.buyerDni,
           qrHash: tickets.qrHash,
           ticketTypeName: ticketTypes.name,
+          validFrom: ticketTypes.validFrom,
+          validUntil: ticketTypes.validUntil,
           // Tarea 3.2 — el scanner colorea la entrada por tipo (VIP = dorado, General = blanco).
           ticketTypeId: ticketTypes.id,
         })
@@ -466,7 +485,7 @@ export const ticketsRoute = new Hono()
         }
       }
 
-      const row = rows.find((r) => r.status === "PENDING") ?? rows[rows.length - 1]
+      const row = selectAdmissionTicket(rows)!
       return applyGateValidation(tx, row, staffId, tenantId)
     })
 
@@ -484,7 +503,7 @@ export const ticketsRoute = new Hono()
           403
         )
       }
-      return c.json({ error: outcome.error }, outcome.status)
+      return c.json({ error: outcome.error, ...("code" in outcome ? { code: outcome.code } : {}) }, outcome.status)
     }
 
     void notifyTicketOwner(outcome.ticket.id)
@@ -497,6 +516,8 @@ export const ticketsRoute = new Hono()
       buyerName: outcome.ticket.buyerName,
       ticketTypeId: outcome.ticketTypeId,
       ticketTypeName: outcome.ticketTypeName,
+      validFrom: outcome.validFrom,
+      validUntil: outcome.validUntil,
       status: outcome.ticket.status,
       ...(outcome.reentry
         ? { reentry: true as const, gatePassCount: outcome.gatePassCount }

@@ -11,6 +11,7 @@ import {
   tickets,
 } from "../db/schema"
 import { TicketEmail } from "../emails/TicketEmail"
+import { formatAdmissionWindow } from "./ticket-admission"
 
 
 type CheckoutContact = {
@@ -19,6 +20,7 @@ type CheckoutContact = {
 }
 
 type EmailItem = {
+  admissionWindow?: string | null
   id: string
   name: string
   qrBuffer: Buffer
@@ -67,6 +69,8 @@ export async function sendGuestCheckoutReceiptEmail(input: {
       id: tickets.id,
       qrHash: tickets.qrHash,
       ticketTypeName: ticketTypes.name,
+      validFrom: ticketTypes.validFrom,
+      validUntil: ticketTypes.validUntil,
     })
     .from(tickets)
     .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
@@ -108,6 +112,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     emailItems.push({
       id: row.id,
       name: `Entrada · ${row.ticketTypeName}`,
+      admissionWindow: formatAdmissionWindow(row),
       qrBuffer,
     })
   }
@@ -134,7 +139,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
   const resend = new Resend(apiKey)
   const subject = receiptEmailSubject(eventName, ticketCount)
 
-  const itemsForReact = emailItems.map((i) => ({ id: i.id, name: i.name }))
+  const itemsForReact = emailItems.map((i) => ({ id: i.id, name: i.name, admissionWindow: i.admissionWindow }))
 
   const attachments =
     emailItems.length > 0
@@ -200,6 +205,8 @@ export async function sendManualTicketQrEmail(input: {
       buyerEmail: tickets.buyerEmail,
       eventName: events.name,
       ticketTypeName: ticketTypes.name,
+      validFrom: ticketTypes.validFrom,
+      validUntil: ticketTypes.validUntil,
     })
     .from(tickets)
     .innerJoin(events, eq(tickets.eventId, events.id))
@@ -252,7 +259,7 @@ export async function sendManualTicketQrEmail(input: {
       userName: (row.buyerName ?? "Asistente").trim(),
       eventName: row.eventName,
       receiptUrl,
-      items: [{ id: row.id, name: itemName }],
+      items: [{ id: row.id, name: itemName, admissionWindow: formatAdmissionWindow(row) }],
     }),
     attachments: [
       {
