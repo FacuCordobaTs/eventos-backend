@@ -45,7 +45,7 @@ import {
   requestAccessCode,
   verifyAccessCode,
 } from "../lib/customer-access"
-import { clientIp, consumeRateLimit } from "../lib/rate-limit"
+import { clientIp, consumeRateLimit, releaseRateLimit } from "../lib/rate-limit"
 
 const customerAccessSchema = z.object({
   type: z.enum(["email", "phone", "dni"]),
@@ -446,20 +446,23 @@ export const publicRoute = new Hono()
           return c.json({ error: "Demasiados intentos. Esperá unos minutos." }, 429)
         }
       }
+      const cooldownKey = `access:cd:${ev.id}:${identifier.value}`
       const cooldown = consumeRateLimit(
-        `access:cd:${ev.id}:${identifier.value}`,
+        cooldownKey,
         ACCESS_COOLDOWN.limit,
         ACCESS_COOLDOWN.windowMs
       )
       if (!cooldown.ok) {
         return c.json({ error: "Ya te enviamos un código. Esperá un minuto." }, 429)
       }
+      const hourlyKey = `access:h:${ev.id}:${identifier.value}`
       const hourly = consumeRateLimit(
-        `access:h:${ev.id}:${identifier.value}`,
+        hourlyKey,
         ACCESS_LIMIT_PER_PHONE.limit,
         ACCESS_LIMIT_PER_PHONE.windowMs
       )
       if (!hourly.ok) {
+        releaseRateLimit(cooldownKey, cooldown.at)
         return c.json({ error: "Pediste demasiados códigos. Probá más tarde." }, 429)
       }
 
@@ -472,6 +475,12 @@ export const publicRoute = new Hono()
       })
 
       if (!result.ok) {
+        // No salió ningún mensaje: los dos cupos vuelven a estar disponibles. El caso que importa
+        // es `NEEDS_*`, donde el drawer pide el dato que falta y reintenta enseguida; si el cupo
+        // quedara tomado, ese reintento recibiría un "ya te enviamos un código" falso. La cuota
+        // por IP sí sigue contando el intento, que es la que acota el abuso.
+        releaseRateLimit(cooldownKey, cooldown.at)
+        releaseRateLimit(hourlyKey, hourly.at)
         // `NEEDS_*` no es un error: el drawer pide el dato que falta y vuelve a llamar.
         if (result.reason === "NEEDS_PHONE" || result.reason === "NEEDS_REGISTRATION") {
           return c.json({ error: result.error, reason: result.reason }, 400)

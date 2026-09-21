@@ -17,7 +17,8 @@ const SWEEP_EVERY = 500
 let sinceSweep = 0
 
 export type RateLimitResult =
-  | { ok: true }
+  /** `at` identifica el consumo: es lo que recibe `releaseRateLimit` para deshacerlo. */
+  | { ok: true; at: number }
   /** `retryAfterMs` es cuánto falta para que la ventana libere un lugar. */
   | { ok: false; retryAfterMs: number }
 
@@ -52,7 +53,25 @@ export function consumeRateLimit(
     }
   }
 
-  return { ok: true }
+  return { ok: true, at: now }
+}
+
+/**
+ * Deshace un consumo puntual. Un endpoint puede necesitar reservar el cupo antes de saber si el
+ * trabajo se hizo —el código de acceso lo consume y recién después intenta el envío— y un intento
+ * que no mandó nada no debe dejar la ventana cerrada: el cliente vería "ya te enviamos un código"
+ * por un mensaje que nunca salió, y encima esperando el minuto completo.
+ *
+ * Quita exactamente el consumo de `at`. Si entremedio otra petición consumió la misma clave, su
+ * marca es otra y no se toca.
+ */
+export function releaseRateLimit(key: string, at: number): void {
+  const hits = buckets.get(key)
+  if (!hits) return
+  const index = hits.indexOf(at)
+  if (index === -1) return
+  hits.splice(index, 1)
+  if (hits.length === 0) buckets.delete(key)
 }
 
 /** Limpia el estado. Para tests: sin esto, un caso deja la ventana sucia para el siguiente. */
