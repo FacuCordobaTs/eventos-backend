@@ -77,8 +77,9 @@ function isDeliverableEmail(email: string): boolean {
 
 /**
  * Resuelve el evento del link de acceso, por slug o por id (el link usa el slug cuando existe y
- * el id cuando no). `draft` no es público; `closed` sí, porque el cliente todavía tiene que poder
- * entrar a ver sus entradas después del evento.
+ * el id cuando no). No filtra por `status`: `draft` ya es público en este repo (la tienda y el
+ * listado sólo excluyen `closed`) y `closed` tiene que seguir funcionando, porque después del
+ * evento el cliente todavía necesita entrar a ver sus entradas.
  */
 async function resolveEventForAccess(
   db: MySql2Database<Record<string, never>>,
@@ -89,8 +90,7 @@ async function resolveEventForAccess(
     .from(events)
     .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
     .limit(1)
-  if (!ev || ev.status === "draft") return null
-  return ev
+  return ev ?? null
 }
 
 async function countIssued(
