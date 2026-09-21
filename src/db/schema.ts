@@ -1091,6 +1091,38 @@ export const magicLinks = mysqlTable(
   })
 );
 
+// Acceso de cliente por DNI/celular (link `crow.ar/{slug}/acceso`): código numérico de un solo uso
+// que viaja por WhatsApp con un template de autenticación de Meta. Es el equivalente del magic
+// link de staff para el cliente final, que no tiene contraseña ni email obligatorio.
+// `customerId` null = alta rápida pendiente: el DNI no existía y el cliente se crea recién al
+// verificar el código, para no dejar fichas huérfanas. `phone` es el destino del código y puede
+// ser un celular que todavía no está en `customers` (cliente creado en caja solo con DNI): se
+// persiste en su ficha al verificar, nunca antes. `codeHash` es sha256(código + id) — el id de la
+// fila oficia de sal. Aditiva.
+export const customerAccessCodes = mysqlTable(
+  'customer_access_codes',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    customerId: varchar('customer_id', { length: 36 }).references(() => customers.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    /** Datos que trajo el cliente cuando el DNI no existía. Solo alta rápida. */
+    pendingName: varchar('pending_name', { length: 255 }),
+    pendingDni: varchar('pending_dni', { length: 20 }),
+    phone: varchar('phone', { length: 255 }).notNull(),
+    codeHash: varchar('code_hash', { length: 64 }).notNull(),
+    /** Intentos fallidos. El código se corta al llegar al tope. */
+    attempts: int('attempts').notNull().default(0),
+    consumedAt: timestamp('consumed_at'),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    customerIdx: index('customer_access_codes_customer_idx').on(table.customerId, table.eventId),
+    expiresIdx: index('customer_access_codes_expires_idx').on(table.expiresAt),
+  })
+);
+
 // Sesión de puesto (spec §1): "el administrador abre el POS en un teléfono o tablet y lo fija a un
 // puesto concreto; a partir de ahí el personal rota sobre ese dispositivo identificándose solo con
 // su PIN." Cada fila fija un dispositivo a un evento y (opcionalmente) a una barra/puesto; su

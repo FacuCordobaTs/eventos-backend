@@ -33,7 +33,7 @@ export type ClientCheckoutContact = {
    * real de un cliente existente y los nuevos se crean con un email sintético. */
   email: string
   phone: string
-  /** Tarea 1.1 — DNI del comprador (identidad dentro del evento). Opcional: hoy no se pide en el checkout; lo manda F2. */
+  /** DNI del comprador (identidad dentro del evento). El checkout público lo solicita; sigue opcional para flujos internos/legacy. */
   dni?: string
   /** Fecha de nacimiento conocida (ej. parseada del código de barras en puerta). Opcional por ahora — el +18 es en puerta. */
   birthDate?: Date | null

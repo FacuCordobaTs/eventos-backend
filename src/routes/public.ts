@@ -2,6 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
+import type { MySql2Database } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   courtesies,
@@ -37,16 +38,59 @@ import {
   sendWhatsAppTemplateMessage,
 } from "../lib/whatsapp-service"
 import { eventSupportsConsumptions } from "../lib/event-operation-mode"
+import { verifyToken } from "../lib/jwt"
+import {
+  normalizeIdentifier,
+  requestAccessCode,
+  verifyAccessCode,
+} from "../lib/customer-access"
+import { clientIp, consumeRateLimit } from "../lib/rate-limit"
 
 const customerAccessSchema = z.object({
   type: z.enum(["email", "phone", "dni"]),
   value: z.string().trim().min(1).max(255),
 })
 
+const eventAccessRequestSchema = z.object({
+  value: z.string().trim().min(1).max(255),
+  /** Celular a verificar cuando la ficha no tiene uno, o en el alta rápida. */
+  phone: z.string().trim().max(255).optional(),
+  /** Nombre del alta rápida. */
+  name: z.string().trim().max(255).optional(),
+})
+
+const eventAccessVerifySchema = z.object({
+  challenge: z.string().trim().min(1).max(64),
+  code: z.string().trim().min(4).max(10),
+})
+
+/** Límites del pedido de código. Sin esto, el endpoint es un amplificador de WhatsApps. */
+const ACCESS_LIMIT_PER_IP = { limit: 10, windowMs: 15 * 60 * 1000 }
+const ACCESS_LIMIT_PER_PHONE = { limit: 5, windowMs: 60 * 60 * 1000 }
+const ACCESS_COOLDOWN = { limit: 1, windowMs: 60 * 1000 }
+
 const CLIENT_URL = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(/\/$/, "")
 
 function isDeliverableEmail(email: string): boolean {
   return !email.toLowerCase().endsWith("@crow.local")
+}
+
+/**
+ * Resuelve el evento del link de acceso, por slug o por id (el link usa el slug cuando existe y
+ * el id cuando no). `draft` no es público; `closed` sí, porque el cliente todavía tiene que poder
+ * entrar a ver sus entradas después del evento.
+ */
+async function resolveEventForAccess(
+  db: MySql2Database<Record<string, never>>,
+  slugOrId: string
+) {
+  const [ev] = await db
+    .select()
+    .from(events)
+    .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
+    .limit(1)
+  if (!ev || ev.status === "draft") return null
+  return ev
 }
 
 async function countIssued(
@@ -271,17 +315,29 @@ export const publicRoute = new Hono()
   })
   .get("/customers/profile/:token", async (c) => {
     const db = drizzle(pool)
+    const token = c.req.param("token")
+
+    // Dos credenciales abren esta página: el token de venta de toda la vida (los links del mail)
+    // y la sesión que emite el acceso por DNI/celular desde `/{slug}/acceso`.
     const [credential] = await db
       .select({ customerId: sales.customerId })
       .from(sales)
-      .where(eq(sales.receiptToken, c.req.param("token")))
+      .where(eq(sales.receiptToken, token))
       .limit(1)
 
-    if (!credential?.customerId) return c.json({ error: "El enlace no es válido" }, 404)
+    let customerId = credential?.customerId ?? null
+    if (!customerId) {
+      try {
+        customerId = (await verifyToken(token, "customer")).sub
+      } catch {
+        return c.json({ error: "El enlace no es válido" }, 404)
+      }
+    }
+
     const [customer] = await db
       .select({ id: customers.id, name: customers.name })
       .from(customers)
-      .where(and(eq(customers.id, credential.customerId), eq(customers.isActive, true)))
+      .where(and(eq(customers.id, customerId), eq(customers.isActive, true)))
       .limit(1)
     if (!customer) return c.json({ error: "El enlace no es válido" }, 404)
 
@@ -340,6 +396,138 @@ export const publicRoute = new Hono()
       })),
     })
   })
+  // Link de acceso por evento (`crow.ar/{slug}/acceso`): el flyer y el botón de ingreso, sin la
+  // tienda entera. A diferencia de `GET /events/:id`, responde también para eventos cerrados —
+  // después del evento el cliente todavía tiene que poder entrar a ver sus entradas.
+  .get("/events/:id/access", async (c) => {
+    const db = drizzle(pool)
+    const ev = await resolveEventForAccess(db, c.req.param("id"))
+    if (!ev) return c.json({ error: "Evento no encontrado" }, 404)
+
+    const [productora] = await db
+      .select({
+        name: tenants.name,
+        whatsappEnabled: tenants.whatsappEnabled,
+        whatsappToken: tenants.whatsappToken,
+        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
+      })
+      .from(tenants)
+      .where(eq(tenants.id, ev.tenantId))
+      .limit(1)
+
+    return c.json({
+      event: {
+        id: ev.id,
+        name: ev.name,
+        date: ev.date,
+        venue: ev.venue,
+        location: ev.location,
+        imageUrl: ev.imageUrl,
+        status: ev.status,
+      },
+      productora: { name: productora?.name ?? "" },
+      // Sólo si el envío está disponible — nunca los tokens del tenant.
+      whatsappEnabled: Boolean(
+        productora?.whatsappEnabled &&
+          productora.whatsappToken &&
+          productora.whatsappPhoneNumberId
+      ),
+    })
+  })
+  .post(
+    "/events/:id/access/request",
+    zValidator("json", eventAccessRequestSchema),
+    async (c) => {
+      const db = drizzle(pool)
+      const body = c.req.valid("json")
+      const ev = await resolveEventForAccess(db, c.req.param("id"))
+      if (!ev) return c.json({ error: "Evento no encontrado" }, 404)
+
+      const identifier = normalizeIdentifier(body.value)
+      if (!identifier) {
+        return c.json({ error: "Ingresá tu DNI o tu celular." }, 400)
+      }
+
+      // Sin límites, este endpoint manda un WhatsApp a cualquier cliente con sólo saber su DNI.
+      const ip = clientIp(c.req.raw.headers)
+      if (ip) {
+        const byIp = consumeRateLimit(
+          `access:ip:${ip}`,
+          ACCESS_LIMIT_PER_IP.limit,
+          ACCESS_LIMIT_PER_IP.windowMs
+        )
+        if (!byIp.ok) {
+          return c.json({ error: "Demasiados intentos. Esperá unos minutos." }, 429)
+        }
+      }
+      const cooldown = consumeRateLimit(
+        `access:cd:${ev.id}:${identifier.value}`,
+        ACCESS_COOLDOWN.limit,
+        ACCESS_COOLDOWN.windowMs
+      )
+      if (!cooldown.ok) {
+        return c.json({ error: "Ya te enviamos un código. Esperá un minuto." }, 429)
+      }
+      const hourly = consumeRateLimit(
+        `access:h:${ev.id}:${identifier.value}`,
+        ACCESS_LIMIT_PER_PHONE.limit,
+        ACCESS_LIMIT_PER_PHONE.windowMs
+      )
+      if (!hourly.ok) {
+        return c.json({ error: "Pediste demasiados códigos. Probá más tarde." }, 429)
+      }
+
+      const [tenant] = await db
+        .select({
+          whatsappEnabled: tenants.whatsappEnabled,
+          whatsappToken: tenants.whatsappToken,
+          whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
+        })
+        .from(tenants)
+        .where(eq(tenants.id, ev.tenantId))
+        .limit(1)
+
+      const result = await requestAccessCode(db, {
+        eventId: ev.id,
+        tenantId: ev.tenantId,
+        whatsapp: {
+          enabled: Boolean(tenant?.whatsappEnabled),
+          token: tenant?.whatsappToken ?? null,
+          phoneNumberId: tenant?.whatsappPhoneNumberId ?? null,
+        },
+        identifier,
+        phone: body.phone ?? null,
+        name: body.name ?? null,
+      })
+
+      if (!result.ok) {
+        // `NEEDS_*` no es un error: el drawer pide el dato que falta y vuelve a llamar.
+        if (result.reason === "NEEDS_PHONE" || result.reason === "NEEDS_REGISTRATION") {
+          return c.json({ error: result.error, reason: result.reason }, 400)
+        }
+        if (result.reason === "WHATSAPP_UNAVAILABLE") {
+          return c.json({ error: result.error, reason: result.reason }, 503)
+        }
+        return c.json({ error: result.error, reason: result.reason }, 502)
+      }
+
+      return c.json({ ok: true, challenge: result.challenge, to: result.to })
+    }
+  )
+  .post(
+    "/events/:id/access/verify",
+    zValidator("json", eventAccessVerifySchema),
+    async (c) => {
+      const db = drizzle(pool)
+      const body = c.req.valid("json")
+      const result = await verifyAccessCode(db, {
+        challenge: body.challenge,
+        code: body.code,
+      })
+      if (!result.ok) return c.json({ error: result.error, reason: result.reason }, 400)
+      return c.json({ ok: true, token: result.token, name: result.name })
+    }
+  )
   .get("/events", async (c) => {
     const db = drizzle(pool)
     const tenantFilter = c.req.query("productoraId")

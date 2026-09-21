@@ -9,6 +9,11 @@
  *   - `crow_recordatorio` (MARKETING, es_AR) — recordatorio 1 h antes (tarea 8.2),
  *     cuerpo: {{1}} nombre, {{2}} nombre del evento; botón URL dinámico índice 0:
  *     "Ir al evento". El link no forma parte del texto del mensaje.
+ *   - `crow_acceso_perfil` (UTILITY, es_AR) — link al perfil del cliente, con botón URL
+ *     dinámico "Ver mis eventos".
+ *   - `crow_codigo_acceso` (AUTHENTICATION, es_AR) — código de 6 dígitos para entrar con
+ *     DNI o celular desde el link por evento; botón "copiar código" de Meta, que se
+ *     completa con el mismo código que el cuerpo.
  *
  * Si mañana se muda a Twilio, se reemplaza la implementación de este archivo sin
  * tocar los callers: las firmas de `validateWhatsAppConnection` y
@@ -26,6 +31,13 @@ export const TEST_TEMPLATE = "crow_prueba"
  * dinámico "Ver mis eventos" configurado como `https://crow.ar/{{1}}`.
  */
 export const CUSTOMER_PROFILE_TEMPLATE = "crow_acceso_perfil"
+/**
+ * Template AUTHENTICATION `crow_codigo_acceso` (es_AR): cuerpo con {{1}} = código de 6 dígitos y
+ * botón "copiar código" (que Meta resuelve con su propia URL, por eso el mismo valor va también
+ * como parámetro del botón). Es el que usa el acceso de cliente por DNI/celular desde el link por
+ * evento. Tiene que estar aprobado en WhatsApp Manager con la categoría AUTHENTICATION.
+ */
+export const CUSTOMER_AUTH_TEMPLATE = "crow_codigo_acceso"
 
 /**
  * Normaliza un número argentino a formato internacional de WhatsApp (sin +):

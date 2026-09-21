@@ -2,7 +2,11 @@ import * as jwt from "jsonwebtoken"
 
 const secret = () => process.env.JWT_SECRET ?? "fallback-secret"
 
-export type TokenAudience = "staff"
+/**
+ * "staff" es el personal (admin, POS, puerta). "customer" es el cliente final que se autenticó
+ * con el código de WhatsApp desde el link por evento; su `sub` es `customers.id`.
+ */
+export type TokenAudience = "staff" | "customer"
 
 export type AccessTokenPayload = {
   sub: string
@@ -11,12 +15,12 @@ export type AccessTokenPayload = {
 
 export function createAccessToken(
   sub: string,
-  _aud: TokenAudience = "staff",
-  expiresIn: "365d" | "60d" = "365d"
+  aud: TokenAudience = "staff",
+  expiresIn: "365d" | "60d" | "30d" = "365d"
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     jwt.sign(
-      { sub, aud: "staff" as const },
+      { sub, aud },
       secret(),
       { expiresIn },
       (err, token) => {
@@ -28,7 +32,14 @@ export function createAccessToken(
   })
 }
 
-export function verifyToken(token: string): Promise<AccessTokenPayload> {
+/**
+ * Verifica un token y exige que su audiencia sea la esperada. El default sigue siendo "staff",
+ * así que los llamadores existentes (middleware de staff y WS de stock) no cambian.
+ */
+export function verifyToken(
+  token: string,
+  expectedAud: TokenAudience = "staff"
+): Promise<AccessTokenPayload> {
   return new Promise((resolve, reject) => {
     jwt.verify(token, secret(), (err, decoded) => {
       if (err) reject(err)
@@ -40,9 +51,15 @@ export function verifyToken(token: string): Promise<AccessTokenPayload> {
             : typeof d.id === "string"
               ? d.id
               : null
-        if (!sub) reject(new Error("Token sin sujeto"))
-        if (d.aud !== "staff") reject(new Error("Token inválido"))
-        resolve({ sub, aud: "staff" })
+        if (!sub) {
+          reject(new Error("Token sin sujeto"))
+          return
+        }
+        if (d.aud !== expectedAud) {
+          reject(new Error("Token inválido"))
+          return
+        }
+        resolve({ sub, aud: expectedAud })
       }
     })
   })

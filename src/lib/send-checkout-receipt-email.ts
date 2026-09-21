@@ -105,8 +105,11 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     if (row.qrHash == null || row.qrHash === "") continue
     const qrBuffer = await toBuffer(row.qrHash, {
       type: "png",
-      width: 512,
-      margin: 2,
+      // 740 px = 37 módulos (29 de datos + 4 de quiet zone por lado) × 20 px. `TicketEmail.tsx`
+      // lo pinta a 200 px CSS, que en un teléfono DPR 3 son 600 px reales: 740 cubre eso sin
+      // que el cliente de correo tenga que interpolar la imagen.
+      width: 740,
+      margin: 4,
       color: { dark: "#000000ff", light: "#ffffffff" },
     })
     emailItems.push({
@@ -121,8 +124,8 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     if (row.qrHash == null || row.qrHash === "") continue
     const qrBuffer = await toBuffer(row.qrHash, {
       type: "png",
-      width: 512,
-      margin: 2,
+      width: 740,
+      margin: 4,
       color: { dark: "#000000ff", light: "#ffffffff" },
     })
     emailItems.push({
@@ -236,8 +239,8 @@ export async function sendManualTicketQrEmail(input: {
 
   const qrBuffer = await toBuffer(row.qrHash, {
     type: "png",
-    width: 512,
-    margin: 2,
+    width: 740,
+    margin: 4,
     color: { dark: "#000000ff", light: "#ffffffff" },
   })
 
