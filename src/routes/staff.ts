@@ -24,7 +24,7 @@ import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
-import { sendWhatsAppTemplateMessage } from "../lib/whatsapp-service"
+import { isWhatsAppConfigured, sendWhatsAppTemplateMessage } from "../lib/whatsapp-service"
 
 const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.crow.ar").replace(/\/$/, "")
 
@@ -606,21 +606,10 @@ export const staffRoute = new Hono()
     if (!invitation.inviteePhone?.trim()) {
       return c.json({ error: "Esta invitación no tiene un número de WhatsApp" }, 400)
     }
-    const [tenant] = await db
-      .select({
-        whatsappEnabled: tenants.whatsappEnabled,
-        whatsappToken: tenants.whatsappToken,
-        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
-      })
-      .from(tenants)
-      .where(eq(tenants.id, tenantId!))
-      .limit(1)
-    if (!tenant?.whatsappEnabled || !tenant.whatsappToken || !tenant.whatsappPhoneNumberId) {
-      return c.json({ error: "Configurá WhatsApp en la productora antes de enviar invitaciones." }, 400)
+    if (!isWhatsAppConfigured()) {
+      return c.json({ error: "El envío por WhatsApp no está disponible." }, 400)
     }
     const result = await sendWhatsAppTemplateMessage({
-      token: tenant.whatsappToken,
-      phoneNumberId: tenant.whatsappPhoneNumberId,
       to: invitation.inviteePhone,
       templateName: STAFF_INVITATION_TEMPLATE,
       bodyParameters: [invitation.inviteeName ?? "", invitation.role],

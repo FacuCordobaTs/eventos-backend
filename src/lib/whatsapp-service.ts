@@ -2,9 +2,11 @@
  * Tarea 8.1 — Proveedor de WhatsApp (visión §2.3).
  *
  * Abstracción de envío sobre la **Meta WhatsApp Cloud API** (Graph API v21.0).
- * Cada productora guarda sus credenciales por tenant (mismo patrón que Cucuru):
- * System User Access Token + ID del número de WhatsApp Business. Los templates se
- * aprueban en Meta Business Manager:
+ * Las credenciales son **de la plataforma y viven en el `.env` del VPS**
+ * (`WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID`): las productoras no cargan
+ * las suyas, así que todos los tenants salen por el mismo número de WhatsApp Business.
+ * Si faltan esas variables, el envío queda apagado para toda la plataforma. Los
+ * templates se aprueban una sola vez en el Meta Business Manager de Crow:
  *   - `crow_prueba`       (MARKETING, es_AR) — mensaje de prueba desde Configuración.
  *   - `crow_recordatorio` (MARKETING, es_AR) — recordatorio 1 h antes (tarea 8.2),
  *     cuerpo: {{1}} nombre, {{2}} nombre del evento; botón URL dinámico índice 0:
@@ -16,7 +18,7 @@
  *     completa con el mismo código que el cuerpo.
  *
  * Si mañana se muda a Twilio, se reemplaza la implementación de este archivo sin
- * tocar los callers: las firmas de `validateWhatsAppConnection` y
+ * tocar los callers: las firmas de `isWhatsAppConfigured` y
  * `sendWhatsAppTemplateMessage` no cambian.
  */
 
@@ -59,46 +61,30 @@ export function normalizeWhatsAppPhone(raw: string): string | null {
   return digits
 }
 
-export type WhatsAppConnectionInfo = {
-  ok: boolean
-  displayPhone?: string
-  verifiedName?: string
-  qualityRating?: string
-  error?: string
+/**
+ * Credenciales del número de WhatsApp Business de la plataforma. `WHATSAPP_PHONE` es sólo
+ * informativo: el número visible que Configuración le muestra a la productora.
+ */
+export type WhatsAppPlatformConfig = {
+  token: string
+  phoneNumberId: string
+  phone: string | null
 }
 
 /**
- * Valida las credenciales contra Meta consultando los datos del número de teléfono.
- * Es la prueba real de conexión: token inválido, sin permisos o ID inexistente
- * fallan acá, antes de guardar la config en el tenant.
+ * Lee las credenciales del entorno. `null` significa que el envío no está disponible para
+ * nadie (falta el `.env` del VPS); es el único interruptor de WhatsApp que queda.
  */
-export async function validateWhatsAppConnection(
-  token: string,
-  phoneNumberId: string
-): Promise<WhatsAppConnectionInfo> {
-  try {
-    const url = `${GRAPH_API_BASE}/${phoneNumberId}?fields=display_phone_number,verified_name,quality_rating`
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (!res.ok) {
-      const body = await res.text().catch(() => "")
-      return { ok: false, error: extractGraphErrorMessage(body) || `http_${res.status}` }
-    }
-    const data = (await res.json()) as {
-      display_phone_number?: string
-      verified_name?: string
-      quality_rating?: string
-    }
-    return {
-      ok: true,
-      displayPhone: data.display_phone_number,
-      verifiedName: data.verified_name,
-      qualityRating: data.quality_rating,
-    }
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "unknown_error" }
-  }
+export function getWhatsAppPlatformConfig(): WhatsAppPlatformConfig | null {
+  const token = process.env.WHATSAPP_ACCESS_TOKEN?.trim()
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID?.trim()
+  if (!token || !phoneNumberId) return null
+  return { token, phoneNumberId, phone: process.env.WHATSAPP_PHONE?.trim() || null }
+}
+
+/** ¿Está configurado el número de la plataforma? Es la condición que habilita todo envío. */
+export function isWhatsAppConfigured(): boolean {
+  return getWhatsAppPlatformConfig() !== null
 }
 
 export type SendTemplateResult = { ok: boolean; messageId?: string; error?: string }
@@ -115,9 +101,11 @@ type WhatsAppTemplateComponent =
       parameters: [{ type: "text"; text: string }]
     }
 
+/**
+ * Manda un template aprobado. Las credenciales salen del entorno: ningún caller las pasa ni
+ * puede mandar por un número distinto al de la plataforma.
+ */
 export async function sendWhatsAppTemplateMessage(input: {
-  token: string
-  phoneNumberId: string
   to: string
   templateName: string
   language?: string
@@ -129,8 +117,10 @@ export async function sendWhatsAppTemplateMessage(input: {
    */
   urlButton?: { parameter: string; index?: number }
 }): Promise<SendTemplateResult> {
+  const config = getWhatsAppPlatformConfig()
+  if (!config) return { ok: false, error: "whatsapp_not_configured" }
   try {
-    const url = `${GRAPH_API_BASE}/${input.phoneNumberId}/messages`
+    const url = `${GRAPH_API_BASE}/${config.phoneNumberId}/messages`
     const components: WhatsAppTemplateComponent[] = []
     if (input.bodyParameters && input.bodyParameters.length > 0) {
       components.push({
@@ -160,7 +150,7 @@ export async function sendWhatsAppTemplateMessage(input: {
     const res = await fetch(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${input.token}`,
+        Authorization: `Bearer ${config.token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),

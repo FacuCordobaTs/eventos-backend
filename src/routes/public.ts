@@ -34,6 +34,7 @@ import { sendCustomerProfileEmail } from "../lib/send-customer-profile-email"
 import { broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
 import {
   CUSTOMER_PROFILE_TEMPLATE,
+  isWhatsAppConfigured,
   normalizeWhatsAppPhone,
   sendWhatsAppTemplateMessage,
 } from "../lib/whatsapp-service"
@@ -270,29 +271,21 @@ export const publicRoute = new Hono()
       .select({
         saleId: sales.id,
         receiptToken: sales.receiptToken,
-        whatsappEnabled: tenants.whatsappEnabled,
-        whatsappToken: tenants.whatsappToken,
-        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
       })
       .from(sales)
-      .innerJoin(tenants, eq(sales.tenantId, tenants.id))
       .where(and(eq(sales.customerId, customer.id), eq(sales.status, "COMPLETED")))
       .orderBy(desc(sales.createdAt))
       .limit(1)
 
     if (!latest) return c.json({ ok: true })
     const profileUrl = `${CLIENT_URL}/mi-cuenta/${encodeURIComponent(latest.receiptToken)}`
-    const canWhatsApp = Boolean(
-      customer.phone && latest.whatsappEnabled && latest.whatsappToken && latest.whatsappPhoneNumberId
-    )
+    const canWhatsApp = Boolean(customer.phone) && isWhatsAppConfigured()
     const preferWhatsApp = type === "phone" || (type === "dni" && canWhatsApp)
 
     let deliveredByWhatsApp = false
     if (preferWhatsApp && canWhatsApp) {
       try {
         const result = await sendWhatsAppTemplateMessage({
-          token: latest.whatsappToken!,
-          phoneNumberId: latest.whatsappPhoneNumberId!,
           to: customer.phone!,
           templateName: CUSTOMER_PROFILE_TEMPLATE,
           bodyParameters: [customer.name],
@@ -407,9 +400,6 @@ export const publicRoute = new Hono()
     const [productora] = await db
       .select({
         name: tenants.name,
-        whatsappEnabled: tenants.whatsappEnabled,
-        whatsappToken: tenants.whatsappToken,
-        whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
       })
       .from(tenants)
       .where(eq(tenants.id, ev.tenantId))
@@ -426,12 +416,8 @@ export const publicRoute = new Hono()
         status: ev.status,
       },
       productora: { name: productora?.name ?? "" },
-      // Sólo si el envío está disponible — nunca los tokens del tenant.
-      whatsappEnabled: Boolean(
-        productora?.whatsappEnabled &&
-          productora.whatsappToken &&
-          productora.whatsappPhoneNumberId
-      ),
+      // Sólo si el envío está disponible — el número y el token son de la plataforma, no del tenant.
+      whatsappEnabled: isWhatsAppConfigured(),
     })
   })
   .post(
@@ -477,24 +463,9 @@ export const publicRoute = new Hono()
         return c.json({ error: "Pediste demasiados códigos. Probá más tarde." }, 429)
       }
 
-      const [tenant] = await db
-        .select({
-          whatsappEnabled: tenants.whatsappEnabled,
-          whatsappToken: tenants.whatsappToken,
-          whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
-        })
-        .from(tenants)
-        .where(eq(tenants.id, ev.tenantId))
-        .limit(1)
-
       const result = await requestAccessCode(db, {
         eventId: ev.id,
         tenantId: ev.tenantId,
-        whatsapp: {
-          enabled: Boolean(tenant?.whatsappEnabled),
-          token: tenant?.whatsappToken ?? null,
-          phoneNumberId: tenant?.whatsappPhoneNumberId ?? null,
-        },
         identifier,
         phone: body.phone ?? null,
         name: body.name ?? null,

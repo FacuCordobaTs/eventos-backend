@@ -26,8 +26,10 @@ export const tenants = mysqlTable('tenants', {
   cucuruApiKey: varchar('cucuru_api_key', { length: 255 }),
   cucuruCollectorId: varchar('cucuru_collector_id', { length: 255 }),
   cucuruEnabled: boolean('cucuru_enabled').default(false),
-  // Tarea 8.1 — WhatsApp (visión §2.3): credenciales de la Meta WhatsApp Cloud API
-  // por tenant (mismo patrón que Cucuru). El token es un System User Access Token.
+  // WhatsApp: las credenciales de Meta ahora son de la plataforma y viven en el `.env` del VPS
+  // (`WHATSAPP_ACCESS_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID`, ver `lib/whatsapp-service.ts`). Estas
+  // columnas son legacy: quedan porque la migración 0049 es aditiva y dropearlas es destructivo,
+  // pero ningún flujo las lee ni las escribe.
   whatsappPhone: varchar('whatsapp_phone', { length: 32 }), // ej. 5491155555555 (normalizado)
   whatsappPhoneNumberId: varchar('whatsapp_phone_number_id', { length: 64 }),
   whatsappToken: varchar('whatsapp_token', { length: 512 }),

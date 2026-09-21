@@ -8,7 +8,7 @@
  *
  * Cada minuto:
  *   (a) Recordatorio de WhatsApp — eventos `on_sale|live` con `doorsAt` en la próxima hora
- *       y `whatsapp_reminder_sent_at` null (y tenant con WhatsApp conectado): manda el
+ *       y `whatsapp_reminder_sent_at` null (y el número de la plataforma configurado): manda el
  *       template aprobado (`crow_recordatorio`: nombre y evento en el cuerpo + botón URL)
  *       a todos los customers
  *       con tickets del evento, UNA vez por persona, y setea la columna.
@@ -26,8 +26,12 @@
 import { and, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { customers, events, tenants, tickets } from "../db/schema"
-import { REMINDER_TEMPLATE, sendWhatsAppTemplateMessage } from "./whatsapp-service"
+import { customers, events, tickets } from "../db/schema"
+import {
+  isWhatsAppConfigured,
+  REMINDER_TEMPLATE,
+  sendWhatsAppTemplateMessage,
+} from "./whatsapp-service"
 
 /** Ventana previa a la puerta en la que se manda el recordatorio (visión §2.3: 1 h antes). */
 const REMINDER_WINDOW_MS = 60 * 60 * 1000
@@ -78,6 +82,10 @@ async function transitionDueEvents(): Promise<void> {
 
 /** (a) Recordatorio de WhatsApp 1 h antes a los compradores de eventos con puertas próximas. */
 async function sendWhatsAppReminders(): Promise<void> {
+  // Un solo número para toda la plataforma (`.env` del VPS): sin credenciales no hay a quién
+  // mandarle ni con qué, así que el tick entero se saltea.
+  if (!isWhatsAppConfigured()) return
+
   const db = drizzle(pool)
   const now = new Date()
   const windowEnd = new Date(now.getTime() + REMINDER_WINDOW_MS)
@@ -88,22 +96,15 @@ async function sendWhatsAppReminders(): Promise<void> {
       name: events.name,
       slug: events.slug,
       doorsAt: events.doorsAt,
-      whatsappPhoneNumberId: tenants.whatsappPhoneNumberId,
-      whatsappToken: tenants.whatsappToken,
-      whatsappTemplateName: tenants.whatsappTemplateName,
     })
     .from(events)
-    .innerJoin(tenants, eq(events.tenantId, tenants.id))
     .where(
       and(
         inArray(events.status, ["on_sale", "live"]),
         isNotNull(events.doorsAt),
         gt(events.doorsAt, now),
         lte(events.doorsAt, windowEnd),
-        isNull(events.whatsappReminderSentAt),
-        eq(tenants.whatsappEnabled, true),
-        isNotNull(tenants.whatsappToken),
-        isNotNull(tenants.whatsappPhoneNumberId)
+        isNull(events.whatsappReminderSentAt)
       )
     )
 
@@ -135,14 +136,11 @@ async function sendWhatsAppReminders(): Promise<void> {
       })
 
       const urlButtonParameter = eventShopUrlParameter(event)
-      const templateName = event.whatsappTemplateName?.trim() || REMINDER_TEMPLATE
       let sent = 0
       for (const recipient of recipients) {
         const result = await sendWhatsAppTemplateMessage({
-          token: event.whatsappToken!,
-          phoneNumberId: event.whatsappPhoneNumberId!,
           to: recipient.phone!,
-          templateName,
+          templateName: REMINDER_TEMPLATE,
           // `crow_recordatorio`: dos variables en el cuerpo y un CTA dinámico separado.
           // El link no se inserta como texto visible dentro del mensaje.
           bodyParameters: [recipient.name, event.name],

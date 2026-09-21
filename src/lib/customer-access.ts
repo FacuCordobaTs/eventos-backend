@@ -6,6 +6,7 @@ import { customerAccessCodes, customers } from "../db/schema"
 import { createAccessToken } from "./jwt"
 import {
   CUSTOMER_AUTH_TEMPLATE,
+  isWhatsAppConfigured,
   normalizeWhatsAppPhone,
   sendWhatsAppTemplateMessage,
 } from "./whatsapp-service"
@@ -83,16 +84,9 @@ export function generateCode(): string {
 // Pedir el código
 // -----------------------------------------------------------------------------
 
-export type AccessWhatsAppConfig = {
-  enabled: boolean
-  token: string | null
-  phoneNumberId: string | null
-}
-
 export type RequestAccessInput = {
   eventId: string
   tenantId: string
-  whatsapp: AccessWhatsAppConfig
   identifier: AccessIdentifier
   /** Celular que ingresa el cliente cuando su ficha no tiene uno, o en el alta rápida. */
   phone?: string | null
@@ -170,11 +164,13 @@ export async function requestAccessCode(
     to = normalizeWhatsAppPhone(customer.phone) ?? customer.phone
   }
 
-  if (!input.whatsapp.enabled || !input.whatsapp.token || !input.whatsapp.phoneNumberId) {
+  // El envío es de la plataforma (`.env` del VPS), no de la productora: si no está configurado
+  // no hay código posible para nadie.
+  if (!isWhatsAppConfigured()) {
     return {
       ok: false,
       reason: "WHATSAPP_UNAVAILABLE",
-      error: "La productora no tiene WhatsApp configurado. Podés cargar saldo en la caja.",
+      error: "El envío por WhatsApp no está disponible. Podés cargar saldo en la caja.",
     }
   }
 
@@ -211,8 +207,6 @@ export async function requestAccessCode(
   let sent: { ok: boolean; error?: string } = { ok: false }
   try {
     sent = await sendWhatsAppTemplateMessage({
-      token: input.whatsapp.token,
-      phoneNumberId: input.whatsapp.phoneNumberId,
       to,
       templateName: CUSTOMER_AUTH_TEMPLATE,
       bodyParameters: [code],
