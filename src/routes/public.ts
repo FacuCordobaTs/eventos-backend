@@ -22,6 +22,7 @@ import {
 import type { PickupItemsJson } from "../db/schema"
 import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
+import type { ClientCheckoutContact } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { getBalance } from "../lib/balance"
 import { pickupItemsWithNames } from "../lib/pickup-items"
@@ -127,6 +128,240 @@ async function resolveCustomerForToken(
   return customer ?? null
 }
 
+/** La ficha del cliente que alcanza para operar en su nombre: contacto, DNI y saldo. */
+type CustomerIdentity = {
+  id: string
+  name: string
+  email: string
+  phone: string | null
+  dni: string | null
+}
+
+/**
+ * La sesión de `/{slug}/acceso` aplicada a un evento concreto. El token tiene que ser un JWT de
+ * audiencia `customer` y esa persona tiene que estar adentro de ese evento —entró con un código
+ * verificado o tiene una compra completada ahí—, así la credencial que se ganó en la barra de un
+ * evento no sirve para operar en otro.
+ */
+async function resolveCustomerForEvent(
+  db: MySql2Database<Record<string, never>>,
+  token: string,
+  eventId: string
+): Promise<{ customer: CustomerIdentity; tenantId: string } | null> {
+  let customerId: string
+  try {
+    customerId = (await verifyToken(token, "customer")).sub
+  } catch {
+    return null
+  }
+
+  const [customer] = await db
+    .select({
+      id: customers.id,
+      name: customers.name,
+      email: customers.email,
+      phone: customers.phone,
+      dni: customers.dni,
+    })
+    .from(customers)
+    .where(and(eq(customers.id, customerId), eq(customers.isActive, true)))
+    .limit(1)
+  if (!customer) return null
+
+  const [event] = await db
+    .select({ tenantId: events.tenantId })
+    .from(events)
+    .where(eq(events.id, eventId))
+    .limit(1)
+  if (!event) return null
+
+  const [entry] = await db
+    .select({ id: customerAccessCodes.id })
+    .from(customerAccessCodes)
+    .where(
+      and(
+        eq(customerAccessCodes.customerId, customer.id),
+        eq(customerAccessCodes.eventId, eventId),
+        eq(customerAccessCodes.tenantId, event.tenantId),
+        isNotNull(customerAccessCodes.consumedAt)
+      )
+    )
+    .limit(1)
+
+  if (!entry) {
+    const [purchase] = await db
+      .select({ id: sales.id })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.customerId, customer.id),
+          eq(sales.eventId, eventId),
+          eq(sales.tenantId, event.tenantId),
+          eq(sales.status, "COMPLETED")
+        )
+      )
+      .limit(1)
+    if (!purchase) return null
+  }
+
+  return { customer, tenantId: event.tenantId }
+}
+
+/** El contacto del checkout a partir de la ficha del cliente: el mismo que ya dejó al entrar. */
+function contactFromCustomer(customer: CustomerIdentity): ClientCheckoutContact {
+  return {
+    name: customer.name,
+    email: customer.email,
+    phone: customer.phone ?? "",
+    ...(customer.dni ? { dni: customer.dni } : {}),
+  }
+}
+
+/**
+ * Códigos que devuelven las compras de consumos. Es el union de literales —y no `number`— porque
+ * `c.json` sólo acepta códigos que llevan cuerpo.
+ */
+type ConsumptionsCheckoutOutcome = {
+  status: 200 | 400 | 404 | 500 | 502
+  body: Record<string, unknown>
+}
+
+/**
+ * Compra de consumos del cliente. La comparten las dos anclas posibles: el comprobante de una
+ * compra (`/receipts/:token/...`, el cliente ya está identificado por su venta) y el evento de la
+ * sesión de acceso (`/customers/profile/:token/events/:eventId/...`, donde puede no haber ninguna
+ * venta todavía). Lo que cambia entre las dos es de dónde sale el contacto y a dónde vuelve
+ * Mercado Pago; el cobro, el canje y la idempotencia son los mismos.
+ */
+async function runConsumptionsCheckout(input: {
+  eventId: string
+  tenantId: string
+  contact: ClientCheckoutContact
+  /** Para resolver el DNI del titular cuando paga con saldo y el contacto no lo trae. */
+  customerId: string | null
+  body: {
+    drinkLines: { productId: string; quantity: number }[]
+    clientTotal: string
+    paymentMethod?: string
+  }
+  /**
+   * Comprobante al que vuelve el navegador después de pagar: el de la venta original cuando la
+   * compra cuelga de un comprobante. Sin comprobante previo (sesión de acceso) va `null` y se usa
+   * el de la venta que se acaba de crear, que es el comprobante que el cliente tiene que ver.
+   */
+  returnReceiptToken: string | null
+}): Promise<ConsumptionsCheckoutOutcome> {
+  const db = drizzle(pool)
+
+  if (!input.body?.drinkLines?.length || !input.body.clientTotal) {
+    return { status: 400, body: { error: "Datos incompletos" } }
+  }
+
+  // Tarea 6.2 — `paymentMethod` opcional: "SALDO" paga con el saldo del cliente (completo al
+  // instante, sin acreditar nada); por defecto (y back-compat) Mercado Pago.
+  const method = input.body.paymentMethod === "SALDO" ? "SALDO" : "MERCADOPAGO"
+
+  if (method === "MERCADOPAGO") {
+    const [tenant] = await db
+      .select({ mpConnected: tenants.mpConnected })
+      .from(tenants)
+      .where(eq(tenants.id, input.tenantId))
+      .limit(1)
+
+    if (!tenant?.mpConnected) {
+      return { status: 400, body: { error: "Mercado Pago no está habilitado para este evento" } }
+    }
+  }
+
+  // Tarea 6.2 — El pago con saldo exige DNI (el saldo está atado a la identidad). El contacto lo
+  // tiene si compró con DNI; si no, se resuelve de la ficha del cliente.
+  let contact = input.contact
+  if (method === "SALDO" && !contact.dni && input.customerId) {
+    const [customerRow] = await db
+      .select({ dni: customers.dni })
+      .from(customers)
+      .where(eq(customers.id, input.customerId))
+      .limit(1)
+    contact = { ...contact, ...(customerRow?.dni ? { dni: customerRow.dni } : {}) }
+  }
+
+  let result: Awaited<ReturnType<typeof executeClientCheckout>>
+  try {
+    result = await db.transaction(async (tx) =>
+      executeClientCheckout(tx, {
+        eventId: input.eventId,
+        contact,
+        paymentMethod: method,
+        clientTotal: input.body.clientTotal.trim(),
+        ticketLines: [],
+        drinkLines: input.body.drinkLines,
+      })
+    )
+  } catch (e) {
+    if (e instanceof PurchaseError) {
+      const { status, body: errBody } = purchaseErrorStatus(e.code)
+      return { status: status as ConsumptionsCheckoutOutcome["status"], body: errBody }
+    }
+    throw e
+  }
+
+  // Tarea 6.2 — SALDO: la sale quedó COMPLETED y el saldo debitado dentro de la
+  // transacción. Sin preferencia que crear: el client refresca el comprobante.
+  if (method === "SALDO") {
+    return {
+      status: 200,
+      body: {
+        success: true,
+        receiptToken: result.receiptToken,
+        ...(result.balance != null ? { balance: result.balance } : {}),
+      },
+    }
+  }
+
+  const mpAccessToken = await obtenerTokenValido(input.tenantId)
+  if (!mpAccessToken) {
+    return { status: 502, body: { error: "No se pudo conectar con Mercado Pago" } }
+  }
+
+  const total = parseFloat(input.body.clientTotal)
+  const fee = Math.round(total * 0.01 * 100) / 100
+  const backUrlToken = input.returnReceiptToken ?? result.receiptToken
+
+  const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${mpAccessToken}`,
+    },
+    body: JSON.stringify({
+      items: [{ title: "Consumos", quantity: 1, currency_id: "ARS", unit_price: total }],
+      marketplace_fee: fee,
+      back_urls: {
+        success: `https://crow.ar/receipt/${backUrlToken}`,
+        failure: `https://crow.ar/receipt/${backUrlToken}`,
+        pending: `https://crow.ar/receipt/${backUrlToken}`,
+      },
+      auto_return: "approved",
+      external_reference: `totem-sale-${result.saleId}`,
+      notification_url: "https://api.crow.ar/api/mp/webhook",
+      statement_descriptor: "TOTEM",
+      expires: true,
+      expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    }),
+  })
+
+  if (!mpRes.ok) {
+    return { status: 500, body: { error: "No se pudo crear la preferencia de Mercado Pago" } }
+  }
+
+  const preference = (await mpRes.json()) as { init_point?: string }
+  if (!preference.init_point) {
+    return { status: 500, body: { error: "No se pudo obtener el link de pago" } }
+  }
+
+  return { status: 200, body: { success: true, url_pago: preference.init_point } }
+}
+
 async function countIssued(
   db: ReturnType<typeof drizzle>,
   tenantId: string,
@@ -197,6 +432,12 @@ const balanceDepositSchema = z.object({
    * a pedir nombre/mail/teléfono. `contact` es entonces opcional.
    */
   receiptToken: z.string().min(1).optional(),
+  /**
+   * Lo mismo para la sesión de `/{slug}/acceso`, donde todavía no hay ninguna compra: el
+   * contacto sale de la ficha del cliente que acreditó su DNI o su celular. Sin ninguna de
+   * las dos credenciales, la carga exige el contacto en el body.
+   */
+  customerToken: z.string().min(1).optional(),
   contact: z
     .object({
       name: z.string().min(1).max(255),
@@ -453,10 +694,12 @@ export const publicRoute = new Hono()
 
     return c.json({ customer: { name: customer.name }, events: profileEvents })
   })
-  // Vista de un evento para el cliente que entró por el link de acceso: el mismo contenido que el
-  // comprobante (entradas con su QR, consumos y saldo) pero sin venta de por medio, porque puede
-  // no haber comprado nada todavía. Los datos son sólo de ese cliente, acotados al evento y a su
-  // productora: la credencial del perfil es la única puerta.
+  // El evento del cliente, con **la misma forma que `GET /receipts/:token`**: es el payload de la
+  // pantalla de comprobante (`/receipt/:receiptToken` y `/mi-cuenta/:token/evento/:eventId` son la
+  // misma pantalla). La diferencia es que acá el ancla es el cliente y el evento, no una venta: por
+  // eso `sale` es `null` cuando todavía no compró nada. Comprar consumos y cargar saldo funcionan
+  // igual sin venta (el token de la sesión resuelve al cliente); lo que no se puede armar sin una
+  // venta es un retiro, porque una orden se arma sobre consumiciones ya compradas.
   .get("/customers/profile/:token/events/:eventId", async (c) => {
     const db = drizzle(pool)
     const customer = await resolveCustomerForToken(db, c.req.param("token"))
@@ -465,13 +708,10 @@ export const publicRoute = new Hono()
     const [ev] = await db
       .select({
         id: events.id,
-        slug: events.slug,
         name: events.name,
         date: events.date,
         venue: events.venue,
         location: events.location,
-        imageUrl: events.imageUrl,
-        status: events.status,
         tenantId: events.tenantId,
         productoraName: tenants.name,
       })
@@ -490,7 +730,7 @@ export const publicRoute = new Hono()
       productPrice: products.price,
     }
 
-    const [ticketRows, consumptionRows, latestSale, balanceAmount] = await Promise.all([
+    const [ticketRows, consumptionRows, saleRows, pickupRows, balanceAmount] = await Promise.all([
       db
         .select({
           id: tickets.id,
@@ -525,7 +765,18 @@ export const publicRoute = new Hono()
         )
         .orderBy(products.name, digitalConsumptions.createdAt),
       db
-        .select({ receiptToken: sales.receiptToken })
+        .select({
+          id: sales.id,
+          receiptToken: sales.receiptToken,
+          totalAmount: sales.totalAmount,
+          paymentMethod: sales.paymentMethod,
+          status: sales.status,
+          createdAt: sales.createdAt,
+          paid: sales.paid,
+          paidAt: sales.paidAt,
+          cucuruAlias: sales.cucuruAlias,
+          cucuruCvu: sales.cucuruCvu,
+        })
         .from(sales)
         .where(
           and(
@@ -536,26 +787,54 @@ export const publicRoute = new Hono()
         )
         .orderBy(desc(sales.createdAt))
         .limit(1),
+      db
+        .select({
+          token: pickupOrders.token,
+          status: pickupOrders.status,
+          createdAt: pickupOrders.createdAt,
+          deliveredAt: pickupOrders.deliveredAt,
+          itemsJson: pickupOrders.itemsJson,
+        })
+        .from(pickupOrders)
+        .where(
+          and(
+            eq(pickupOrders.customerId, customer.id),
+            eq(pickupOrders.eventId, ev.id),
+            eq(pickupOrders.tenantId, ev.tenantId)
+          )
+        )
+        .orderBy(desc(pickupOrders.createdAt)),
       getBalance(db, customer.id, ev.id),
     ])
 
+    const sale = saleRows[0] ?? null
+    const pickups = await Promise.all(
+      pickupRows.map(async (pickup) => ({
+        token: pickup.token,
+        status: pickup.status,
+        createdAt: pickup.createdAt ?? null,
+        deliveredAt: pickup.deliveredAt ?? null,
+        items: await pickupItemsWithNames(db, pickup.itemsJson),
+      }))
+    )
+
     return c.json({
-      customer: { name: customer.name },
+      receiptToken: sale?.receiptToken ?? null,
+      customerName: customer.name,
+      balance: { amount: balanceAmount },
+      // La venta que ancla las acciones de esta pantalla (comprar consumos, cargar saldo, retiros).
+      // Sin compra en este evento no hay ninguna, y la pantalla igual se muestra: es la misma.
+      sale,
       event: {
         id: ev.id,
-        slug: ev.slug ?? null,
         name: ev.name,
         date: ev.date,
         venue: ev.venue,
         location: ev.location,
-        imageUrl: ev.imageUrl,
-        status: ev.status,
       },
-      productora: { name: ev.productoraName },
-      balance: { amount: balanceAmount },
-      // Si hay compra, el comprobante tiene el flujo completo (retiros, comprar consumos): la
-      // página del evento ofrece el link en vez de duplicarlo.
-      receiptToken: latestSale[0]?.receiptToken ?? null,
+      // La clave pública de Mercado Pago sólo hace falta para reintentar una compra con tarjeta
+      // pendiente, y acá `sale` siempre es una compra completada.
+      productora: { name: ev.productoraName, mpPublicKey: null },
       tickets: ticketRows.map((r) => ({
         id: r.id,
         qrHash: r.qrHash,
@@ -573,6 +852,7 @@ export const publicRoute = new Hono()
         status: r.status,
         product: { id: r.productId, name: r.productName, price: r.productPrice },
       })),
+      pickups,
     })
   })
   // Link de acceso por evento (`crow.ar/{slug}/acceso`): el flyer y el botón de ingreso, sin la
@@ -691,8 +971,8 @@ export const publicRoute = new Hono()
         code: body.code,
       })
       if (!result.ok) return c.json({ error: result.error, reason: result.reason }, 400)
-      // `eventId` + `receiptToken` evitan un viaje extra: el cliente va directo al comprobante si
-      // compró, o a la vista del evento si no.
+      // `eventId` + `receiptToken` evitan un viaje extra: el cliente va directo al comprobante de
+      // ese evento —el link del mail si compró, el evento de su cuenta si no.
       return c.json({
         ok: true,
         token: result.token,
@@ -1252,9 +1532,12 @@ export const publicRoute = new Hono()
       )
     }
 
-    // Tarea 6.2 — Contacto explícito o, si viene `receiptToken`, el del snapshot de esa
-    // compra (misma persona: el saldo queda atado a quien ya está identificado).
-    let contact: { name: string; email: string; phone: string; dni?: string }
+    // Tarea 6.2 — Contacto explícito, el del snapshot de una compra (`receiptToken`) o el de la
+    // ficha del cliente que entró con el link de acceso (`customerToken`): en los tres casos el
+    // saldo queda atado a una persona ya identificada, nunca al navegador que hace el pedido.
+    let contact: ClientCheckoutContact
+    /** Cliente ya resuelto por credencial: evita volver a buscarlo (y crear) en la transacción. */
+    let depositCustomerId: string | null = null
     if (body.contact) {
       contact = {
         name: body.contact.name,
@@ -1262,6 +1545,13 @@ export const publicRoute = new Hono()
         phone: body.contact.phone,
         ...(body.contact.dni ? { dni: body.contact.dni } : {}),
       }
+    } else if (body.customerToken) {
+      const session = await resolveCustomerForEvent(db, body.customerToken, eventId)
+      if (!session) {
+        return c.json({ error: "El enlace no es válido" }, 404)
+      }
+      depositCustomerId = session.customer.id
+      contact = contactFromCustomer(session.customer)
     } else if (body.receiptToken) {
       const [saleRow] = await db
         .select()
@@ -1284,7 +1574,7 @@ export const publicRoute = new Hono()
     }
 
     const result = await db.transaction(async (tx) => {
-      const customerId = await findOrCreateCustomer(tx, contact)
+      const customerId = depositCustomerId ?? (await findOrCreateCustomer(tx, contact))
       const saleId = uuidv4()
       const receiptToken = randomUUID()
       await tx.insert(sales).values({
@@ -1640,8 +1930,6 @@ export const publicRoute = new Hono()
     const token = c.req.param("token")
     const db = drizzle(pool)
 
-    // Tarea 6.2 — `paymentMethod` opcional: "SALDO" paga con el saldo del cliente (completo
-    // al instante, sin acreditar nada); por defecto (y back-compat) Mercado Pago.
     let body: {
       drinkLines: { productId: string; quantity: number }[]
       clientTotal: string
@@ -1652,12 +1940,6 @@ export const publicRoute = new Hono()
     } catch {
       return c.json({ error: "JSON inválido" }, 400)
     }
-
-    if (!body.drinkLines?.length || !body.clientTotal) {
-      return c.json({ error: "Datos incompletos" }, 400)
-    }
-
-    const method = body.paymentMethod === "SALDO" ? "SALDO" : "MERCADOPAGO"
 
     const [saleRow] = await db
       .select()
@@ -1673,102 +1955,50 @@ export const publicRoute = new Hono()
       return c.json({ error: "No hay datos de contacto en esta compra" }, 400)
     }
 
-    const [tenant] = await db
-      .select({ mpConnected: tenants.mpConnected })
-      .from(tenants)
-      .where(eq(tenants.id, saleRow.tenantId))
-      .limit(1)
-
-    if (method === "MERCADOPAGO" && !tenant?.mpConnected) {
-      return c.json({ error: "Mercado Pago no está habilitado para este evento" }, 400)
-    }
-
-    // Tarea 6.2 — El pago con saldo exige DNI (el saldo está atado a la identidad). El
-    // snapshot del comprador lo tiene si compró con DNI; si no, se resuelve del customer
-    // (una carga de saldo en caja quedó registrada con DNI).
-    let contact = snap.contact
-    if (method === "SALDO" && !contact.dni) {
-      const [customerRow] = saleRow.customerId
-        ? await db
-            .select({ dni: customers.dni })
-            .from(customers)
-            .where(eq(customers.id, saleRow.customerId))
-            .limit(1)
-        : []
-      contact = { ...snap.contact, ...(customerRow?.dni ? { dni: customerRow.dni } : {}) }
-    }
-
-    let result: Awaited<ReturnType<typeof executeClientCheckout>>
-    try {
-      result = await db.transaction(async (tx) =>
-        executeClientCheckout(tx, {
-          eventId: saleRow.eventId,
-          contact,
-          paymentMethod: method,
-          clientTotal: body.clientTotal.trim(),
-          ticketLines: [],
-          drinkLines: body.drinkLines,
-        })
-      )
-    } catch (e) {
-      if (e instanceof PurchaseError) {
-        const { status, body: errBody } = purchaseErrorStatus(e.code)
-        return c.json(errBody, status)
-      }
-      throw e
-    }
-
-    // Tarea 6.2 — SALDO: la sale quedó COMPLETED y el saldo debitado dentro de la
-    // transacción. Sin preferencia que crear: el client refresca el comprobante.
-    if (method === "SALDO") {
-      return c.json({
-        success: true,
-        receiptToken: result.receiptToken,
-        ...(result.balance != null ? { balance: result.balance } : {}),
-      })
-    }
-
-    const mpAccessToken = await obtenerTokenValido(saleRow.tenantId)
-    if (!mpAccessToken) {
-      return c.json({ error: "No se pudo conectar con Mercado Pago" }, 502)
-    }
-
-    const total = parseFloat(body.clientTotal)
-    const fee = Math.round(total * 0.01 * 100) / 100
-
-    const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${mpAccessToken}`,
-      },
-      body: JSON.stringify({
-        items: [{ title: "Consumos", quantity: 1, currency_id: "ARS", unit_price: total }],
-        marketplace_fee: fee,
-        back_urls: {
-          success: `https://crow.ar/receipt/${token}`,
-          failure: `https://crow.ar/receipt/${token}`,
-          pending: `https://crow.ar/receipt/${token}`,
-        },
-        auto_return: "approved",
-        external_reference: `totem-sale-${result.saleId}`,
-        notification_url: "https://api.crow.ar/api/mp/webhook",
-        statement_descriptor: "TOTEM",
-        expires: true,
-        expiration_date_to: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      }),
+    const outcome = await runConsumptionsCheckout({
+      eventId: saleRow.eventId,
+      tenantId: saleRow.tenantId,
+      contact: snap.contact,
+      customerId: saleRow.customerId,
+      body,
+      returnReceiptToken: token,
     })
+    return c.json(outcome.body, outcome.status)
+  })
+  // La misma compra de consumos, pero sin comprobante previo: el ancla es la sesión de
+  // `/{slug}/acceso` (cliente + evento). Es la persona que entró a la barra con su DNI o su
+  // celular y todavía no compró nada; la venta que sale acá es la primera de ese evento y desde
+  // ese momento el comprobante de esa venta es el que manda. La tienda del evento (`/{slug}`)
+  // sigue siendo el link de compra previa: esto no la reemplaza.
+  .post("/customers/profile/:token/events/:eventId/consumptions-checkout", async (c) => {
+    const db = drizzle(pool)
+    const eventId = c.req.param("eventId")
 
-    if (!mpRes.ok) {
-      return c.json({ error: "No se pudo crear la preferencia de Mercado Pago" }, 500)
+    const session = await resolveCustomerForEvent(db, c.req.param("token"), eventId)
+    if (!session) return c.json({ error: "El enlace no es válido" }, 404)
+
+    let body: {
+      drinkLines: { productId: string; quantity: number }[]
+      clientTotal: string
+      paymentMethod?: string
+    }
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ error: "JSON inválido" }, 400)
     }
 
-    const preference = (await mpRes.json()) as { init_point?: string }
-    if (!preference.init_point) {
-      return c.json({ error: "No se pudo obtener el link de pago" }, 500)
-    }
-
-    return c.json({ success: true, url_pago: preference.init_point })
+    const outcome = await runConsumptionsCheckout({
+      eventId,
+      tenantId: session.tenantId,
+      contact: contactFromCustomer(session.customer),
+      customerId: session.customer.id,
+      body,
+      // Sin comprobante previo, el navegador vuelve al de la venta nueva: es el comprobante que
+      // el cliente tiene que ver cuando Mercado Pago lo devuelve.
+      returnReceiptToken: null,
+    })
+    return c.json(outcome.body, outcome.status)
   })
   // ─── Retiro en barra (tarea 4.1) — "¿Qué te llevás ahora?" ─────────────────────
   // El cliente elige tragos comprados y no canjeados y genera UN QR de pedido. Las
