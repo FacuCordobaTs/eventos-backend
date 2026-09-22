@@ -1,8 +1,8 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm"
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm"
 import type { MySql2Database } from "drizzle-orm/mysql2"
 import { createHash, randomInt, timingSafeEqual } from "crypto"
 import { v4 as uuidv4 } from "uuid"
-import { customerAccessCodes, customers } from "../db/schema"
+import { customerAccessCodes, customers, sales } from "../db/schema"
 import { createAccessToken } from "./jwt"
 import {
   CUSTOMER_AUTH_TEMPLATE,
@@ -178,10 +178,12 @@ export async function requestAccessCode(
   const code = generateCode()
   const now = new Date()
 
-  // Un solo código activo por destino y evento: el anterior se quema al pedir uno nuevo.
+  // Un solo código activo por destino y evento: el anterior se descarta al pedir uno nuevo.
+  // Se vence en vez de marcarse consumido: `consumedAt` significa "este cliente entró al evento"
+  // y de acá sale la lista de eventos del perfil, así que un código descartado no debe figurar.
   await db
     .update(customerAccessCodes)
-    .set({ consumedAt: now })
+    .set({ expiresAt: now })
     .where(
       and(
         eq(customerAccessCodes.eventId, input.eventId),
@@ -218,10 +220,10 @@ export async function requestAccessCode(
   }
 
   if (!sent.ok) {
-    // Un código que no llegó no debe poder usarse: se quema y el cliente reintenta.
+    // Un código que no llegó no debe poder usarse: se vence y el cliente reintenta.
     await db
       .update(customerAccessCodes)
-      .set({ consumedAt: new Date() })
+      .set({ expiresAt: new Date() })
       .where(eq(customerAccessCodes.id, challenge))
     if (sent.error) console.error("[customer-access] WhatsApp rechazó el mensaje", sent.error)
     return {
@@ -239,7 +241,16 @@ export async function requestAccessCode(
 // -----------------------------------------------------------------------------
 
 export type VerifyAccessResult =
-  | { ok: true; token: string; customerId: string; name: string }
+  | {
+      ok: true
+      token: string
+      customerId: string
+      name: string
+      /** Evento al que se entró: es el destino de la redirección. */
+      eventId: string
+      /** Receipt de una compra completada en ese evento; `null` si no compró nada todavía. */
+      receiptToken: string | null
+    }
   | {
       ok: false
       reason: "INVALID" | "EXPIRED" | "CONFLICT" | "INACTIVE"
@@ -264,11 +275,9 @@ export async function verifyAccessCode(
     .limit(1)
 
   if (!row) return { ok: false, reason: "INVALID", error: "El código no es válido." }
+  // El vencimiento se informa aparte (y no se marca nada): un código vencido no es "usado", y
+  // `consumedAt` es justamente la marca de acceso que lee el perfil del cliente.
   if (row.expiresAt.getTime() <= Date.now()) {
-    await db
-      .update(customerAccessCodes)
-      .set({ consumedAt: new Date() })
-      .where(eq(customerAccessCodes.id, row.id))
     return { ok: false, reason: "EXPIRED", error: "El código venció. Pedí uno nuevo." }
   }
   if (row.attempts >= MAX_ATTEMPTS) {
@@ -357,6 +366,16 @@ export async function verifyAccessCode(
         return { ok: false as const, reason: "INACTIVE" as const, error: "Tu cuenta no está activa." }
       }
 
+      // La fila del alta rápida se insertó sin cliente (todavía no existía). Se enlaza recién acá,
+      // cuando la ficha existe: `consumedAt` + `customerId` son juntos la marca de "este cliente
+      // entró a este evento", que es de donde sale la lista de eventos de su perfil.
+      if (!locked.customerId) {
+        await tx
+          .update(customerAccessCodes)
+          .set({ customerId })
+          .where(eq(customerAccessCodes.id, locked.id))
+      }
+
       // Guarda clave: sólo se completa un celular que no existía. Si la ficha ya tiene uno, el
       // que se escribió en el link no la toca.
       if (!customer.phone) {
@@ -366,6 +385,21 @@ export async function verifyAccessCode(
           .where(eq(customers.id, customerId))
       }
 
+      // El receipt que corresponde a este evento, si compró: el drawer entra directo al
+      // comprobante (que es donde se canjean consumos) en vez de a una vista intermedia.
+      const [sale] = await tx
+        .select({ receiptToken: sales.receiptToken })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.customerId, customerId),
+            eq(sales.eventId, locked.eventId),
+            eq(sales.status, "COMPLETED")
+          )
+        )
+        .orderBy(desc(sales.createdAt))
+        .limit(1)
+
       return {
         ok: true as const,
         token: await createAccessToken(customerId, "customer", CUSTOMER_SESSION_TTL),
@@ -373,6 +407,8 @@ export async function verifyAccessCode(
         // Para saludar en el drawer sin un request extra: no es un dato sensible para quien acaba
         // de acreditar el celular de la ficha.
         name: customer.name,
+        eventId: locked.eventId,
+        receiptToken: sale?.receiptToken ?? null,
       }
     })
   } catch (error) {

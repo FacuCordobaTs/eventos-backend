@@ -1115,6 +1115,11 @@ export const customerAccessCodes = mysqlTable(
     codeHash: varchar('code_hash', { length: 64 }).notNull(),
     /** Intentos fallidos. El código se corta al llegar al tope. */
     attempts: int('attempts').notNull().default(0),
+    /**
+     * Se llena **sólo** cuando el código se verifica bien: es la marca de "este cliente entró a
+     * este evento". Los códigos que se descartan (se pidió uno nuevo, o el envío falló) se vencen
+     * con `expiresAt` en vez de marcarse acá, así el perfil no lista eventos que nunca se abrieron.
+     */
     consumedAt: timestamp('consumed_at'),
     expiresAt: timestamp('expires_at').notNull(),
     createdAt: timestamp('created_at').defaultNow(),

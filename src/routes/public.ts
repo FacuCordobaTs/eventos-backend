@@ -6,6 +6,7 @@ import type { MySql2Database } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   courtesies,
+  customerAccessCodes,
   customers,
   digitalConsumptions,
   eventProducts,
@@ -19,7 +20,7 @@ import {
   tickets,
 } from "../db/schema"
 import type { PickupItemsJson } from "../db/schema"
-import { SQL, and, asc, count, desc, eq, gte, inArray, ne, or } from "drizzle-orm"
+import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { getBalance } from "../lib/balance"
@@ -92,6 +93,38 @@ async function resolveEventForAccess(
     .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
     .limit(1)
   return ev ?? null
+}
+
+/**
+ * Resuelve el cliente detrás de una capability. La abren dos tokens distintos: el de una venta
+ * (los links del mail) y el JWT de audiencia `customer` que emite el acceso por DNI/celular desde
+ * `/{slug}/acceso`. Ninguno de los dos caduca la página, así que los dos siguen valiendo.
+ */
+async function resolveCustomerForToken(
+  db: MySql2Database<Record<string, never>>,
+  token: string
+): Promise<{ id: string; name: string } | null> {
+  const [credential] = await db
+    .select({ customerId: sales.customerId })
+    .from(sales)
+    .where(eq(sales.receiptToken, token))
+    .limit(1)
+
+  let customerId = credential?.customerId ?? null
+  if (!customerId) {
+    try {
+      customerId = (await verifyToken(token, "customer")).sub
+    } catch {
+      return null
+    }
+  }
+
+  const [customer] = await db
+    .select({ id: customers.id, name: customers.name })
+    .from(customers)
+    .where(and(eq(customers.id, customerId), eq(customers.isActive, true)))
+    .limit(1)
+  return customer ?? null
 }
 
 async function countIssued(
@@ -310,28 +343,7 @@ export const publicRoute = new Hono()
     const db = drizzle(pool)
     const token = c.req.param("token")
 
-    // Dos credenciales abren esta página: el token de venta de toda la vida (los links del mail)
-    // y la sesión que emite el acceso por DNI/celular desde `/{slug}/acceso`.
-    const [credential] = await db
-      .select({ customerId: sales.customerId })
-      .from(sales)
-      .where(eq(sales.receiptToken, token))
-      .limit(1)
-
-    let customerId = credential?.customerId ?? null
-    if (!customerId) {
-      try {
-        customerId = (await verifyToken(token, "customer")).sub
-      } catch {
-        return c.json({ error: "El enlace no es válido" }, 404)
-      }
-    }
-
-    const [customer] = await db
-      .select({ id: customers.id, name: customers.name })
-      .from(customers)
-      .where(and(eq(customers.id, customerId), eq(customers.isActive, true)))
-      .limit(1)
+    const customer = await resolveCustomerForToken(db, token)
     if (!customer) return c.json({ error: "El enlace no es válido" }, 404)
 
     const saleRows = await db
@@ -364,6 +376,31 @@ export const publicRoute = new Hono()
       .from(digitalConsumptions)
       .where(eq(digitalConsumptions.customerId, customer.id))
 
+    // Eventos a los que el cliente entró con el link de acceso (`crow.ar/{slug}/acceso`) y en los
+    // que todavía no compró nada: sin esto, entrar por el link no dejaría el evento en su lista.
+    // La marca es `consumedAt` (código verificado), no cualquier fila de `customerAccessCodes`.
+    const accessRows = await db
+      .select({
+        eventId: events.id,
+        eventName: events.name,
+        eventDate: events.date,
+        eventVenue: events.venue,
+        eventLocation: events.location,
+        eventImageUrl: events.imageUrl,
+        eventStatus: events.status,
+        productoraName: tenants.name,
+      })
+      .from(customerAccessCodes)
+      .innerJoin(events, eq(customerAccessCodes.eventId, events.id))
+      .innerJoin(tenants, eq(customerAccessCodes.tenantId, tenants.id))
+      .where(
+        and(
+          eq(customerAccessCodes.customerId, customer.id),
+          isNotNull(customerAccessCodes.consumedAt)
+        )
+      )
+      .orderBy(desc(events.date))
+
     const ticketSaleIds = new Set(ticketRows.map((row) => row.saleId).filter(Boolean))
     const grouped = new Map<string, (typeof saleRows)[number]>()
     for (const row of saleRows) {
@@ -372,9 +409,30 @@ export const publicRoute = new Hono()
       if (!current || (current.snapshot?.kind === "deposit" && useful)) grouped.set(row.eventId, row)
     }
 
-    return c.json({
-      customer: { name: customer.name },
-      events: [...grouped.values()].map((row) => ({
+    const countTickets = (eventId: string) =>
+      ticketRows.filter((item) => item.eventId === eventId && item.status !== "CANCELLED").length
+    const countPending = (eventId: string) =>
+      consumptionRows.filter((item) => item.eventId === eventId && item.status === "PENDING").length
+
+    const profileEvents = [...grouped.values()].map((row) => ({
+      id: row.eventId,
+      name: row.eventName,
+      date: row.eventDate,
+      venue: row.eventVenue,
+      location: row.eventLocation,
+      imageUrl: row.eventImageUrl,
+      status: row.eventStatus,
+      productoraName: row.productoraName,
+      receiptToken: row.receiptToken as string | null,
+      tickets: countTickets(row.eventId),
+      pendingConsumptions: countPending(row.eventId),
+    }))
+
+    const listed = new Set(profileEvents.map((item) => item.id))
+    for (const row of accessRows) {
+      if (listed.has(row.eventId)) continue
+      listed.add(row.eventId)
+      profileEvents.push({
         id: row.eventId,
         name: row.eventName,
         date: row.eventDate,
@@ -383,9 +441,137 @@ export const publicRoute = new Hono()
         imageUrl: row.eventImageUrl,
         status: row.eventStatus,
         productoraName: row.productoraName,
-        receiptToken: row.receiptToken,
-        tickets: ticketRows.filter((item) => item.eventId === row.eventId && item.status !== "CANCELLED").length,
-        pendingConsumptions: consumptionRows.filter((item) => item.eventId === row.eventId && item.status === "PENDING").length,
+        // Sin compra completada no hay receipt: la vista del evento es la que muestra lo que haya.
+        receiptToken: null,
+        tickets: countTickets(row.eventId),
+        pendingConsumptions: countPending(row.eventId),
+      })
+    }
+
+    // Cada consulta viene ordenada por fecha, pero el merge rompe ese orden.
+    profileEvents.sort((a, b) => b.date.getTime() - a.date.getTime())
+
+    return c.json({ customer: { name: customer.name }, events: profileEvents })
+  })
+  // Vista de un evento para el cliente que entró por el link de acceso: el mismo contenido que el
+  // comprobante (entradas con su QR, consumos y saldo) pero sin venta de por medio, porque puede
+  // no haber comprado nada todavía. Los datos son sólo de ese cliente, acotados al evento y a su
+  // productora: la credencial del perfil es la única puerta.
+  .get("/customers/profile/:token/events/:eventId", async (c) => {
+    const db = drizzle(pool)
+    const customer = await resolveCustomerForToken(db, c.req.param("token"))
+    if (!customer) return c.json({ error: "El enlace no es válido" }, 404)
+
+    const [ev] = await db
+      .select({
+        id: events.id,
+        slug: events.slug,
+        name: events.name,
+        date: events.date,
+        venue: events.venue,
+        location: events.location,
+        imageUrl: events.imageUrl,
+        status: events.status,
+        tenantId: events.tenantId,
+        productoraName: tenants.name,
+      })
+      .from(events)
+      .innerJoin(tenants, eq(events.tenantId, tenants.id))
+      .where(eq(events.id, c.req.param("eventId")))
+      .limit(1)
+    if (!ev) return c.json({ error: "Evento no encontrado" }, 404)
+
+    const consumptionShape = {
+      id: digitalConsumptions.id,
+      qrHash: digitalConsumptions.qrHash,
+      status: digitalConsumptions.status,
+      productId: digitalConsumptions.productId,
+      productName: products.name,
+      productPrice: products.price,
+    }
+
+    const [ticketRows, consumptionRows, latestSale, balanceAmount] = await Promise.all([
+      db
+        .select({
+          id: tickets.id,
+          qrHash: tickets.qrHash,
+          status: tickets.status,
+          ticketTypeName: ticketTypes.name,
+          ticketTypePrice: ticketTypes.price,
+          validFrom: ticketTypes.validFrom,
+          validUntil: ticketTypes.validUntil,
+        })
+        .from(tickets)
+        .innerJoin(ticketTypes, eq(tickets.ticketTypeId, ticketTypes.id))
+        .where(
+          and(
+            eq(tickets.customerId, customer.id),
+            eq(tickets.eventId, ev.id),
+            eq(tickets.tenantId, ev.tenantId),
+            ne(tickets.status, "CANCELLED")
+          )
+        )
+        .orderBy(ticketTypes.name, tickets.createdAt),
+      db
+        .select(consumptionShape)
+        .from(digitalConsumptions)
+        .innerJoin(products, eq(digitalConsumptions.productId, products.id))
+        .where(
+          and(
+            eq(digitalConsumptions.customerId, customer.id),
+            eq(digitalConsumptions.eventId, ev.id),
+            eq(digitalConsumptions.tenantId, ev.tenantId)
+          )
+        )
+        .orderBy(products.name, digitalConsumptions.createdAt),
+      db
+        .select({ receiptToken: sales.receiptToken })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.customerId, customer.id),
+            eq(sales.eventId, ev.id),
+            eq(sales.status, "COMPLETED")
+          )
+        )
+        .orderBy(desc(sales.createdAt))
+        .limit(1),
+      getBalance(db, customer.id, ev.id),
+    ])
+
+    return c.json({
+      customer: { name: customer.name },
+      event: {
+        id: ev.id,
+        slug: ev.slug ?? null,
+        name: ev.name,
+        date: ev.date,
+        venue: ev.venue,
+        location: ev.location,
+        imageUrl: ev.imageUrl,
+        status: ev.status,
+      },
+      productora: { name: ev.productoraName },
+      balance: { amount: balanceAmount },
+      // Si hay compra, el comprobante tiene el flujo completo (retiros, comprar consumos): la
+      // página del evento ofrece el link en vez de duplicarlo.
+      receiptToken: latestSale[0]?.receiptToken ?? null,
+      tickets: ticketRows.map((r) => ({
+        id: r.id,
+        qrHash: r.qrHash,
+        status: r.status,
+        ticketType: {
+          name: r.ticketTypeName,
+          price: r.ticketTypePrice,
+          validFrom: r.validFrom?.toISOString() ?? null,
+          validUntil: r.validUntil?.toISOString() ?? null,
+        },
+      })),
+      consumptions: consumptionRows.map((r) => ({
+        id: r.id,
+        qrHash: r.qrHash,
+        status: r.status,
+        product: { id: r.productId, name: r.productName, price: r.productPrice },
       })),
     })
   })
@@ -505,7 +691,15 @@ export const publicRoute = new Hono()
         code: body.code,
       })
       if (!result.ok) return c.json({ error: result.error, reason: result.reason }, 400)
-      return c.json({ ok: true, token: result.token, name: result.name })
+      // `eventId` + `receiptToken` evitan un viaje extra: el cliente va directo al comprobante si
+      // compró, o a la vista del evento si no.
+      return c.json({
+        ok: true,
+        token: result.token,
+        name: result.name,
+        eventId: result.eventId,
+        receiptToken: result.receiptToken,
+      })
     }
   )
   .get("/events", async (c) => {
