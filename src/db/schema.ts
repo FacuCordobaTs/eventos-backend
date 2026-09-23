@@ -1156,6 +1156,35 @@ export const posSessions = mysqlTable(
   })
 );
 
+// Vinculación de un equipo por QR (estilo WhatsApp Web): la computadora muestra un código, un
+// teléfono que ya tiene sesión staff lo aprueba y la computadora recibe la sesión de esa persona.
+// `code` es público (viaja en el QR y sólo sirve para aprobar desde una sesión ya iniciada);
+// `secret` queda únicamente en el equipo que creó el vínculo y es lo que permite reclamar el JWT,
+// así una foto del QR no alcanza para quedarse con la sesión. De un solo uso y vida corta. Aditiva.
+export const staffDeviceLinks = mysqlTable(
+  'staff_device_links',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    // Código público del QR. Único.
+    code: varchar('code', { length: 64 }).notNull().unique(),
+    // Secreto del equipo que espera. Único por generación; no viaja en el QR.
+    secret: varchar('secret', { length: 64 }).notNull(),
+    // Módulo que el equipo está abriendo. Guía la UI del teléfono; no otorga permisos:
+    // la sesión que se entrega es la del staff que aprueba, con su rol real.
+    requestedAccess: mysqlEnum('requested_access', ['pos', 'security']),
+    // Staff que aprobó desde su teléfono. Null mientras nadie escaneó.
+    staffId: varchar('staff_id', { length: 36 }).references(() => staff.id),
+    approvedAt: timestamp('approved_at'),
+    // Se llena al entregar el JWT: el vínculo no se puede reclamar dos veces.
+    claimedAt: timestamp('claimed_at'),
+    expiresAt: timestamp('expires_at').notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    expiresIdx: index('staff_device_links_expires_idx').on(table.expiresAt),
+  })
+);
+
 // -----------------------------------------------------------------------------
 // 5. RELACIONES
 // -----------------------------------------------------------------------------

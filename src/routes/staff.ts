@@ -12,6 +12,7 @@ import {
   posSessions,
   promoters,
   staff,
+  staffDeviceLinks,
   staffInvitations,
   tenants,
 } from "../db/schema"
@@ -24,6 +25,7 @@ import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
+import { clientIp, consumeRateLimit } from "../lib/rate-limit"
 import { isWhatsAppConfigured, sendWhatsAppTemplateMessage } from "../lib/whatsapp-service"
 
 const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.crow.ar").replace(/\/$/, "")
@@ -52,6 +54,15 @@ const magicLinkConsumeSchema = z.object({
   staffId: z.string().optional(),
 })
 
+const createDeviceLinkSchema = z.object({
+  // Módulo que el equipo está abriendo. Sólo contextúa la pantalla del teléfono.
+  access: z.enum(["pos", "security"]).optional(),
+})
+const claimDeviceLinkSchema = z.object({
+  code: z.string().min(1),
+  secret: z.string().min(1),
+})
+
 const createPosSessionSchema = z.object({
   eventId: z.string().min(1),
   barId: z.string().optional(),
@@ -61,6 +72,25 @@ const posPinSchema = z.object({ pin: pinSchema })
 
 const MAGIC_LINK_TTL_MS = 15 * 60 * 1000
 const STAFF_INVITATION_TEMPLATE = "crow_invitacion_staff"
+
+/** Vida del código de vinculación de equipo: el teléfono tiene que escanear dentro de esa ventana. */
+const DEVICE_LINK_TTL_MS = 5 * 60 * 1000
+/** Si el teléfono aprueba sobre el final, el equipo todavía necesita tiempo para reclamar el JWT. */
+const DEVICE_LINK_CLAIM_GRACE_MS = 2 * 60 * 1000
+const DEVICE_LINK_LIMIT_PER_IP = { limit: 20, windowMs: 60 * 1000 }
+
+type StaffDeviceLinkRow = typeof staffDeviceLinks.$inferSelect
+
+/**
+ * Estado del vínculo. `approved` y `claimed` significan lo mismo para el teléfono (ya vinculó);
+ * para el equipo que espera sólo `approved` habilita reclamar el JWT.
+ */
+function deviceLinkStatus(row: StaffDeviceLinkRow): "pending" | "approved" | "claimed" | "expired" {
+  if (row.claimedAt) return "claimed"
+  if (row.expiresAt.getTime() < Date.now()) return "expired"
+  if (row.approvedAt) return "approved"
+  return "pending"
+}
 
 /**
  * ¿Ese PIN ya lo usa OTRA persona activa del tenant? El alta/rotación por PIN requiere que el
@@ -852,6 +882,143 @@ export const staffRoute = new Hono()
       })
     )
     return c.json({ requiresTenantSelection: true as const, options })
+  })
+  // ---------------------------------------------------------------------------
+  // Vinculación de equipo por QR (estilo WhatsApp Web): la computadora muestra un código, el
+  // teléfono que ya tiene sesión staff lo aprueba y la computadora recibe la sesión de esa
+  // persona. El `secret` no viaja en el QR: sólo el equipo que creó el vínculo puede reclamar
+  // el JWT, así una foto del código no alcanza para quedarse con la sesión.
+  // ---------------------------------------------------------------------------
+  .post("/device-links", zValidator("json", createDeviceLinkSchema), async (c) => {
+    const db = drizzle(pool)
+    const body = c.req.valid("json")
+    // Cada llamada escribe una fila y devuelve el `secret`: sin cupo por IP, cualquiera podría
+    // llenar la tabla desde afuera.
+    const ip = clientIp(c.req.raw.headers)
+    if (ip) {
+      const byIp = consumeRateLimit(
+        `device-link:ip:${ip}`,
+        DEVICE_LINK_LIMIT_PER_IP.limit,
+        DEVICE_LINK_LIMIT_PER_IP.windowMs
+      )
+      if (!byIp.ok) {
+        return c.json({ error: "Demasiados intentos. Esperá un momento." }, 429)
+      }
+    }
+    const id = uuidv4()
+    const code = randomBytes(16).toString("hex")
+    const secret = genToken()
+    const expiresAt = new Date(Date.now() + DEVICE_LINK_TTL_MS)
+    await db.insert(staffDeviceLinks).values({
+      id,
+      code,
+      secret,
+      requestedAccess: body.access ?? null,
+      expiresAt,
+      createdAt: new Date(),
+    })
+    return c.json(
+      {
+        deviceLink: {
+          code,
+          secret,
+          access: body.access ?? null,
+          expiresAt,
+          // El QR apunta siempre a Crow web: la app de escritorio no es una URL que un teléfono abra.
+          url: `${ADMIN_URL}/vincular/${code}`,
+        },
+      },
+      201
+    )
+  })
+  // Público (sin auth): el teléfono consulta el vínculo que acaba de escanear, antes de aprobarlo.
+  // Nunca revela quién lo aprobó: sólo el estado y el módulo que pidió el equipo.
+  .get("/device-links/:code", async (c) => {
+    const db = drizzle(pool)
+    const [link] = await db
+      .select()
+      .from(staffDeviceLinks)
+      .where(eq(staffDeviceLinks.code, c.req.param("code")))
+      .limit(1)
+    if (!link) {
+      return c.json({ error: "El código no existe" }, 404)
+    }
+    return c.json({
+      deviceLink: {
+        access: link.requestedAccess,
+        status: deviceLinkStatus(link),
+        expiresAt: link.expiresAt,
+      },
+    })
+  })
+  .post("/device-links/:code/approve", authMiddleware, async (c) => {
+    const db = drizzle(pool)
+    const ctx = c as AuthenticatedContext
+    const code = String(c.req.param("code"))
+    const [link] = await db
+      .select()
+      .from(staffDeviceLinks)
+      .where(eq(staffDeviceLinks.code, code))
+      .limit(1)
+    if (!link) {
+      return c.json({ error: "El código no existe. Pedí uno nuevo en la computadora." }, 404)
+    }
+    if (link.approvedAt) {
+      return c.json({ error: "Este código ya fue usado. Generá uno nuevo en la computadora." }, 409)
+    }
+    if (link.expiresAt.getTime() < Date.now()) {
+      return c.json({ error: "El código venció. Generá uno nuevo en la computadora." }, 410)
+    }
+    // La sesión que se entrega es la de quien aprueba, con su rol y su tenant: vincular un equipo
+    // no agrega permisos ni permite prestar otra cuenta. Por eso alcanza con estar autenticado;
+    // el rol se sigue validando al operar, como en cualquier login.
+    await db
+      .update(staffDeviceLinks)
+      .set({
+        staffId: ctx.staff.id,
+        approvedAt: new Date(),
+        expiresAt: new Date(
+          Math.max(link.expiresAt.getTime(), Date.now() + DEVICE_LINK_CLAIM_GRACE_MS)
+        ),
+      })
+      .where(eq(staffDeviceLinks.id, link.id))
+    return c.json({ ok: true })
+  })
+  // El equipo espera con su `secret`; cuando el teléfono aprobó, acá recibe su sesión.
+  .post("/device-links/claim", zValidator("json", claimDeviceLinkSchema), async (c) => {
+    const db = drizzle(pool)
+    const { code, secret } = c.req.valid("json")
+    const [link] = await db
+      .select()
+      .from(staffDeviceLinks)
+      .where(and(eq(staffDeviceLinks.code, code), eq(staffDeviceLinks.secret, secret)))
+      .limit(1)
+    if (!link) {
+      return c.json({ error: "Vínculo no encontrado" }, 404)
+    }
+    if (link.claimedAt) {
+      return c.json({ error: "Este código ya fue reclamado. Generá uno nuevo." }, 409)
+    }
+    if (link.expiresAt.getTime() < Date.now()) {
+      return c.json({ status: "expired" as const })
+    }
+    if (!link.staffId) {
+      return c.json({ status: "pending" as const })
+    }
+    const [row] = await db.select().from(staff).where(eq(staff.id, link.staffId)).limit(1)
+    if (!row || !row.isActive) {
+      return c.json({ error: "La cuenta de este acceso ya no está disponible" }, 410)
+    }
+    await db
+      .update(staffDeviceLinks)
+      .set({ claimedAt: new Date() })
+      .where(eq(staffDeviceLinks.id, link.id))
+    const jwt = await createAccessToken(row.id, "staff")
+    return c.json({
+      status: "approved" as const,
+      token: jwt,
+      staff: await staffPayloadForClient(db, row),
+    })
   })
   // ---------------------------------------------------------------------------
   // Sesión de puesto (spec §1): dispositivo fijado a una barra, rotación por PIN.
