@@ -10,6 +10,7 @@ import {
   barInventory,
   barProducts,
   bars,
+  customerAccessCodes,
   customerBalances,
   courtesies,
   customers,
@@ -1446,6 +1447,9 @@ export const eventsRoute = new Hono()
       await tx.delete(pickupOrders).where(and(eq(pickupOrders.eventId, eventId), eq(pickupOrders.tenantId, tenantId)))
       await tx.delete(balanceMovements).where(and(eq(balanceMovements.eventId, eventId), eq(balanceMovements.tenantId, tenantId)))
       await tx.delete(customerBalances).where(and(eq(customerBalances.eventId, eventId), eq(customerBalances.tenantId, tenantId)))
+      // Códigos de acceso (DNI/celular) del evento: filas hoja, se van con él. La ficha del
+      // cliente y su celular quedan intactos — viven en `customers`.
+      await tx.delete(customerAccessCodes).where(and(eq(customerAccessCodes.eventId, eventId), eq(customerAccessCodes.tenantId, tenantId)))
       await tx.delete(digitalConsumptions).where(and(eq(digitalConsumptions.eventId, eventId), eq(digitalConsumptions.tenantId, tenantId)))
       await tx.delete(gateLogs).where(and(eq(gateLogs.eventId, eventId), eq(gateLogs.tenantId, tenantId)))
       await tx.delete(courtesies).where(and(eq(courtesies.eventId, eventId), eq(courtesies.tenantId, tenantId)))
