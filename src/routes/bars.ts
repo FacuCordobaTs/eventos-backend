@@ -412,6 +412,140 @@ async function findPickupStockShortages(
   return shortages
 }
 
+type ConsumptionRow = typeof digitalConsumptions.$inferSelect
+
+type RedeemSetResult =
+  | {
+      kind: "ok"
+      items: { productId: string; productName: string; quantity: number }[]
+      totalAmount: string
+      inventoryItemIds: string[]
+    }
+  | { kind: "wrong_event" }
+  | { kind: "race_used" }
+
+/**
+ * Marca REDEEMED un conjunto de consumiciones PENDING y descuenta el stock por receta UNA vez
+ * por producto (cantidad agregada). Lo comparten la entrega de pedidos de retiro (tarea 4.2) y
+ * la entrega por comprobante de la venta: entregar 2 fernets descuenta exactamente lo mismo que
+ * canjear 2 QRs individuales. Corre DENTRO de la transacción del caller: ante `wrong_event` o
+ * `race_used` el caller debe descartarla. Lanza `InsufficientStockError` si no alcanza el stock.
+ */
+async function redeemConsumptionSet(
+  tx: Tx,
+  params: { tenantId: string; eventId: string; barId: string; staffId: string },
+  consRows: ConsumptionRow[]
+): Promise<RedeemSetResult> {
+  if (consRows.some((r) => r.eventId !== params.eventId)) {
+    return { kind: "wrong_event" }
+  }
+  if (consRows.some((r) => r.status !== "PENDING")) {
+    return { kind: "race_used" }
+  }
+
+  const consumptionIds = consRows.map((r) => r.id)
+
+  // Marcar todas REDEEMED (update condicional: si otra entrega concurrente del mismo pedido se
+  // adelantó, las filas que ya no están PENDING quedan sin tocar y la verificación de abajo lo
+  // detecta → rollback).
+  for (const r of consRows) {
+    await tx
+      .update(digitalConsumptions)
+      .set({
+        status: "REDEEMED",
+        redeemedAt: new Date(),
+        redeemedBy: params.staffId,
+      })
+      .where(
+        and(
+          eq(digitalConsumptions.id, r.id),
+          eq(digitalConsumptions.status, "PENDING")
+        )
+      )
+  }
+
+  const [verify] = await tx
+    .select({ n: sql<string>`count(*)` })
+    .from(digitalConsumptions)
+    .where(
+      and(
+        inArray(digitalConsumptions.id, consumptionIds),
+        ne(digitalConsumptions.status, "REDEEMED")
+      )
+    )
+  if (Number(verify?.n ?? 0) > 0) {
+    return { kind: "race_used" }
+  }
+
+  // Descuento de stock por receta, UNA vez por producto con la cantidad agregada. Cada fila de
+  // `digital_consumptions` es una unidad, así que la cantidad sale de contar filas.
+  const qtyByProduct = new Map<string, number>()
+  for (const r of consRows) {
+    qtyByProduct.set(r.productId, (qtyByProduct.get(r.productId) ?? 0) + 1)
+  }
+  const prodIds = [...qtyByProduct.keys()]
+  const prodRows = await tx
+    .select({
+      id: products.id,
+      name: products.name,
+      price: products.price,
+      saleType: products.saleType,
+    })
+    .from(products)
+    .where(inArray(products.id, prodIds))
+  const prodById = new Map(prodRows.map((p) => [p.id, p]))
+  const inventoryItemIds = await deductRecipeStock(
+    tx,
+    { tenantId: params.tenantId, eventId: params.eventId, barId: params.barId },
+    prodIds.map((pid) => ({
+      productId: pid,
+      quantity: qtyByProduct.get(pid) ?? 1,
+      saleType: prodById.get(pid)?.saleType ?? "GLASS",
+    }))
+  )
+
+  // Total = precio cobrado al momento de la compra (`sale_items.price_at_time`), con fallback
+  // al precio actual del producto — mismo criterio que el comprobante.
+  const saleIds = [...new Set(consRows.map((r) => r.saleId))]
+  const priceRows = await tx
+    .select({
+      saleId: saleItems.saleId,
+      productId: saleItems.productId,
+      priceAtTime: saleItems.priceAtTime,
+    })
+    .from(saleItems)
+    .where(
+      and(
+        inArray(saleItems.saleId, saleIds),
+        inArray(saleItems.productId, prodIds)
+      )
+    )
+  const priceByKey = new Map(
+    priceRows.map((p) => [`${p.saleId}:${p.productId}`, String(p.priceAtTime)])
+  )
+
+  let total = dec(0)
+  for (const r of consRows) {
+    const charged = priceByKey.get(`${r.saleId}:${r.productId}`)
+    const unit =
+      charged != null
+        ? decFromDb(charged)
+        : decFromDb(prodById.get(r.productId)?.price ?? "0")
+    total = total.plus(unit)
+  }
+
+  return {
+    kind: "ok",
+    items: prodIds.map((productId) => ({
+      productId,
+      productName: prodById.get(productId)?.name ?? "Producto",
+      quantity: qtyByProduct.get(productId) ?? 1,
+    })),
+    totalAmount: decToDb(total),
+    inventoryItemIds,
+  }
+}
+
 export const barsRoute = new Hono()
   .use("*", authMiddleware)
   .get("/:barId/products", async (c) => {
@@ -1166,68 +1300,15 @@ export const barsRoute = new Hono()
         if (consRows.length !== consumptionIds.length) {
           return { kind: "race_used" as const }
         }
-        if (consRows.some((r) => r.eventId !== bar.eventId)) {
-          return { kind: "wrong_event" as const }
-        }
-        if (consRows.some((r) => r.status !== "PENDING")) {
-          return { kind: "race_used" as const }
-        }
 
-        // Marcar todas REDEEMED (update condicional: si otra entrega concurrente del mismo
-        // pedido se adelantó, las filas que ya no están PENDING quedan sin tocar y la
-        // verificación de abajo lo detecta → rollback).
-        for (const r of consRows) {
-          await tx
-            .update(digitalConsumptions)
-            .set({
-              status: "REDEEMED",
-              redeemedAt: new Date(),
-              redeemedBy: ctx.staff.id,
-            })
-            .where(
-              and(
-                eq(digitalConsumptions.id, r.id),
-                eq(digitalConsumptions.status, "PENDING")
-              )
-            )
-        }
-
-        const [verify] = await tx
-          .select({ n: sql<string>`count(*)` })
-          .from(digitalConsumptions)
-          .where(
-            and(
-              inArray(digitalConsumptions.id, consumptionIds),
-              ne(digitalConsumptions.status, "REDEEMED")
-            )
-          )
-        if (Number(verify?.n ?? 0) > 0) {
-          return { kind: "race_used" as const }
-        }
-
-        // Descuento de stock por receta, UNA vez por producto con la cantidad agregada.
-        const prodIds = [...new Set(items.map((i) => i.productId))]
-        const prodRows = await tx
-          .select({ id: products.id, saleType: products.saleType })
-          .from(products)
-          .where(inArray(products.id, prodIds))
-        const saleTypeById = new Map(prodRows.map((p) => [p.id, p.saleType]))
-        const qtyByProduct = new Map<string, number>()
-        for (const i of items) {
-          qtyByProduct.set(
-            i.productId,
-            (qtyByProduct.get(i.productId) ?? 0) + i.quantity
-          )
-        }
-        const inventoryItemIds = await deductRecipeStock(
+        const redeemed = await redeemConsumptionSet(
           tx,
-          { tenantId, eventId: bar.eventId, barId },
-          prodIds.map((pid) => ({
-            productId: pid,
-            quantity: qtyByProduct.get(pid) ?? 1,
-            saleType: saleTypeById.get(pid) ?? "GLASS",
-          }))
+          { tenantId, eventId: bar.eventId, barId, staffId: ctx.staff.id },
+          consRows
         )
+        if (redeemed.kind !== "ok") {
+          return { kind: redeemed.kind }
+        }
 
         // Pedido entregado: queda DELIVERED con quién/cuándo (lo muestra el client).
         await tx
@@ -1239,61 +1320,14 @@ export const barsRoute = new Hono()
           })
           .where(eq(pickupOrders.id, order.id))
 
-        // Total = precio cobrado al momento de la compra (`sale_items.price_at_time`),
-        // con fallback al precio actual del producto — mismo criterio que el comprobante.
-        const saleIds = [...new Set(consRows.map((r) => r.saleId))]
-        const priceRows = await tx
-          .select({
-            saleId: saleItems.saleId,
-            productId: saleItems.productId,
-            priceAtTime: saleItems.priceAtTime,
-          })
-          .from(saleItems)
-          .where(
-            and(
-              inArray(saleItems.saleId, saleIds),
-              inArray(saleItems.productId, prodIds)
-            )
-          )
-        const priceByKey = new Map(
-          priceRows.map((p) => [`${p.saleId}:${p.productId}`, String(p.priceAtTime)])
-        )
-        const productRows = await tx
-          .select({ id: products.id, name: products.name, price: products.price })
-          .from(products)
-          .where(inArray(products.id, prodIds))
-        const prodById = new Map(productRows.map((p) => [p.id, p]))
-        const saleIdByConsumption = new Map(
-          consRows.map((r) => [r.id, r.saleId])
-        )
-
-        let total = dec(0)
-        for (const i of items) {
-          const saleId = saleIdByConsumption.get(i.consumptionId)
-          const charged = saleId ? priceByKey.get(`${saleId}:${i.productId}`) : undefined
-          const unit =
-            charged != null
-              ? decFromDb(charged)
-              : decFromDb(prodById.get(i.productId)?.price ?? "0")
-          total = total.plus(unit.times(i.quantity))
-        }
-
-        const groupedItems = [...qtyByProduct.entries()].map(
-          ([productId, quantity]) => ({
-            productId,
-            productName: prodById.get(productId)?.name ?? "Producto",
-            quantity,
-          })
-        )
-
         return {
           kind: "ok" as const,
-          items: groupedItems,
-          totalAmount: decToDb(total),
+          items: redeemed.items,
+          totalAmount: redeemed.totalAmount,
           eventId: bar.eventId,
           customerId: order.customerId,
           pickupToken: order.token,
-          inventoryItemIds,
+          inventoryItemIds: redeemed.inventoryItemIds,
         }
       })
     } catch (e) {
@@ -1348,6 +1382,306 @@ export const barsRoute = new Hono()
         )
       for (const receipt of customerReceipts) {
         broadcastReceiptUpdate(receipt.receiptToken)
+      }
+    }
+
+    return c.json({
+      ok: true,
+      items: result.items,
+      totalAmount: result.totalAmount,
+      message: `Servir: ${(result.items ?? [])
+        .map((i) => `${i.quantity}× ${i.productName}`)
+        .join(", ")}`,
+    })
+  })
+  // Entrega por comprobante de venta: el QR del recibo impreso en caja codifica
+  // `sales.receiptToken`, así que la venta ES el pedido. Es el único camino escaneable de una
+  // venta anónima (sin DNI), que hasta ahora no imprimía ningún QR. Mismo contrato que los
+  // pedidos de retiro: preview idempotente por GET y entrega transaccional por POST.
+  .get("/:barId/sales/:receiptToken", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const receiptToken = c.req.param("receiptToken")
+    const db = drizzle(pool)
+
+    const [bar] = await db
+      .select()
+      .from(bars)
+      .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+      .limit(1)
+    if (!bar) {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+
+    const [sale] = await db
+      .select()
+      .from(sales)
+      .where(
+        and(eq(sales.receiptToken, receiptToken), eq(sales.tenantId, tenantId))
+      )
+      .limit(1)
+    if (!sale) {
+      return c.json({ error: "Venta no encontrada" }, 404)
+    }
+    if (sale.eventId !== bar.eventId) {
+      return c.json({ error: "Esta venta no pertenece a este evento" }, 400)
+    }
+    // Una venta de caja se sirve en la barra que la cobró: el descuento de stock sale del
+    // `barInventory` de la barra que entrega. Las ventas de app (`barId` null) siguen siendo
+    // servibles en cualquier barra del evento, igual que el canje 1×1.
+    if (sale.barId != null && sale.barId !== barId) {
+      return c.json({ error: "Esta venta no es válida en esta barra" }, 400)
+    }
+
+    const consRows = await db
+      .select({
+        id: digitalConsumptions.id,
+        productId: digitalConsumptions.productId,
+        status: digitalConsumptions.status,
+      })
+      .from(digitalConsumptions)
+      .where(
+        and(
+          eq(digitalConsumptions.saleId, sale.id),
+          eq(digitalConsumptions.tenantId, tenantId)
+        )
+      )
+    if (consRows.length === 0) {
+      return c.json(
+        { error: "Esta venta no tiene consumiciones para servir" },
+        400
+      )
+    }
+
+    const pending = consRows.filter((r) => r.status === "PENDING")
+    const deliveredQuantity = consRows.filter(
+      (r) => r.status === "REDEEMED"
+    ).length
+    // Cada consumición es una unidad: mismo shape que el itemsJson de un pedido de retiro.
+    const items = await pickupItemsWithNames(
+      db,
+      pending.map((r) => ({
+        consumptionId: r.id,
+        productId: r.productId,
+        quantity: 1,
+      }))
+    )
+    const stockShortages = await findPickupStockShortages(
+      db,
+      { tenantId, eventId: bar.eventId, barId },
+      items
+    )
+    return c.json({
+      token: sale.receiptToken,
+      status:
+        pending.length > 0
+          ? "PENDING"
+          : deliveredQuantity > 0
+            ? "DELIVERED"
+            : "CANCELLED",
+      items,
+      pendingQuantity: pending.length,
+      deliveredQuantity,
+      totalQuantity: consRows.length,
+      stockShortages,
+    })
+  })
+  // Entrega de la venta completa: el barman escanea el QR del recibo y sirve todo lo que quede
+  // PENDING de esa venta. Idempotente: el segundo intento no escribe nada.
+  .post("/:barId/sales/:receiptToken/deliver", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const barId = c.req.param("barId")
+    const receiptToken = c.req.param("receiptToken")
+    const db = drizzle(pool)
+
+    let result: {
+      kind:
+        | "no_bar"
+        | "no_sale"
+        | "wrong_event"
+        | "wrong_bar"
+        | "no_consumptions"
+        | "already_delivered"
+        | "race_used"
+        | "ok"
+      items?: { productId: string; productName: string; quantity: number }[]
+      totalAmount?: string
+      eventId?: string
+      receiptToken?: string
+      inventoryItemIds?: string[]
+      closedPickupTokens?: string[]
+    }
+    try {
+      result = await db.transaction(async (tx) => {
+        const [bar] = await tx
+          .select()
+          .from(bars)
+          .where(and(eq(bars.id, barId), eq(bars.tenantId, tenantId)))
+          .limit(1)
+        if (!bar) {
+          return { kind: "no_bar" as const }
+        }
+
+        const [sale] = await tx
+          .select()
+          .from(sales)
+          .where(
+            and(
+              eq(sales.receiptToken, receiptToken),
+              eq(sales.tenantId, tenantId)
+            )
+          )
+          .limit(1)
+        if (!sale) {
+          return { kind: "no_sale" as const }
+        }
+        if (sale.eventId !== bar.eventId) {
+          return { kind: "wrong_event" as const }
+        }
+        if (sale.barId != null && sale.barId !== barId) {
+          return { kind: "wrong_bar" as const }
+        }
+
+        const consRows = await tx
+          .select()
+          .from(digitalConsumptions)
+          .where(
+            and(
+              eq(digitalConsumptions.saleId, sale.id),
+              eq(digitalConsumptions.tenantId, tenantId)
+            )
+          )
+        if (consRows.length === 0) {
+          return { kind: "no_consumptions" as const }
+        }
+
+        const pending = consRows.filter((r) => r.status === "PENDING")
+        if (pending.length === 0) {
+          // Nada que servir: ya se entregó por este recibo o canjeando los QRs individuales.
+          return consRows.some((r) => r.status === "REDEEMED")
+            ? { kind: "already_delivered" as const }
+            : { kind: "no_consumptions" as const }
+        }
+
+        const redeemed = await redeemConsumptionSet(
+          tx,
+          { tenantId, eventId: bar.eventId, barId, staffId: ctx.staff.id },
+          pending
+        )
+        if (redeemed.kind !== "ok") {
+          return { kind: redeemed.kind }
+        }
+
+        // Cierre de los pedidos de retiro que esta entrega dejó completos. `pickupOrders` no
+        // guarda `saleId`: el vínculo son los `consumptionId` del itemsJson. Sólo se cierran los
+        // pedidos cubiertos ENTEROS por lo entregado; uno que mezcle consumiciones de otra venta
+        // sigue PENDING y es retirable por el resto.
+        const closedPickupTokens: string[] = []
+        if (sale.customerId != null) {
+          const openPickups = await tx
+            .select()
+            .from(pickupOrders)
+            .where(
+              and(
+                eq(pickupOrders.tenantId, tenantId),
+                eq(pickupOrders.eventId, bar.eventId),
+                eq(pickupOrders.customerId, sale.customerId),
+                eq(pickupOrders.status, "PENDING")
+              )
+            )
+          const deliveredIds = new Set(pending.map((r) => r.id))
+          const covered = openPickups.filter((o) => {
+            const its = o.itemsJson ?? []
+            return (
+              its.length > 0 &&
+              its.every((i) => deliveredIds.has(i.consumptionId))
+            )
+          })
+          for (const o of covered) {
+            await tx
+              .update(pickupOrders)
+              .set({
+                status: "DELIVERED",
+                deliveredAt: new Date(),
+                deliveredBy: ctx.staff.id,
+              })
+              .where(
+                and(eq(pickupOrders.id, o.id), eq(pickupOrders.status, "PENDING"))
+              )
+            closedPickupTokens.push(o.token)
+          }
+        }
+
+        return {
+          kind: "ok" as const,
+          items: redeemed.items,
+          totalAmount: redeemed.totalAmount,
+          eventId: bar.eventId,
+          receiptToken: sale.receiptToken,
+          inventoryItemIds: redeemed.inventoryItemIds,
+          closedPickupTokens,
+        }
+      })
+    } catch (e) {
+      if (e instanceof InsufficientStockError) {
+        return c.json(
+          {
+            error: `Stock insuficiente: ${e.inventoryItemName}`,
+            inventoryItemId: e.inventoryItemId,
+          },
+          409
+        )
+      }
+      throw e
+    }
+
+    if (result.kind === "no_bar") {
+      return c.json({ error: "Barra no encontrada" }, 404)
+    }
+    if (result.kind === "no_sale") {
+      return c.json({ error: "Venta no encontrada" }, 404)
+    }
+    if (result.kind === "wrong_event") {
+      return c.json({ error: "Esta venta no pertenece a este evento" }, 400)
+    }
+    if (result.kind === "wrong_bar") {
+      return c.json({ error: "Esta venta no es válida en esta barra" }, 400)
+    }
+    if (result.kind === "no_consumptions") {
+      return c.json(
+        { error: "Esta venta no tiene consumiciones para servir" },
+        400
+      )
+    }
+    if (result.kind === "already_delivered") {
+      return c.json({ error: "Esta venta ya fue entregada" }, 409)
+    }
+    if (result.kind === "race_used") {
+      return c.json({ error: "Algunas consumiciones ya fueron canjeadas" }, 409)
+    }
+
+    if (
+      result.kind === "ok" &&
+      result.inventoryItemIds &&
+      result.inventoryItemIds.length > 0
+    ) {
+      void emitCommittedStockDeltas(tenantId, result.eventId!, {
+        eventItemIds: result.inventoryItemIds,
+        barDeltas: { barId, itemIds: result.inventoryItemIds },
+      })
+    }
+    if (result.kind === "ok") {
+      broadcastReceiptUpdate(result.receiptToken!)
+      for (const t of result.closedPickupTokens ?? []) {
+        broadcastPickupUpdate(t)
       }
     }
 
