@@ -646,10 +646,11 @@ export const bars = mysqlTable(
       .notNull()
       .references(() => tenants.id),
     name: varchar('name', { length: 255 }).notNull(),
-    // La barra implícita del evento: la única que "vende todo" por defecto.
-    // Un evento tiene a lo sumo una barra con isDefault=true. Los "puestos"
-    // (subdivisión avanzada) nacen con isDefault=false heredando su menú.
-    // Se materializa on-demand vía ensureDefaultBar() (routes/events.ts).
+    // Barra general del evento (`isDefault=true`, a lo sumo una). Compatibilidad: ya
+    // no se materializa ninguna sola al crear una barra, así que solo la tienen
+    // eventos con datos viejos (backfill de 0038) o con el flujo previo de "Dividir
+    // en puestos". Esa barra no se puede desactivar y es la fuente del menú que
+    // heredan los puestos nuevos.
     isDefault: boolean('is_default').notNull().default(false),
     isActive: boolean('is_active').default(true),
     createdAt: timestamp('created_at').defaultNow(),
@@ -1175,6 +1176,20 @@ export const staffDeviceLinks = mysqlTable(
     // Staff que aprobó desde su teléfono. Null mientras nadie escaneó.
     staffId: varchar('staff_id', { length: 36 }).references(() => staff.id),
     approvedAt: timestamp('approved_at'),
+    /**
+     * Barra que quien aprobó fijó a esa computadora (sólo ADMIN/MANAGER sobre un vínculo de POS).
+     * Null con `assignmentDecided = true` significa "quitar la barra": la computadora libera su
+     * fijación local. Null con `assignmentDecided = false` significa "no opinó": no la toca.
+     * Sin FK a `bars` a propósito: las barras se borran físicamente con su evento y este puntero
+     * sólo importa durante el handshake; el claim re-resuelve la barra contra el tenant y, si ya
+     * no existe, la computadora se libera sola.
+     */
+    assignedBarId: varchar('assigned_bar_id', { length: 36 }),
+    /**
+     * Distingue "quien aprobó decidió el destino de la barra" (aunque fuera no asignar) de "no tenía
+     * potestad / no la eligió". El default preserva el comportamiento de las aprobaciones previas.
+     */
+    assignmentDecided: boolean('assignment_decided').notNull().default(false),
     // Se llena al entregar el JWT: el vínculo no se puede reclamar dos veces.
     claimedAt: timestamp('claimed_at'),
     expiresAt: timestamp('expires_at').notNull(),

@@ -19,10 +19,11 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { randomBytes } from "crypto"
 import { setCookie } from "hono/cookie"
-import { and, desc, eq, gt, inArray, isNull, ne, type SQL } from "drizzle-orm"
+import { and, asc, desc, eq, gt, inArray, isNull, ne, or, type SQL } from "drizzle-orm"
 import { createAccessToken } from "../lib/jwt"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { eventSupportsConsumptions } from "../lib/event-operation-mode"
 import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
 import { clientIp, consumeRateLimit } from "../lib/rate-limit"
@@ -61,6 +62,17 @@ const createDeviceLinkSchema = z.object({
 const claimDeviceLinkSchema = z.object({
   code: z.string().min(1),
   secret: z.string().min(1),
+})
+/**
+ * Cuerpo de la aprobación del vínculo. `assignment` es opcional a propósito: los clientes previos
+ * mandan `{}` y eso significa "no opinó" (no se toca la barra que la computadora ya tenía).
+ * `null` explícito significa "quitar la barra asignada".
+ */
+const approveDeviceLinkSchema = z.object({
+  assignment: z
+    .object({ eventId: z.string().min(1).max(36), barId: z.string().min(1).max(36) })
+    .nullable()
+    .optional(),
 })
 
 const createPosSessionSchema = z.object({
@@ -168,6 +180,18 @@ const adminOnly: MiddlewareHandler = async (c, next) => {
   const ctx = c as AuthenticatedContext
   if (ctx.staff.role !== "ADMIN") {
     return c.json({ error: "Solo administradores pueden realizar esta acción" }, 403)
+  }
+  await next()
+}
+
+/**
+ * ADMIN o MANAGER: quien puede fijar la barra de una computadora desde el QR, y ver la lista de
+ * barras para elegir. El `adminOnly` de las sesiones de puesto queda como estaba.
+ */
+const adminOrManager: MiddlewareHandler = async (c, next) => {
+  const ctx = c as AuthenticatedContext
+  if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+    return c.json({ error: "Solo administradores y encargados pueden realizar esta acción" }, 403)
   }
   await next()
 }
@@ -932,7 +956,8 @@ export const staffRoute = new Hono()
     )
   })
   // Público (sin auth): el teléfono consulta el vínculo que acaba de escanear, antes de aprobarlo.
-  // Nunca revela quién lo aprobó: sólo el estado y el módulo que pidió el equipo.
+  // Nunca revela quién lo aprobó ni qué barra se le fijó: sólo el estado y el módulo que pidió el
+  // equipo.
   .get("/device-links/:code", async (c) => {
     const db = drizzle(pool)
     const [link] = await db
@@ -950,6 +975,78 @@ export const staffRoute = new Hono()
         expiresAt: link.expiresAt,
       },
     })
+  })
+  // Barras que el teléfono puede fijar a esa computadora, ya agrupadas por evento para la pantalla
+  // de vinculación. Exige sesión propia (ADMIN/MANAGER): el `code` es público, así que el listado
+  // del catálogo de la productora no puede colgar del GET público de arriba.
+  .get("/device-links/:code/bars", authMiddleware, adminOrManager, async (c) => {
+    const db = drizzle(pool)
+    const ctx = c as AuthenticatedContext
+    const tenantId = ctx.staff.tenantId ?? null
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene productora asignada." }, 400)
+    }
+    const [link] = await db
+      .select()
+      .from(staffDeviceLinks)
+      .where(eq(staffDeviceLinks.code, c.req.param("code")))
+      .limit(1)
+    if (!link) {
+      return c.json({ error: "El código no existe. Pedí uno nuevo en la computadora." }, 404)
+    }
+    if (link.requestedAccess !== "pos") {
+      return c.json({ error: "Este código no es para el POS." }, 400)
+    }
+    if (link.approvedAt) {
+      return c.json({ error: "Este código ya fue usado. Generá uno nuevo en la computadora." }, 409)
+    }
+    if (link.expiresAt.getTime() < Date.now()) {
+      return c.json({ error: "El código venció. Generá uno nuevo en la computadora." }, 410)
+    }
+    // Mismo universo que el POS: eventos ni cerrados ni sólo-entradas, con sus barras activas.
+    // `is_active` es nullable, así que "activa" es `true` o NULL (como en el POS, que compara
+    // contra `false`): un `ne(..., false)` de SQL descartaría los NULL.
+    const rows = await db
+      .select({
+        eventId: events.id,
+        eventName: events.name,
+        eventDate: events.date,
+        barId: bars.id,
+        barName: bars.name,
+        barIsDefault: bars.isDefault,
+      })
+      .from(bars)
+      .innerJoin(events, eq(bars.eventId, events.id))
+      .where(
+        and(
+          eq(bars.tenantId, tenantId),
+          eq(events.tenantId, tenantId),
+          or(eq(bars.isActive, true), isNull(bars.isActive)),
+          ne(events.status, "closed"),
+          ne(events.operationMode, "TICKETS_ONLY")
+        )
+      )
+      .orderBy(desc(events.date), asc(bars.name))
+    const grouped = new Map<
+      string,
+      { id: string; name: string; date: Date; bars: { id: string; name: string; isDefault: boolean }[] }
+    >()
+    for (const r of rows) {
+      const bar = { id: r.barId, name: r.barName, isDefault: r.barIsDefault }
+      const ev = grouped.get(r.eventId)
+      if (ev) {
+        ev.bars.push(bar)
+      } else {
+        grouped.set(r.eventId, {
+          id: r.eventId,
+          name: r.eventName,
+          date: r.eventDate,
+          bars: [bar],
+        })
+      }
+    }
+    // Sin barras activas no hay nada que elegir: el evento no aparece.
+    return c.json({ events: [...grouped.values()] })
   })
   .post("/device-links/:code/approve", authMiddleware, async (c) => {
     const db = drizzle(pool)
@@ -969,6 +1066,51 @@ export const staffRoute = new Hono()
     if (link.expiresAt.getTime() < Date.now()) {
       return c.json({ error: "El código venció. Generá uno nuevo en la computadora." }, 410)
     }
+    // Cuerpo tolerante: los clientes previos no mandan nada y aprueban igual (equivale a "no opinó").
+    const parsed = approveDeviceLinkSchema.safeParse(await c.req.json().catch(() => ({})))
+    if (!parsed.success) {
+      return c.json({ error: "Datos inválidos" }, 400)
+    }
+    const tenantId = ctx.staff.tenantId ?? null
+    const assignment = parsed.data.assignment
+    // Fijar la barra es potestad de ADMIN/MANAGER sobre un vínculo de POS de su propia productora.
+    // Cualquier otro (bartender, seguridad, una cuenta sin productora) aprueba exactamente como
+    // antes: ignora el campo sin pisar la fijación que la computadora ya tenía.
+    const canAssign =
+      link.requestedAccess === "pos" &&
+      (ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER") &&
+      !!tenantId
+    const decides = canAssign && assignment !== undefined
+    let assignedBarId: string | null = null
+    if (decides && assignment && tenantId) {
+      // Mismo patrón que POST /pos-sessions: el evento y la barra se resuelven por id Y tenant, y
+      // el evento tiene que seguir operando consumiciones. El teléfono acaba de leer esta lista del
+      // mismo backend, así que un fallo no se silencia: fijar el puesto equivocado es peor.
+      const [ev] = await db
+        .select()
+        .from(events)
+        .where(and(eq(events.id, assignment.eventId), eq(events.tenantId, tenantId)))
+        .limit(1)
+      if (!ev || !eventSupportsConsumptions(ev.operationMode ?? "FULL_OPERATION")) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      const [bar] = await db
+        .select({ id: bars.id })
+        .from(bars)
+        .where(
+          and(
+            eq(bars.id, assignment.barId),
+            eq(bars.eventId, assignment.eventId),
+            eq(bars.tenantId, tenantId),
+            or(eq(bars.isActive, true), isNull(bars.isActive))
+          )
+        )
+        .limit(1)
+      if (!bar) {
+        return c.json({ error: "Puesto no encontrado" }, 404)
+      }
+      assignedBarId = bar.id
+    }
     // La sesión que se entrega es la de quien aprueba, con su rol y su tenant: vincular un equipo
     // no agrega permisos ni permite prestar otra cuenta. Por eso alcanza con estar autenticado;
     // el rol se sigue validando al operar, como en cualquier login.
@@ -980,6 +1122,7 @@ export const staffRoute = new Hono()
         expiresAt: new Date(
           Math.max(link.expiresAt.getTime(), Date.now() + DEVICE_LINK_CLAIM_GRACE_MS)
         ),
+        ...(decides ? { assignedBarId, assignmentDecided: true } : {}),
       })
       .where(eq(staffDeviceLinks.id, link.id))
     return c.json({ ok: true })
@@ -1009,6 +1152,36 @@ export const staffRoute = new Hono()
     if (!row || !row.isActive) {
       return c.json({ error: "La cuenta de este acceso ya no está disponible" }, 410)
     }
+    // Barra que quien aprobó fijó a esta computadora. Se resuelve contra el tenant de ESA cuenta
+    // (segunda barrera: un `assigned_bar_id` tocado a mano no puede sacar por acá una barra de otra
+    // productora). Si la barra o su evento ya no existen, va null con `assignmentDecided: true`,
+    // que es la señal para que la computadora libere su fijación local.
+    let assignment: {
+      eventId: string
+      eventName: string
+      barId: string
+      barName: string
+    } | null = null
+    if (link.assignmentDecided && link.assignedBarId && row.tenantId) {
+      const [bar] = await db
+        .select({
+          eventId: events.id,
+          eventName: events.name,
+          barId: bars.id,
+          barName: bars.name,
+        })
+        .from(bars)
+        .innerJoin(events, eq(bars.eventId, events.id))
+        .where(
+          and(
+            eq(bars.id, link.assignedBarId),
+            eq(bars.tenantId, row.tenantId),
+            eq(events.tenantId, row.tenantId)
+          )
+        )
+        .limit(1)
+      assignment = bar ?? null
+    }
     await db
       .update(staffDeviceLinks)
       .set({ claimedAt: new Date() })
@@ -1018,6 +1191,8 @@ export const staffRoute = new Hono()
       status: "approved" as const,
       token: jwt,
       staff: await staffPayloadForClient(db, row),
+      assignment,
+      assignmentDecided: link.assignmentDecided === true,
     })
   })
   // ---------------------------------------------------------------------------

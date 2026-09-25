@@ -92,11 +92,22 @@ function requireTenantId(c: AuthenticatedContext): string | null {
   return id
 }
 
+/** Slug de la URL pública del evento (`crow.ar/{slug}`). Único global en `events`. */
+const eventSlugSchema = z
+  .string()
+  .min(2)
+  .max(100)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Solo minúsculas, números y guiones")
+
+/** El slug ocupado se responde 409: el índice único rompería la creación con un 500. */
+const SLUG_TAKEN_ERROR = "Esa URL ya está en uso. Probá con otra."
+
 const createEventSchema = z.object({
   name: z.string().min(1).max(255),
   date: z.string().min(1),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
+  slug: eventSlugSchema.optional(),
   operationMode: z
     .enum(["TICKETS_ONLY", "TICKETS_AND_CONSUMPTIONS", "FULL_OPERATION"])
     .optional()
@@ -111,6 +122,7 @@ const duplicateEventSchema = z.object({
   date: z.string().min(1).optional(),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
+  slug: eventSlugSchema.optional(),
   operationMode: z
     .enum(["TICKETS_ONLY", "TICKETS_AND_CONSUMPTIONS", "FULL_OPERATION"])
     .optional(),
@@ -121,16 +133,7 @@ const patchEventSchema = z
   .object({
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
-    slug: z
-      .union([
-        z
-          .string()
-          .min(2)
-          .max(100)
-          .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Solo minúsculas, números y guiones"),
-        z.null(),
-      ])
-      .optional(),
+    slug: z.union([eventSlugSchema, z.null()]).optional(),
     designType: z.enum(["GLASS", "MINIMAL"]).optional(),
     // Tarea 1.3 — Reingreso: bool del evento; la UI de puerta (3.2) lo edita desde el panel.
     allowReentry: z.boolean().optional(),
@@ -1151,59 +1154,6 @@ async function requireBarForEventTenant(
   return row ?? null
 }
 
-/**
- * Devuelve la barra implícita del evento (la que "vende todo" por defecto),
- * materializándola on-demand si hace falta. Encarna la "barra implícita" de la
- * spec §4.3: el productor nunca la crea; existe sola. Reglas:
- *  - si ya hay una barra con isDefault=true, la devuelve;
- *  - si hay barras pero ninguna default (datos viejos), promueve la más vieja;
- *  - si el evento no tiene barras, crea "Barra general" (isDefault=true).
- * No la llama ningún read por sí solo (para no cambiar el comportamiento del POS,
- * que sigue operando a nivel evento con barId=null); se invoca en acciones
- * deliberadas como "Dividir en puestos". Exportada para reusar en Fase 3.2.
- */
-export async function ensureDefaultBar(
-  db: ReturnType<typeof drizzle>,
-  tenantId: string,
-  eventId: string
-): Promise<typeof bars.$inferSelect> {
-  const existing = await db
-    .select()
-    .from(bars)
-    .where(and(eq(bars.eventId, eventId), eq(bars.tenantId, tenantId)))
-    .orderBy(desc(bars.isDefault), asc(bars.createdAt), asc(bars.id))
-
-  const current = existing[0]
-  if (current) {
-    if (!current.isDefault) {
-      // Datos viejos sin default: promuevo la más vieja.
-      await db
-        .update(bars)
-        .set({ isDefault: true })
-        .where(and(eq(bars.id, current.id), eq(bars.tenantId, tenantId)))
-      return { ...current, isDefault: true }
-    }
-    return current
-  }
-
-  const id = uuidv4()
-  await db.insert(bars).values({
-    id,
-    eventId,
-    tenantId,
-    name: "Barra general",
-    isDefault: true,
-    isActive: true,
-    createdAt: new Date(),
-  })
-  const [row] = await db
-    .select()
-    .from(bars)
-    .where(and(eq(bars.id, id), eq(bars.tenantId, tenantId)))
-    .limit(1)
-  return row!
-}
-
 const EMPTY_BAR_STATS = {
   staffList: [] as string[],
   productList: [] as string[],
@@ -1403,6 +1353,16 @@ export const eventsRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
     const id = uuidv4()
+    if (body.slug !== undefined) {
+      const [taken] = await db
+        .select({ id: events.id })
+        .from(events)
+        .where(eq(events.slug, body.slug))
+        .limit(1)
+      if (taken) {
+        return c.json({ error: SLUG_TAKEN_ERROR }, 409)
+      }
+    }
     await db.insert(events).values({
       id,
       tenantId,
@@ -1410,6 +1370,7 @@ export const eventsRoute = new Hono()
       date: new Date(body.date),
       venue: body.venue ?? null,
       location: body.location ?? null,
+      slug: body.slug ?? null,
       operationMode: body.operationMode,
       status: "draft",
       createdAt: new Date(),
@@ -1496,7 +1457,7 @@ export const eventsRoute = new Hono()
   // sus precios/isActive, barras (default + puestos) con su menú (bar_products), y el equipo
   // (event_staff, con su puesto). NO clona los HECHOS del evento: ventas, entradas emitidas,
   // cortesías canjeadas, stock (event/bar inventory), compras ni gastos. El evento nuevo nace
-  // 'draft', sin slug (es único), sin fechas de apertura/cierre.
+  // 'draft', sin slug propio (el del origen es su link y no se hereda), sin fechas de apertura/cierre.
   .post("/:id/duplicate", zValidator("json", duplicateEventSchema), async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -1558,6 +1519,18 @@ export const eventsRoute = new Hono()
       body.operationMode ?? source.operationMode ?? "FULL_OPERATION"
     const supportsConsumptions = newOperationMode !== "TICKETS_ONLY"
 
+    // El slug del origen no se hereda: sería el mismo link. Si se elige uno nuevo, tiene que estar libre.
+    if (body.slug !== undefined) {
+      const [taken] = await db
+        .select({ id: events.id })
+        .from(events)
+        .where(eq(events.slug, body.slug))
+        .limit(1)
+      if (taken) {
+        return c.json({ error: SLUG_TAKEN_ERROR }, 409)
+      }
+    }
+
     // Mapas id origen → id nuevo para remapear las FKs entre tablas.
     const typeIdMap = new Map<string, string>()
     const barIdMap = new Map<string, string>()
@@ -1570,6 +1543,7 @@ export const eventsRoute = new Hono()
         date: newDate,
         venue: newVenue,
         location: newLocation,
+        slug: body.slug ?? null,
         operationMode: newOperationMode,
         status: "draft",
         designType: source.designType,
@@ -3391,10 +3365,22 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
-    // "Dividir en puestos": el puesto nuevo hereda del default y jamás nace
-    // vacío. Materializo primero la barra implícita, luego creo el puesto
-    // copiando su menú (los barProducts activos del default).
-    const defaultBar = await ensureDefaultBar(db, tenantId, eventId)
+    // Herencia de menú: si el evento ya tiene una barra general (`isDefault`, la
+    // implícita que materializaba el flujo viejo de "Dividir en puestos"), el
+    // puesto nuevo copia su menú y no nace vacío. Si el evento todavía no tiene
+    // ninguna barra NO se materializa una sola: la que crea el productor es la
+    // única que aparece en la grilla.
+    const [defaultBar] = await db
+      .select({ id: bars.id })
+      .from(bars)
+      .where(
+        and(
+          eq(bars.eventId, eventId),
+          eq(bars.tenantId, tenantId),
+          eq(bars.isDefault, true)
+        )
+      )
+      .limit(1)
 
     const id = uuidv4()
     await db.insert(bars).values({
@@ -3410,18 +3396,20 @@ export const eventsRoute = new Hono()
     // Hereda el menú del default: copia sus overrides de barProducts, así el
     // puesto jamás nace vacío. El menú real (con nombres) se ve en el próximo
     // GET /:id/bars; acá devuelvo stats vacías como hacía antes.
-    const menu = await db
-      .select({
-        productId: barProducts.productId,
-        isActive: barProducts.isActive,
-      })
-      .from(barProducts)
-      .where(
-        and(
-          eq(barProducts.barId, defaultBar.id),
-          eq(barProducts.tenantId, tenantId)
-        )
-      )
+    const menu = !defaultBar
+      ? []
+      : await db
+          .select({
+            productId: barProducts.productId,
+            isActive: barProducts.isActive,
+          })
+          .from(barProducts)
+          .where(
+            and(
+              eq(barProducts.barId, defaultBar.id),
+              eq(barProducts.tenantId, tenantId)
+            )
+          )
     if (menu.length > 0) {
       await db.insert(barProducts).values(
         menu.map((m) => ({
