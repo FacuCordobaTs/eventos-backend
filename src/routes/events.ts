@@ -665,11 +665,16 @@ type ClosingData = {
  * `sales.promoter_id` (completadas, valuadas por líneas al precio de venta). Entran TODOS los
  * promotores del tenant: los que no vendieron en este evento figuran en cero (el soft delete
  * de 9.1 conserva a los inactivos con su historial). Ordenados por total, desempate por nombre.
+ *
+ * `ownerStaffId` acota la cartera: el promotor general sólo ve los promotores que él dio de alta
+ * (`promoters.owner_staff_id`). Los agregados de entradas y barra se resuelven por promotor y
+ * después se cruzan con esa lista, así que filtrar la lista alcanza para filtrar todo.
  */
 async function computePromoterSales(
   db: ReturnType<typeof drizzle>,
   eventId: string,
-  tenantId: string
+  tenantId: string,
+  ownerStaffId?: string
 ): Promise<PromoterSalesRow[]> {
   const [ticketRows, barRows, promoterRows] = await Promise.all([
     db
@@ -715,6 +720,7 @@ async function computePromoterSales(
         name: promoters.name,
         phone: promoters.phone,
         isActive: promoters.isActive,
+        ownerStaffId: promoters.ownerStaffId,
       })
       .from(promoters)
       .where(eq(promoters.tenantId, tenantId)),
@@ -724,6 +730,9 @@ async function computePromoterSales(
   const barByPromoter = new Map(barRows.map((r) => [r.promoterId, r]))
 
   return promoterRows
+    // La cartera se acota acá y no en el `where` de arriba porque la lista es corta (los
+    // promotores de una productora) y así el filtro no toca el tipo de la consulta.
+    .filter((p) => ownerStaffId === undefined || p.ownerStaffId === ownerStaffId)
     .map((p) => {
       const t = ticketByPromoter.get(p.id)
       const b = barByPromoter.get(p.id)
@@ -2490,9 +2499,18 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
+    // El promotor general lee esta tabla como su tablero: sólo sus propios promotores, y sólo en
+    // los eventos donde está asignado. El resto de los roles sigue viendo la productora entera.
+    const ownerStaffId = isGeneralPromoter(ctx) ? ctx.staff.id : undefined
+    if (ownerStaffId !== undefined) {
+      if (!(await isAssignedToEvent(db, eventId, tenantId, ctx.staff.id))) {
+        return c.json({ error: "No estás asignado a este evento." }, 403)
+      }
+    }
+
     // Tarea 9.2 — Reporte por promotor (visión §2.8). Lógica compartida con el cierre (10.3):
     // `computePromoterSales` (mismo shape, congelado en `closingReport.byPromoter`).
-    const rows = await computePromoterSales(db, eventId, tenantId)
+    const rows = await computePromoterSales(db, eventId, tenantId, ownerStaffId)
 
     return c.json({ promoters: rows })
   })
