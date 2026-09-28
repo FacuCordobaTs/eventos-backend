@@ -45,7 +45,12 @@ export const staff = mysqlTable(
     name: varchar('name', { length: 255 }).notNull(),
     email: varchar('email', { length: 255 }).notNull(),
     passwordHash: varchar('password_hash', { length: 255 }).notNull(),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER']).notNull(),
+    /**
+     * `GENERAL_PROMOTER` (promotor general) es un coordinador de promotores: entra por su link de
+     * invitación, ve sólo los eventos a los que fue asignado y, dentro de ellos, administra
+     * únicamente los promotores que él mismo dio de alta (`promoters.owner_staff_id`).
+     */
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
@@ -75,12 +80,20 @@ export const promoters = mysqlTable(
     phone: varchar('phone', { length: 32 }),
     /** Cuenta operativa del promotor. Los registros anteriores a este rol pueden no tenerla. */
     staffId: varchar('staff_id', { length: 36 }).references(() => staff.id),
+    /**
+     * Promotor general (staff con rol `GENERAL_PROMOTER`) que dio de alta a este promotor.
+     * Null = el promotor es de la productora (lo creó un admin) y no pertenece a ningún
+     * promotor general. Es lo que acota la vista de cada promotor general a sus propios
+     * promotores: nadie ve ni gestiona los de otro.
+     */
+    ownerStaffId: varchar('owner_staff_id', { length: 36 }).references(() => staff.id),
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({
     tenantIdIdx: index('promoters_tenant_id_idx').on(table.tenantId),
     staffIdUnique: uniqueIndex('promoters_staff_id_unique').on(table.staffId),
+    ownerStaffIdIdx: index('promoters_owner_staff_id_idx').on(table.ownerStaffId),
   })
 );
 
@@ -1054,7 +1067,7 @@ export const staffInvitations = mysqlTable(
   {
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER']).notNull(),
     // Datos del destinatario: permiten identificar la invitación y enviarla por WhatsApp.
     inviteeName: varchar('invitee_name', { length: 255 }),
     inviteePhone: varchar('invitee_phone', { length: 32 }),

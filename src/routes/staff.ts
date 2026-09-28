@@ -36,7 +36,14 @@ function genToken(): string {
   return randomBytes(24).toString("hex")
 }
 
-const roleEnum = z.enum(["ADMIN", "MANAGER", "BARTENDER", "SECURITY", "PROMOTER"])
+const roleEnum = z.enum([
+  "ADMIN",
+  "MANAGER",
+  "BARTENDER",
+  "SECURITY",
+  "PROMOTER",
+  "GENERAL_PROMOTER",
+])
 const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos")
 
 const createInvitationSchema = z.object({
@@ -185,6 +192,21 @@ const adminOnly: MiddlewareHandler = async (c, next) => {
 }
 
 /**
+ * Promotor general: la única cuenta no-admin que administra staff, y sólo del tipo promotor.
+ * El middleware abre la puerta; cada endpoint acota además a SUS promotores (`owner_staff_id`).
+ */
+const adminOrGeneralPromoter: MiddlewareHandler = async (c, next) => {
+  const ctx = c as AuthenticatedContext
+  if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "GENERAL_PROMOTER") {
+    return c.json(
+      { error: "Solo administradores y promotores generales pueden realizar esta acción" },
+      403
+    )
+  }
+  await next()
+}
+
+/**
  * ADMIN o MANAGER: quien puede fijar la barra de una computadora desde el QR, y ver la lista de
  * barras para elegir. El `adminOnly` de las sesiones de puesto queda como estaba.
  */
@@ -224,10 +246,20 @@ async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffR
   return { ...base, tenantName: t?.name ?? null }
 }
 
-/** Mantiene la identidad comercial del promotor ligada a su cuenta de staff. */
+/**
+ * Mantiene la identidad comercial del promotor ligada a su cuenta de staff.
+ * `ownerStaffId` (promotor general que lo dio de alta) se fija sólo al crear: sobrevive a las
+ * reactivaciones, porque la pertenencia no cambia con el nombre ni con el estado de la cuenta.
+ */
 async function ensurePromoterAccount(
   db: any,
-  input: { staffId: string; tenantId: string; name: string; isActive?: boolean }
+  input: {
+    staffId: string
+    tenantId: string
+    name: string
+    isActive?: boolean
+    ownerStaffId?: string | null
+  }
 ) {
   const [existing] = await db
     .select({ id: promoters.id })
@@ -249,10 +281,53 @@ async function ensurePromoterAccount(
     tenantId: input.tenantId,
     staffId: input.staffId,
     name: input.name,
+    ownerStaffId: input.ownerStaffId ?? null,
     isActive: input.isActive ?? true,
     createdAt: new Date(),
   })
   return id
+}
+
+/**
+ * ¿Esa cuenta es un promotor de ESTE promotor general en esta productora? Es la barrera que
+ * mantiene aislados a los promotores generales entre sí: sin ella, uno podría tocar la cuenta que
+ * le pase por id (de otro promotor general, de la productora o de otro tenant).
+ */
+async function ownedPromoterOf(
+  db: any,
+  input: { promoterStaffId: string; tenantId: string; ownerStaffId: string }
+): Promise<{ id: string } | null> {
+  const [row] = await db
+    .select({ id: promoters.id })
+    .from(promoters)
+    .innerJoin(staff, eq(staff.id, promoters.staffId))
+    .where(
+      and(
+        eq(promoters.staffId, input.promoterStaffId),
+        eq(promoters.tenantId, input.tenantId),
+        eq(promoters.ownerStaffId, input.ownerStaffId),
+        eq(staff.role, "PROMOTER")
+      )
+    )
+    .limit(1)
+  return row ?? null
+}
+
+/**
+ * Cuenta del promotor general que creó la invitación, si la creó uno. Lo que un promotor general
+ * invita queda a su nombre; una invitación creada por un admin no pertenece a nadie.
+ */
+async function invitationOwnerStaffId(
+  db: any,
+  invitation: typeof staffInvitations.$inferSelect
+): Promise<string | null> {
+  if (!invitation.createdBy) return null
+  const [creator] = await db
+    .select({ id: staff.id, role: staff.role })
+    .from(staff)
+    .where(eq(staff.id, invitation.createdBy))
+    .limit(1)
+  return creator?.role === "GENERAL_PROMOTER" ? creator.id : null
 }
 
 function sanitizeInvitation(row: typeof staffInvitations.$inferSelect) {
@@ -389,7 +464,12 @@ export const staffRoute = new Hono()
 
       const imported = existingElsewhere.length > 0
 
-      if (body.role === "PROMOTER" && !currentTenantId) {
+      // Ambos roles de promotor viven dentro de una productora: sin tenant no hay eventos que
+      // asignarles ni promotores que coordinar.
+      if (
+        (body.role === "PROMOTER" || body.role === "GENERAL_PROMOTER") &&
+        !currentTenantId
+      ) {
         return c.json({ error: "Un promotor debe pertenecer a una productora." }, 400)
       }
 
@@ -472,7 +552,7 @@ export const staffRoute = new Hono()
       return c.json({ staff: sanitizeStaff(updated) })
     }
   )
-  .delete("/team/:id", authMiddleware, adminOnly, async (c) => {
+  .delete("/team/:id", authMiddleware, adminOrGeneralPromoter, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
     const id = c.req.param("id")
@@ -488,6 +568,18 @@ export const staffRoute = new Hono()
     if (!tenantMatches(ctx.staff.tenantId, target.tenantId)) {
       return c.json({ error: "Sin permiso" }, 403)
     }
+    // El promotor general elimina sólo a sus propios promotores; la productora y los demás
+    // promotores generales le quedan fuera de alcance.
+    if (
+      ctx.staff.role === "GENERAL_PROMOTER" &&
+      !(await ownedPromoterOf(db, {
+        promoterStaffId: id,
+        tenantId: target.tenantId ?? "",
+        ownerStaffId: ctx.staff.id,
+      }))
+    ) {
+      return c.json({ error: "Ese promotor no es tuyo" }, 403)
+    }
     if (!target.isActive) {
       return c.json({ error: "La cuenta ya está desactivada" }, 400)
     }
@@ -498,7 +590,7 @@ export const staffRoute = new Hono()
     }
     return c.json({ ok: true })
   })
-  .post("/team/:id/reactivate", authMiddleware, adminOnly, async (c) => {
+  .post("/team/:id/reactivate", authMiddleware, adminOrGeneralPromoter, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
     const id = c.req.param("id")
@@ -509,6 +601,16 @@ export const staffRoute = new Hono()
     }
     if (!tenantMatches(ctx.staff.tenantId, target.tenantId)) {
       return c.json({ error: "Sin permiso" }, 403)
+    }
+    if (
+      ctx.staff.role === "GENERAL_PROMOTER" &&
+      !(await ownedPromoterOf(db, {
+        promoterStaffId: id,
+        tenantId: target.tenantId ?? "",
+        ownerStaffId: ctx.staff.id,
+      }))
+    ) {
+      return c.json({ error: "Ese promotor no es tuyo" }, 403)
     }
     if (target.isActive) {
       return c.json({ error: "La cuenta ya está activa" }, 400)
@@ -527,7 +629,7 @@ export const staffRoute = new Hono()
   .post(
     "/invitations",
     authMiddleware,
-    adminOnly,
+    adminOrGeneralPromoter,
     zValidator("json", createInvitationSchema),
     async (c) => {
       const db = drizzle(pool)
@@ -537,6 +639,12 @@ export const staffRoute = new Hono()
         return c.json({ error: "Tu cuenta no tiene productora asignada." }, 400)
       }
       const body = c.req.valid("json")
+      // El promotor general es un rol acotado: sólo da de alta promotores, y quedan a su nombre.
+      const isGeneralPromoter = ctx.staff.role === "GENERAL_PROMOTER"
+      if (isGeneralPromoter && body.role !== "PROMOTER") {
+        return c.json({ error: "Un promotor general sólo puede invitar promotores." }, 403)
+      }
+      const ownerStaffId = isGeneralPromoter ? ctx.staff.id : null
       const id = uuidv4()
       const staffId = uuidv4()
       const token = genToken()
@@ -551,6 +659,23 @@ export const staffRoute = new Hono()
           .limit(1)
         if (!event) {
           return c.json({ error: "Evento no encontrado" }, 404)
+        }
+        // Invita desde el evento, así que sólo puede sumar gente a los eventos donde él está.
+        if (isGeneralPromoter) {
+          const [assignment] = await db
+            .select({ id: eventStaff.id })
+            .from(eventStaff)
+            .where(
+              and(
+                eq(eventStaff.eventId, body.eventId),
+                eq(eventStaff.staffId, ctx.staff.id),
+                eq(eventStaff.tenantId, tenantId)
+              )
+            )
+            .limit(1)
+          if (!assignment) {
+            return c.json({ error: "No estás asignado a este evento." }, 403)
+          }
         }
       }
 
@@ -569,7 +694,7 @@ export const staffRoute = new Hono()
         createdAt: new Date(),
       })
       if (body.role === "PROMOTER") {
-        await ensurePromoterAccount(db, { staffId, tenantId, name: body.name })
+        await ensurePromoterAccount(db, { staffId, tenantId, name: body.name, ownerStaffId })
       }
       await db.insert(staffInvitations).values({
         id,
@@ -600,26 +725,31 @@ export const staffRoute = new Hono()
       return c.json({ invitation: sanitizeInvitation(row) }, 201)
     }
   )
-  .get("/invitations", authMiddleware, adminOnly, async (c) => {
+  .get("/invitations", authMiddleware, adminOrGeneralPromoter, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
     const tenantId = ctx.staff.tenantId ?? null
     if (!tenantId) {
       return c.json({ invitations: [] })
     }
+    const isGeneralPromoter = ctx.staff.role === "GENERAL_PROMOTER"
     const rows = await db
       .select()
       .from(staffInvitations)
       .where(
         and(
           eq(staffInvitations.tenantId, tenantId),
+          // El promotor general ve las invitaciones que él creó: son sus promotores.
+          ...(isGeneralPromoter
+            ? [eq(staffInvitations.createdBy, ctx.staff.id)]
+            : []),
           inArray(staffInvitations.status, ["PENDING", "ACCEPTED"])
         )
       )
       .orderBy(desc(staffInvitations.createdAt))
     return c.json({ invitations: rows.map(sanitizeInvitation) })
   })
-  .post("/invitations/:id/revoke", authMiddleware, adminOnly, async (c) => {
+  .post("/invitations/:id/revoke", authMiddleware, adminOrGeneralPromoter, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
     const tenantId = ctx.staff.tenantId ?? null
@@ -630,6 +760,9 @@ export const staffRoute = new Hono()
       .where(eq(staffInvitations.id, id))
       .limit(1)
     if (!inv || !tenantMatches(tenantId, inv.tenantId)) {
+      return c.json({ error: "Invitación no encontrada" }, 404)
+    }
+    if (ctx.staff.role === "GENERAL_PROMOTER" && inv.createdBy !== ctx.staff.id) {
       return c.json({ error: "Invitación no encontrada" }, 404)
     }
     if (inv.status === "REVOKED") {
@@ -772,6 +905,8 @@ export const staffRoute = new Hono()
             staffId,
             tenantId: inv.tenantId,
             name: inv.inviteeName ?? "Nuevo promotor",
+            // Si la creó un promotor general, el promotor queda a su nombre.
+            ownerStaffId: await invitationOwnerStaffId(db, inv),
           })
         }
         await db

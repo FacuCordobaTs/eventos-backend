@@ -92,6 +92,65 @@ function requireTenantId(c: AuthenticatedContext): string | null {
   return id
 }
 
+/**
+ * Promotor general: ve y administra sólo eventos a los que fue asignado y, dentro de cada uno,
+ * sólo los promotores que él mismo dio de alta. Es una superficie reducida — no configura el
+ * evento, no opera caja ni puerta—, así que todo lo que toca pasa por estas dos comprobaciones.
+ */
+function isGeneralPromoter(ctx: AuthenticatedContext): boolean {
+  return ctx.staff.role === "GENERAL_PROMOTER"
+}
+
+/**
+ * ¿El evento está entre los que le fueron asignados? Alcance de visibilidad del promotor general.
+ * `db: any` es el mismo recurso que usa `ensurePromoterAccount` en `routes/staff.ts`: el genérico de
+ * `drizzle(pool)` no acepta el schema completo en estas funciones sueltas.
+ */
+async function isAssignedToEvent(
+  db: any,
+  eventId: string,
+  tenantId: string,
+  staffId: string
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: eventStaff.id })
+    .from(eventStaff)
+    .where(
+      and(
+        eq(eventStaff.eventId, eventId),
+        eq(eventStaff.staffId, staffId),
+        eq(eventStaff.tenantId, tenantId)
+      )
+    )
+    .limit(1)
+  return row != null
+}
+
+/**
+ * ¿Esa cuenta es un promotor propio de este promotor general? La pertenencia vive en
+ * `promoters.owner_staff_id`; sin ella, un promotor general podría operar sobre cualquier cuenta
+ * del tenant con sólo conocer su id.
+ */
+async function ownedPromoterOf(
+  db: any,
+  input: { promoterStaffId: string; tenantId: string; ownerStaffId: string }
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: promoters.id })
+    .from(promoters)
+    .innerJoin(staff, eq(staff.id, promoters.staffId))
+    .where(
+      and(
+        eq(promoters.staffId, input.promoterStaffId),
+        eq(promoters.tenantId, input.tenantId),
+        eq(promoters.ownerStaffId, input.ownerStaffId),
+        eq(staff.role, "PROMOTER")
+      )
+    )
+    .limit(1)
+  return row != null
+}
+
 /** Slug de la URL pública del evento (`crow.ar/{slug}`). Único global en `events`. */
 const eventSlugSchema = z
   .string()
@@ -1319,8 +1378,10 @@ export const eventsRoute = new Hono()
       )
     }
     const db = drizzle(pool)
+    // Mismo alcance para los roles acotados a una asignación: seguridad (opera la puerta) y
+    // promotor general (coordina sus promotores en ese evento). El resto ve la productora entera.
     const eventVisibility =
-      ctx.staff.role === "SECURITY"
+      ctx.staff.role === "SECURITY" || isGeneralPromoter(ctx)
         ? and(
             eq(events.tenantId, tenantId),
             exists(
@@ -3045,6 +3106,55 @@ export const eventsRoute = new Hono()
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
+    // El promotor general no ve el equipo de la productora: sólo sus propios promotores, con su
+    // estado de asignación a este evento.
+    if (isGeneralPromoter(ctx)) {
+      if (!(await isAssignedToEvent(db, eventId, tenantId, ctx.staff.id))) {
+        return c.json({ error: "No estás asignado a este evento." }, 403)
+      }
+      const ownRows = await db
+        .select({
+          id: staff.id,
+          name: staff.name,
+          email: staff.email,
+          role: staff.role,
+          isActive: staff.isActive,
+          assignmentId: eventStaff.id,
+          barId: eventStaff.barId,
+          promoterId: promoters.id,
+        })
+        .from(promoters)
+        .innerJoin(staff, eq(staff.id, promoters.staffId))
+        .leftJoin(
+          eventStaff,
+          and(
+            eq(eventStaff.staffId, staff.id),
+            eq(eventStaff.eventId, eventId),
+            eq(eventStaff.tenantId, tenantId)
+          )
+        )
+        .where(
+          and(
+            eq(promoters.tenantId, tenantId),
+            eq(promoters.ownerStaffId, ctx.staff.id),
+            eq(staff.isActive, true),
+            eq(staff.role, "PROMOTER")
+          )
+        )
+        .orderBy(asc(staff.name))
+      return c.json({
+        staff: ownRows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          email: r.email,
+          role: r.role,
+          isAssigned: r.assignmentId != null,
+          barId: r.barId ?? null,
+          promoterId: r.promoterId ?? null,
+        })),
+      })
+    }
+
     const rows = await db
       .select({
         id: staff.id,
@@ -3104,6 +3214,26 @@ export const eventsRoute = new Hono()
       const ev = await requireEventForTenant(db, eventId, tenantId)
       if (!ev) {
         return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      // El promotor general sólo mueve a sus propios promotores, y sólo en eventos donde él está.
+      // Nunca elige barra: la asignación de puesto es del admin.
+      if (isGeneralPromoter(ctx)) {
+        if (body.barId !== undefined && body.barId !== null) {
+          return c.json({ error: "Sin permiso para asignar puestos." }, 403)
+        }
+        if (!(await isAssignedToEvent(db, eventId, tenantId, ctx.staff.id))) {
+          return c.json({ error: "No estás asignado a este evento." }, 403)
+        }
+        if (
+          !(await ownedPromoterOf(db, {
+            promoterStaffId: body.staffId,
+            tenantId,
+            ownerStaffId: ctx.staff.id,
+          }))
+        ) {
+          return c.json({ error: "Ese promotor no es tuyo" }, 403)
+        }
       }
 
       if (!body.isAssigned) {
@@ -5192,6 +5322,11 @@ export const eventsRoute = new Hono()
       .limit(1)
     if (!row) {
       return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    // El promotor general abre sólo los eventos de su lista; el listado ya viene acotado por
+    // asignación, así que un id suelto no puede ampliarle el alcance.
+    if (isGeneralPromoter(ctx) && !(await isAssignedToEvent(db, id, tenantId, ctx.staff.id))) {
+      return c.json({ error: "No estás asignado a este evento." }, 403)
     }
     return c.json({ event: sanitizeEvent(row) })
   })

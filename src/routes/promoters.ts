@@ -43,6 +43,10 @@ function requireTenantId(ctx: AuthenticatedContext): string | null {
 const promoterMatch = (id: string, tenantId: string) =>
   and(eq(promoters.id, id), eq(promoters.tenantId, tenantId))
 
+/** Mismo criterio que `promoterMatch`, pre-instanciado para la pertenencia al promotor general. */
+const promoterOwnerMatch = (ownerStaffId: string, tenantId: string) =>
+  and(eq(promoters.ownerStaffId, ownerStaffId), eq(promoters.tenantId, tenantId))
+
 // Mismo criterio que el ABM de Equipo: solo ADMIN/MANAGER escriben.
 function canManage(ctx: AuthenticatedContext): boolean {
   return ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER"
@@ -139,10 +143,16 @@ export const promotersRoute = new Hono()
     }
 
     const db = drizzle(pool)
+    // El promotor general ve únicamente su propia cartera: los promotores que él dio de alta
+    // (`owner_staff_id`). Los de la productora y los de otro promotor general quedan fuera.
     const rows = await db
       .select()
       .from(promoters)
-      .where(eq(promoters.tenantId, tenantId))
+      .where(
+        ctx.staff.role === "GENERAL_PROMOTER"
+          ? promoterOwnerMatch(ctx.staff.id, tenantId)
+          : eq(promoters.tenantId, tenantId)
+      )
       .orderBy(asc(promoters.name))
 
     return c.json({ promoters: rows.map(sanitizePromoter) })
