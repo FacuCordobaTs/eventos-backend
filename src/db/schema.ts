@@ -253,6 +253,8 @@ export const events = mysqlTable(
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     name: varchar('name', { length: 255 }).notNull(), // Ej: "Fiesta de la Primavera"
+    /** Descripción libre que se muestra en la página pública del evento. */
+    description: varchar('description', { length: 500 }),
     slug: varchar('slug', { length: 100 }).unique(), // URL-friendly: crow.ar/e/divino
     date: timestamp('date').notNull(),
     /** Nombre visible del lugar, ej. "Salón del Puerto". */

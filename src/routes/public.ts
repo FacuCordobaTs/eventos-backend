@@ -1170,6 +1170,7 @@ export const publicRoute = new Hono()
         // Tarea 2.2 — la slug para navegar "Volver" al evento desde el checkout.
         slug: ev.slug ?? null,
         name: ev.name,
+        description: ev.description ?? null,
         date: ev.date,
         venue: ev.venue ?? null,
         location: ev.location,

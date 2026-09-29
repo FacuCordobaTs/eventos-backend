@@ -163,6 +163,7 @@ const SLUG_TAKEN_ERROR = "Esa URL ya está en uso. Probá con otra."
 
 const createEventSchema = z.object({
   name: z.string().min(1).max(255),
+  description: z.string().max(500).optional(),
   date: z.string().min(1),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
@@ -178,6 +179,7 @@ const createEventSchema = z.object({
 // ("... (copia)"), fecha y lugar del origen.
 const duplicateEventSchema = z.object({
   name: z.string().min(1).max(255).optional(),
+  description: z.string().max(500).optional(),
   date: z.string().min(1).optional(),
   venue: z.string().max(255).optional(),
   location: z.string().max(255).optional(),
@@ -190,6 +192,7 @@ const duplicateEventSchema = z.object({
 /** ISO 8601 instant from client (UTC or offset); null clears the window. */
 const patchEventSchema = z
   .object({
+    description: z.union([z.string().max(500), z.null()]).optional(),
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     slug: z.union([eventSlugSchema, z.null()]).optional(),
@@ -215,6 +218,7 @@ const patchEventSchema = z
     check("ticketsAvailableFrom")
     check("consumptionsAvailableFrom")
     if (
+      data.description === undefined &&
       data.ticketsAvailableFrom === undefined &&
       data.consumptionsAvailableFrom === undefined &&
       data.slug === undefined &&
@@ -460,6 +464,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     id: row.id,
     tenantId: row.tenantId,
     name: row.name,
+    description: row.description ?? null,
     slug: row.slug ?? null,
     date: row.date,
     venue: row.venue ?? null,
@@ -1437,6 +1442,7 @@ export const eventsRoute = new Hono()
       id,
       tenantId,
       name: body.name,
+      description: body.description?.trim() || null,
       date: new Date(body.date),
       venue: body.venue ?? null,
       location: body.location ?? null,
@@ -1582,6 +1588,10 @@ export const eventsRoute = new Hono()
 
     const newEventId = uuidv4()
     const newName = body.name?.trim() || `${source.name} (copia)`
+    const newDescription =
+      body.description !== undefined
+        ? body.description.trim() || null
+        : source.description ?? null
     const newDate = body.date ? new Date(body.date) : source.date
     const newVenue = body.venue ?? source.venue ?? null
     const newLocation = body.location ?? source.location ?? null
@@ -1610,6 +1620,7 @@ export const eventsRoute = new Hono()
         id: newEventId,
         tenantId,
         name: newName,
+        description: newDescription,
         date: newDate,
         venue: newVenue,
         location: newLocation,
@@ -4658,6 +4669,7 @@ export const eventsRoute = new Hono()
     }
 
     const setPayload: {
+      description?: string | null
       ticketsAvailableFrom?: Date | null
       consumptionsAvailableFrom?: Date | null
       slug?: string | null
@@ -4665,6 +4677,10 @@ export const eventsRoute = new Hono()
       allowReentry?: boolean
       ageRestriction?: number | null
     } = {}
+    if (body.description !== undefined) {
+      setPayload.description =
+        body.description === null ? null : body.description.trim() || null
+    }
     if (body.ticketsAvailableFrom !== undefined) {
       setPayload.ticketsAvailableFrom =
         body.ticketsAvailableFrom === null
