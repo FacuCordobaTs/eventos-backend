@@ -7,6 +7,7 @@ import { pool } from "../db"
 import { events, eventStaff, promoters, ticketTypes, tickets } from "../db/schema"
 import { v4 as uuidv4 } from "uuid"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { ensurePromoterAccount } from "../lib/promoter-account"
 
 // Tarea 9.1 — Promotores (visión §2.8): la productora da de alta a las personas que venden
 // entradas a comisión, y cada venta (manual de entradas o caja POS) puede atribuírseles con
@@ -62,17 +63,39 @@ function sanitizePromoter(row: typeof promoters.$inferSelect) {
   }
 }
 
+/**
+ * Identidad comercial de la cuenta que pide su espacio de ventas. La usan los dos roles que venden
+ * con link propio: `PROMOTER` y `GENERAL_PROMOTER` (que además coordina su cartera).
+ *
+ * Para el promotor general la fila nunca puede faltar: la cuenta pudo crearse antes de que este
+ * rol tuviera link propio, así que se repara en su primer acceso. Tampoco se mira `isActive`: su
+ * baja de cuenta ya la validó `authMiddleware`, y desactivar la fila desde el listado de promotores
+ * de la productora no debe dejarlo sin sus propias ventas ni sin su link.
+ */
 async function currentStaffPromoter(
   db: any,
   ctx: AuthenticatedContext,
   tenantId: string
 ) {
-  if (ctx.staff.role !== "PROMOTER") return null
-  const [row] = await db
-    .select({ id: promoters.id, name: promoters.name })
-    .from(promoters)
-    .where(and(eq(promoters.staffId, ctx.staff.id), eq(promoters.tenantId, tenantId), eq(promoters.isActive, true)))
-    .limit(1)
+  const role = ctx.staff.role
+  if (role !== "PROMOTER" && role !== "GENERAL_PROMOTER") return null
+  const isGeneral = role === "GENERAL_PROMOTER"
+
+  const where = isGeneral
+    ? and(eq(promoters.staffId, ctx.staff.id), eq(promoters.tenantId, tenantId))
+    : and(
+        eq(promoters.staffId, ctx.staff.id),
+        eq(promoters.tenantId, tenantId),
+        eq(promoters.isActive, true)
+      )
+  const findOwn = () =>
+    db.select({ id: promoters.id, name: promoters.name }).from(promoters).where(where).limit(1)
+
+  let [row] = await findOwn()
+  if (!row && isGeneral) {
+    await ensurePromoterAccount(db, { staffId: ctx.staff.id, tenantId, name: ctx.staff.name })
+    ;[row] = await findOwn()
+  }
   return row ?? null
 }
 

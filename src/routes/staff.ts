@@ -28,6 +28,7 @@ import { sanitizeStaff, type StaffRow } from "../lib/staff-dto"
 import { sendMagicLinkEmail } from "../lib/send-magic-link-email"
 import { clientIp, consumeRateLimit } from "../lib/rate-limit"
 import { isWhatsAppConfigured, sendWhatsAppTemplateMessage } from "../lib/whatsapp-service"
+import { ensurePromoterAccount } from "../lib/promoter-account"
 
 const ADMIN_URL = (process.env.ADMIN_URL ?? "https://admin.crow.ar").replace(/\/$/, "")
 
@@ -247,48 +248,6 @@ async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffR
 }
 
 /**
- * Mantiene la identidad comercial del promotor ligada a su cuenta de staff.
- * `ownerStaffId` (promotor general que lo dio de alta) se fija sólo al crear: sobrevive a las
- * reactivaciones, porque la pertenencia no cambia con el nombre ni con el estado de la cuenta.
- */
-async function ensurePromoterAccount(
-  db: any,
-  input: {
-    staffId: string
-    tenantId: string
-    name: string
-    isActive?: boolean
-    ownerStaffId?: string | null
-  }
-) {
-  const [existing] = await db
-    .select({ id: promoters.id })
-    .from(promoters)
-    .where(eq(promoters.staffId, input.staffId))
-    .limit(1)
-
-  if (existing) {
-    await db
-      .update(promoters)
-      .set({ name: input.name, ...(input.isActive !== undefined ? { isActive: input.isActive } : {}) })
-      .where(eq(promoters.id, existing.id))
-    return existing.id
-  }
-
-  const id = uuidv4()
-  await db.insert(promoters).values({
-    id,
-    tenantId: input.tenantId,
-    staffId: input.staffId,
-    name: input.name,
-    ownerStaffId: input.ownerStaffId ?? null,
-    isActive: input.isActive ?? true,
-    createdAt: new Date(),
-  })
-  return id
-}
-
-/**
  * ¿Esa cuenta es un promotor de ESTE promotor general en esta productora? Es la barrera que
  * mantiene aislados a los promotores generales entre sí: sin ella, uno podría tocar la cuenta que
  * le pase por id (de otro promotor general, de la productora o de otro tenant).
@@ -484,7 +443,12 @@ export const staffRoute = new Hono()
         isActive: true,
         createdAt: new Date(),
       })
-      if (body.role === "PROMOTER" && currentTenantId) {
+      // Los dos roles de promotor llevan fila propia en `promoters`: es su identidad comercial y
+      // de ahí sale el link de venta. El promotor general, además, es dueño de las de su cartera.
+      if (
+        (body.role === "PROMOTER" || body.role === "GENERAL_PROMOTER") &&
+        currentTenantId
+      ) {
         await ensurePromoterAccount(db, { staffId: id, tenantId: currentTenantId, name: body.name })
       }
 
@@ -534,14 +498,23 @@ export const staffRoute = new Hono()
         .where(eq(staff.id, id))
 
       const nextRole = body.role ?? target.role
-      if (nextRole === "PROMOTER" && target.tenantId) {
+      if ((nextRole === "PROMOTER" || nextRole === "GENERAL_PROMOTER") && target.tenantId) {
         await ensurePromoterAccount(db, {
           staffId: target.id,
           tenantId: target.tenantId,
           name: body.name ?? target.name,
           isActive: target.isActive !== false,
         })
-      } else if (target.role === "PROMOTER" && body.role !== undefined) {
+        // Al ascender a alguien a promotor general deja de pertenecer a quien lo había invitado:
+        // si conservara el `owner_staff_id`, sus ventas seguirían apareciendo en la cartera de su
+        // antiguo dueño, que ya no lo ve en su equipo.
+        if (body.role === "GENERAL_PROMOTER") {
+          await db
+            .update(promoters)
+            .set({ ownerStaffId: null })
+            .where(eq(promoters.staffId, target.id))
+        }
+      } else if (target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") {
         await db
           .update(promoters)
           .set({ isActive: false })
@@ -585,7 +558,7 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: false }).where(eq(staff.id, id))
-    if (target.role === "PROMOTER") {
+    if (target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") {
       await db.update(promoters).set({ isActive: false }).where(eq(promoters.staffId, id))
     }
     return c.json({ ok: true })
@@ -617,7 +590,7 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: true }).where(eq(staff.id, id))
-    if (target.role === "PROMOTER" && target.tenantId) {
+    if ((target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") && target.tenantId) {
       await ensurePromoterAccount(db, { staffId: id, tenantId: target.tenantId, name: target.name, isActive: true })
     }
     const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
@@ -693,8 +666,15 @@ export const staffRoute = new Hono()
         isActive: true,
         createdAt: new Date(),
       })
-      if (body.role === "PROMOTER") {
-        await ensurePromoterAccount(db, { staffId, tenantId, name: body.name, ownerStaffId })
+      if (body.role === "PROMOTER" || body.role === "GENERAL_PROMOTER") {
+        await ensurePromoterAccount(db, {
+          staffId,
+          tenantId,
+          name: body.name,
+          // Sólo los promotores de a pie pertenecen a alguien: el promotor general tiene su fila
+          // propia (su link), no la de un tercero.
+          ownerStaffId: body.role === "PROMOTER" ? ownerStaffId : null,
+        })
       }
       await db.insert(staffInvitations).values({
         id,
@@ -900,13 +880,14 @@ export const staffRoute = new Hono()
           isActive: true,
           createdAt: new Date(),
         })
-        if (inv.role === "PROMOTER" && inv.tenantId) {
+        if ((inv.role === "PROMOTER" || inv.role === "GENERAL_PROMOTER") && inv.tenantId) {
           await ensurePromoterAccount(db, {
             staffId,
             tenantId: inv.tenantId,
             name: inv.inviteeName ?? "Nuevo promotor",
-            // Si la creó un promotor general, el promotor queda a su nombre.
-            ownerStaffId: await invitationOwnerStaffId(db, inv),
+            // Si la creó un promotor general, el promotor queda a su nombre. Un promotor general
+            // nunca invita a otro (sólo puede invitar `PROMOTER`), así que no hay ambigüedad.
+            ownerStaffId: inv.role === "PROMOTER" ? await invitationOwnerStaffId(db, inv) : null,
           })
         }
         await db

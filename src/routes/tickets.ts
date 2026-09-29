@@ -277,9 +277,11 @@ export const ticketsRoute = new Hono()
     const db = drizzle(pool)
 
     // El promotor nunca puede acreditar la venta a otra persona ni vender en un evento ajeno:
-    // su identidad comercial se toma de su cuenta y el evento debe estar asignado en Equipo.
+    // su identidad comercial se toma de su cuenta y el evento debe estar asignado en Equipo. Vale
+    // para los dos roles que venden con link propio, incluido el promotor general (sus entradas
+    // son suyas y no las de su cartera).
     let effectivePromoterId = body.promoterId
-    if (ctx.staff.role === "PROMOTER") {
+    if (ctx.staff.role === "PROMOTER" || ctx.staff.role === "GENERAL_PROMOTER") {
       const [promoter] = await db
         .select({ id: promoters.id })
         .from(promoters)
