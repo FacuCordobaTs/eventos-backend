@@ -41,13 +41,30 @@ import {
   sendWhatsAppTemplateMessage,
 } from "../lib/whatsapp-service"
 import { eventSupportsConsumptions } from "../lib/event-operation-mode"
-import { verifyToken } from "../lib/jwt"
+import { createAccessToken, verifyToken } from "../lib/jwt"
 import {
+  CUSTOMER_SESSION_TTL,
   normalizeIdentifier,
   requestAccessCode,
   verifyAccessCode,
 } from "../lib/customer-access"
 import { clientIp, consumeRateLimit, releaseRateLimit } from "../lib/rate-limit"
+import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
+import {
+  EMPTY_TICKET_SHARES,
+  MAX_SHARE_QUANTITY,
+  cancelTicketShare,
+  claimTicketShare,
+  createTicketShare,
+  earmarkedTickets,
+  getSharePreview,
+  loadOwnerShares,
+  normalizeClaimPhone,
+  normalizeDni,
+  ownerReceiptTokens,
+  shareErrorResponse,
+  type ClaimedTicket,
+} from "../lib/ticket-shares"
 
 const customerAccessSchema = z.object({
   type: z.enum(["email", "phone", "dni"]),
@@ -71,6 +88,48 @@ const eventAccessVerifySchema = z.object({
 const ACCESS_LIMIT_PER_IP = { limit: 10, windowMs: 15 * 60 * 1000 }
 const ACCESS_LIMIT_PER_PHONE = { limit: 5, windowMs: 60 * 60 * 1000 }
 const ACCESS_COOLDOWN = { limit: 1, windowMs: 60 * 1000 }
+
+/**
+ * Compartir entradas. Reclamar es público y crea clientes, y cada canje manda un email: se acota por
+ * IP y por link. Ver la vista previa es barato pero también se limita para que no sirva de sondeo.
+ */
+const SHARE_VIEW_LIMIT_PER_IP = { limit: 120, windowMs: 15 * 60 * 1000 }
+const SHARE_CLAIM_LIMIT_PER_IP = { limit: 20, windowMs: 15 * 60 * 1000 }
+const SHARE_CLAIM_LIMIT_PER_LINK = { limit: 60, windowMs: 60 * 60 * 1000 }
+const SHARE_CREATE_LIMIT_PER_OWNER = { limit: 30, windowMs: 60 * 60 * 1000 }
+
+/** Credenciales del dueño de las entradas: las mismas dos que el resto de la cuenta del cliente. */
+const ticketShareOwnerSchema = z.object({
+  receiptToken: z.string().min(1).max(200).optional(),
+  customerToken: z.string().min(1).max(4096).optional(),
+  eventId: z.string().min(1).max(36).optional(),
+})
+
+const ticketShareCreateSchema = ticketShareOwnerSchema.extend({
+  ticketTypeId: z.string().min(1).max(36),
+  quantity: z.number().int().min(1).max(MAX_SHARE_QUANTITY),
+})
+
+/**
+ * Datos de quien reclama. Son los mismos que pide la compra (nombre, DNI, celular, email) pero con
+ * nombre y apellido por separado: quedan como ficha de cliente y con ella puede comprar consumos.
+ * Los mensajes son lo que lee el amigo, por eso van en castellano y por campo.
+ */
+const ticketShareClaimSchema = z.object({
+  firstName: z.string().trim().min(1, "Ingresá tu nombre").max(100, "El nombre es demasiado largo"),
+  lastName: z.string().trim().min(1, "Ingresá tu apellido").max(100, "El apellido es demasiado largo"),
+  dni: z
+    .string()
+    .trim()
+    .max(20, "Revisá tu DNI")
+    .refine((value) => normalizeDni(value) !== null, "Revisá tu DNI: tiene que ser de 6 a 9 números"),
+  phone: z
+    .string()
+    .trim()
+    .max(40, "Revisá tu celular")
+    .refine((value) => normalizeClaimPhone(value) !== null, "Revisá tu celular"),
+  email: z.string().trim().toLowerCase().max(255, "Revisá tu email").email("Revisá tu email"),
+})
 
 const CLIENT_URL = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(/\/$/, "")
 
@@ -201,10 +260,84 @@ async function resolveCustomerForEvent(
         )
       )
       .limit(1)
-    if (!purchase) return null
+    if (!purchase) {
+      // Quien recibió una entrada de un amigo (link de "compartir entradas") también está adentro
+      // del evento, aunque no haya comprado ni pasado por el link de acceso.
+      const [held] = await db
+        .select({ id: tickets.id })
+        .from(tickets)
+        .where(
+          and(
+            eq(tickets.customerId, customer.id),
+            eq(tickets.eventId, eventId),
+            eq(tickets.tenantId, event.tenantId),
+            ne(tickets.status, "CANCELLED")
+          )
+        )
+        .limit(1)
+      if (!held) return null
+    }
   }
 
   return { customer, tenantId: event.tenantId }
+}
+
+/** A quién pertenecen las entradas que se quieren compartir o cuyo link se quiere cancelar. */
+type TicketHolder = { customerId: string; eventId: string; tenantId: string }
+
+/**
+ * Resuelve al dueño de las entradas con cualquiera de las dos credenciales del cliente, igual que
+ * el saldo: el comprobante de una compra (`receiptToken`, ya acreditada) o la sesión de
+ * `/{slug}/acceso` (`customerToken` + `eventId`, validada contra el evento). Viajan en el body y no
+ * en la URL para que no queden en los logs de acceso.
+ */
+async function resolveTicketHolder(
+  db: MySql2Database<Record<string, never>>,
+  credentials: { receiptToken?: string; customerToken?: string; eventId?: string }
+): Promise<TicketHolder | null> {
+  if (credentials.receiptToken) {
+    const [sale] = await db
+      .select({
+        customerId: sales.customerId,
+        eventId: sales.eventId,
+        tenantId: sales.tenantId,
+        status: sales.status,
+      })
+      .from(sales)
+      .where(eq(sales.receiptToken, credentials.receiptToken))
+      .limit(1)
+    if (!sale?.customerId || sale.status !== "COMPLETED") return null
+    return { customerId: sale.customerId, eventId: sale.eventId, tenantId: sale.tenantId }
+  }
+  if (credentials.customerToken && credentials.eventId) {
+    const resolved = await resolveCustomerForEvent(
+      db,
+      credentials.customerToken,
+      credentials.eventId
+    )
+    if (!resolved) return null
+    return {
+      customerId: resolved.customer.id,
+      eventId: credentials.eventId,
+      tenantId: resolved.tenantId,
+    }
+  }
+  return null
+}
+
+/** Avisa a los comprobantes abiertos del dueño que cambió algo en sus entradas. Nunca falla. */
+async function notifyTicketOwnerChange(
+  db: MySql2Database<Record<string, never>>,
+  customerId: string,
+  eventId: string
+) {
+  try {
+    for (const token of await ownerReceiptTokens(db, customerId, eventId)) {
+      broadcastReceiptUpdate(token)
+    }
+  } catch (error) {
+    console.error("[ticket-shares] no se pudo avisar al dueño", error)
+  }
 }
 
 /** El contacto del checkout a partir de la ficha del cliente: el mismo que ya dejó al entrar. */
@@ -689,6 +822,48 @@ export const publicRoute = new Hono()
       })
     }
 
+    // Quien recibió una entrada de un amigo (link de "compartir entradas") no compró ni pasó por el
+    // link de acceso, pero el evento tiene que figurar en su cuenta: es donde ve su entrada.
+    const heldEventIds = [
+      ...new Set(
+        ticketRows
+          .filter((row) => row.status !== "CANCELLED" && !listed.has(row.eventId))
+          .map((row) => row.eventId)
+      ),
+    ]
+    if (heldEventIds.length > 0) {
+      const heldRows = await db
+        .select({
+          eventId: events.id,
+          eventName: events.name,
+          eventDate: events.date,
+          eventVenue: events.venue,
+          eventLocation: events.location,
+          eventImageUrl: events.imageUrl,
+          eventStatus: events.status,
+          productoraName: tenants.name,
+        })
+        .from(events)
+        .innerJoin(tenants, eq(events.tenantId, tenants.id))
+        .where(inArray(events.id, heldEventIds))
+      for (const row of heldRows) {
+        listed.add(row.eventId)
+        profileEvents.push({
+          id: row.eventId,
+          name: row.eventName,
+          date: row.eventDate,
+          venue: row.eventVenue,
+          location: row.eventLocation,
+          imageUrl: row.eventImageUrl,
+          status: row.eventStatus,
+          productoraName: row.productoraName,
+          receiptToken: null,
+          tickets: countTickets(row.eventId),
+          pendingConsumptions: countPending(row.eventId),
+        })
+      }
+    }
+
     // Cada consulta viene ordenada por fecha, pero el merge rompe ese orden.
     profileEvents.sort((a, b) => b.date.getTime() - a.date.getTime())
 
@@ -818,6 +993,15 @@ export const publicRoute = new Hono()
       }))
     )
 
+    // Compartir entradas: incluye a quien recibió entradas de un amigo y nunca compró (sin `sale`).
+    const [shares, reservedTickets] = await Promise.all([
+      loadOwnerShares(db, { customerId: customer.id, eventId: ev.id, tenantId: ev.tenantId }),
+      earmarkedTickets(
+        db,
+        ticketRows.map((r) => r.id)
+      ),
+    ])
+
     return c.json({
       receiptToken: sale?.receiptToken ?? null,
       customerName: customer.name,
@@ -839,6 +1023,7 @@ export const publicRoute = new Hono()
         id: r.id,
         qrHash: r.qrHash,
         status: r.status,
+        shareId: reservedTickets.get(r.id) ?? null,
         ticketType: {
           name: r.ticketTypeName,
           price: r.ticketTypePrice,
@@ -853,6 +1038,7 @@ export const publicRoute = new Hono()
         product: { id: r.productId, name: r.productName, price: r.productPrice },
       })),
       pickups,
+      shares,
     })
   })
   // Link de acceso por evento (`crow.ar/{slug}/acceso`): el flyer y el botón de ingreso, sin la
@@ -1872,6 +2058,24 @@ export const publicRoute = new Hono()
       }))
     )
 
+    // Compartir entradas: lo que el dueño puede repartir, sus links y cuáles de sus entradas están
+    // reservadas en uno. Sólo con la compra acreditada: antes no hay entradas que repartir.
+    const holderCustomerId = header.sale.customerId
+    const [shares, reservedTickets] =
+      holderCustomerId && header.sale.paid
+        ? await Promise.all([
+            loadOwnerShares(db, {
+              customerId: holderCustomerId,
+              eventId: header.sale.eventId,
+              tenantId: header.sale.tenantId,
+            }),
+            earmarkedTickets(
+              db,
+              ticketRows.map((r) => r.id)
+            ),
+          ])
+        : ([EMPTY_TICKET_SHARES, new Map<string, string>()] as const)
+
     return c.json({
       receiptToken: header.sale.receiptToken,
       customerName:
@@ -1905,6 +2109,8 @@ export const publicRoute = new Hono()
         id: r.id,
         qrHash: r.qrHash,
         status: r.status,
+        // Link de "compartir entradas" que la tiene reservada para un amigo; null si no está en ninguno.
+        shareId: reservedTickets.get(r.id) ?? null,
         ticketType: { name: r.ticketTypeName, price: r.ticketTypePrice,
           validFrom: r.validFrom?.toISOString() ?? null, validUntil: r.validUntil?.toISOString() ?? null },
       })),
@@ -1925,6 +2131,7 @@ export const publicRoute = new Hono()
         })),
       ],
       pickups,
+      shares,
     })
   })
   .post("/receipts/:token/consumptions-checkout", async (c) => {
@@ -2359,3 +2566,222 @@ export const publicRoute = new Hono()
       drinks: outcome.drinks,
     })
   })
+  // ---------------------------------------------------------------------------------------------
+  // Compartir entradas (lib/ticket-shares.ts). Quien compró varias entradas arma un link con N
+  // cupos; cada amigo lo abre (`client/t/:token`), completa sus datos y reclama una. Sin auth para
+  // el amigo — el token del link es la credencial —; el dueño se identifica con las mismas dos
+  // credenciales que el resto de su cuenta (comprobante o sesión del evento).
+  // ---------------------------------------------------------------------------------------------
+  // Armar un link: reserva `quantity` entradas de un tipo para que los amigos las reclamen.
+  .post("/ticket-shares", zValidator("json", ticketShareCreateSchema), async (c) => {
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const holder = await resolveTicketHolder(db, body)
+    if (!holder) {
+      const { status, body: error } = shareErrorResponse("HOLDER_NOT_FOUND")
+      return c.json(error, status)
+    }
+
+    const limited = consumeRateLimit(
+      `share:create:${holder.customerId}`,
+      SHARE_CREATE_LIMIT_PER_OWNER.limit,
+      SHARE_CREATE_LIMIT_PER_OWNER.windowMs
+    )
+    if (!limited.ok) {
+      return c.json({ error: "Armaste muchos links en poco tiempo. Probá de nuevo más tarde." }, 429)
+    }
+
+    const result = await createTicketShare(db, {
+      customerId: holder.customerId,
+      eventId: holder.eventId,
+      tenantId: holder.tenantId,
+      ticketTypeId: body.ticketTypeId,
+      quantity: body.quantity,
+    })
+    if (!result.ok) {
+      const { status, body: error } = shareErrorResponse(result.code)
+      return c.json(error, status)
+    }
+
+    void notifyTicketOwnerChange(db, holder.customerId, holder.eventId)
+    return c.json({ share: result.share }, 201)
+  })
+  // Cancelar un link: los cupos sin reclamar vuelven a ser entradas comunes; lo ya reclamado queda.
+  .post("/ticket-shares/:id/cancel", zValidator("json", ticketShareOwnerSchema), async (c) => {
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+
+    const holder = await resolveTicketHolder(db, body)
+    if (!holder) {
+      const { status, body: error } = shareErrorResponse("HOLDER_NOT_FOUND")
+      return c.json(error, status)
+    }
+
+    const result = await cancelTicketShare(db, {
+      shareId: c.req.param("id"),
+      customerId: holder.customerId,
+      eventId: holder.eventId,
+      tenantId: holder.tenantId,
+    })
+    if (!result.ok) {
+      const { status, body: error } = shareErrorResponse(result.code)
+      return c.json(error, status)
+    }
+
+    void notifyTicketOwnerChange(db, holder.customerId, holder.eventId)
+    return c.json({ ok: true })
+  })
+  // Lo que ve el amigo al abrir el link: quién se lo pasó, para qué evento y cuántas quedan. Nunca
+  // expone QRs ni datos de quienes ya reclamaron.
+  .get("/ticket-shares/:token", async (c) => {
+    const db = drizzle(pool)
+
+    const ip = clientIp(c.req.raw.headers)
+    if (ip) {
+      const byIp = consumeRateLimit(
+        `share:view:ip:${ip}`,
+        SHARE_VIEW_LIMIT_PER_IP.limit,
+        SHARE_VIEW_LIMIT_PER_IP.windowMs
+      )
+      if (!byIp.ok) return c.json({ error: "Demasiados intentos. Esperá unos minutos." }, 429)
+    }
+
+    const preview = await getSharePreview(db, c.req.param("token"))
+    if (!preview) {
+      const { status, body: error } = shareErrorResponse("SHARE_NOT_FOUND")
+      return c.json(error, status)
+    }
+
+    return c.json({
+      state: preview.state,
+      hostName: preview.hostName,
+      event: preview.event,
+      productora: { name: preview.productoraName },
+      ticketType: {
+        name: preview.ticketType.name,
+        validFrom: preview.ticketType.validFrom?.toISOString() ?? null,
+        validUntil: preview.ticketType.validUntil?.toISOString() ?? null,
+      },
+      remaining: preview.remaining,
+      total: preview.total,
+    })
+  })
+  // Reclamar: el amigo deja sus datos y la entrada pasa a su nombre (con QR nuevo). Queda
+  // registrado como cliente: con esa ficha puede comprar consumos y cargar saldo en el evento.
+  .post(
+    "/ticket-shares/:token/claim",
+    zValidator("json", ticketShareClaimSchema, (result, c) => {
+      if (!result.success) {
+        const issue = result.error.issues[0]
+        const field = issue?.path[0]
+        return c.json(
+          {
+            error: issue?.message ?? "Revisá tus datos",
+            code: "INVALID_DATA",
+            field: field === undefined ? null : String(field),
+          },
+          400
+        )
+      }
+    }),
+    async (c) => {
+      const token = c.req.param("token")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+
+      const ip = clientIp(c.req.raw.headers)
+      if (ip) {
+        const byIp = consumeRateLimit(
+          `share:claim:ip:${ip}`,
+          SHARE_CLAIM_LIMIT_PER_IP.limit,
+          SHARE_CLAIM_LIMIT_PER_IP.windowMs
+        )
+        if (!byIp.ok) return c.json({ error: "Demasiados intentos. Esperá unos minutos." }, 429)
+      }
+      const byLink = consumeRateLimit(
+        `share:claim:link:${token}`,
+        SHARE_CLAIM_LIMIT_PER_LINK.limit,
+        SHARE_CLAIM_LIMIT_PER_LINK.windowMs
+      )
+      if (!byLink.ok) {
+        return c.json({ error: "Este link recibió demasiados intentos. Probá más tarde." }, 429)
+      }
+
+      // El schema ya los validó; se normalizan de nuevo porque acá se guardan tal cual.
+      const dni = normalizeDni(body.dni)
+      const phone = normalizeClaimPhone(body.phone)
+      if (!dni || !phone) {
+        return c.json({ error: "Revisá tus datos", code: "INVALID_DATA", field: null }, 400)
+      }
+
+      const result = await claimTicketShare(db, token, {
+        firstName: body.firstName,
+        lastName: body.lastName,
+        dni,
+        phone,
+        email: body.email,
+      })
+      if (!result.ok) {
+        const { status, body: error } = shareErrorResponse(result.code)
+        return c.json(error, status)
+      }
+      const { claimed } = result
+
+      // La ficha recién creada no tiene ningún dato previo que proteger: la sesión queda abierta y
+      // el amigo entra directo a su cuenta (entradas, consumos, saldo). Con una ficha que ya
+      // existía NO se abre sesión: el DNI no se verifica, así que para entrar a una cuenta con
+      // historial sigue haciendo falta el código por WhatsApp de `/{slug}/acceso`.
+      const sessionToken = claimed.claimant.createdNow
+        ? await createAccessToken(claimed.claimant.customerId, "customer", CUSTOMER_SESSION_TTL)
+        : null
+
+      void notifyTicketOwnerChange(db, claimed.ownerCustomerId, claimed.event.id)
+      void emailClaimedTicket(db, claimed)
+
+      return c.json(
+        {
+          ticket: {
+            id: claimed.ticketId,
+            qrHash: claimed.qrHash,
+            status: "PENDING" as const,
+            ticketType: {
+              name: claimed.ticketType.name,
+              validFrom: claimed.ticketType.validFrom?.toISOString() ?? null,
+              validUntil: claimed.ticketType.validUntil?.toISOString() ?? null,
+            },
+          },
+          holderName: claimed.claimant.name,
+          event: claimed.event,
+          session: sessionToken ? { token: sessionToken } : null,
+        },
+        201
+      )
+    }
+  )
+
+/**
+ * Le manda al que reclamó una copia de su entrada por email (QR incluido). Es un respaldo: la
+ * entrada ya se le mostró en pantalla y en la puerta también entra con el DNI. Nunca bloquea ni
+ * rompe el canje.
+ */
+async function emailClaimedTicket(
+  db: MySql2Database<Record<string, never>>,
+  claimed: ClaimedTicket
+) {
+  if (!process.env.RESEND_API_KEY?.trim()) return
+  try {
+    await sendManualTicketQrEmail({
+      db,
+      ticketId: claimed.ticketId,
+      tenantId: claimed.tenantId,
+      linkUrl: `${CLIENT_URL}/${encodeURIComponent(claimed.event.slug ?? claimed.event.id)}/acceso`,
+    })
+    await db
+      .update(tickets)
+      .set({ emailSentAt: new Date() })
+      .where(eq(tickets.id, claimed.ticketId))
+  } catch (error) {
+    console.error("[ticket-shares] no se pudo enviar el email de la entrada", error)
+  }
+}

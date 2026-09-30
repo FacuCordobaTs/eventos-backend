@@ -537,6 +537,87 @@ export const courtesies = mysqlTable(
 );
 
 // -----------------------------------------------------------------------------
+// 2.d COMPARTIR ENTRADAS — el comprador pasa entradas a sus amigos con un link
+// -----------------------------------------------------------------------------
+
+/**
+ * Link para compartir entradas. Quien compró varias entradas elige un tipo y una cantidad, y el
+ * sistema le da UN link (`/t/{token}`) para mandar al grupo: cada amigo que lo abre completa sus
+ * datos y reclama una entrada. Con cantidad 1 es un link por persona.
+ *
+ * El `token` es la capability pública del link (sin auth). Las entradas que reserva no viven acá
+ * sino en `ticket_transfers`, una fila por cupo. Un link se cancela con `cancelledAt` (soft): lo ya
+ * reclamado no se deshace. La fila también es el punto de serialización del canje: reclamar y
+ * cancelar la bloquean (`FOR UPDATE`), así dos amigos no se llevan la misma entrada.
+ */
+export const ticketShares = mysqlTable(
+  'ticket_shares',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    /** Un link reparte un solo tipo de entrada: el amigo sabe qué recibe. */
+    ticketTypeId: varchar('ticket_type_id', { length: 36 }).notNull().references(() => ticketTypes.id),
+    /** Cliente dueño de las entradas al momento de armar el link. */
+    ownerCustomerId: varchar('owner_customer_id', { length: 36 }).notNull().references(() => customers.id),
+    token: varchar('token', { length: 64 }).notNull().unique(),
+    cancelledAt: timestamp('cancelled_at'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    ownerEventIdx: index('ticket_shares_owner_event_idx').on(table.ownerCustomerId, table.eventId),
+    eventTenantIdx: index('ticket_shares_event_tenant_idx').on(table.eventId, table.tenantId),
+  })
+);
+
+/**
+ * Un cupo de un link: una entrada concreta reservada para que un amigo la reclame.
+ *
+ * - `PENDING`: reservada; sigue siendo del dueño (y usable por él) hasta que se reclama.
+ * - `CLAIMED`: la reclamó `toCustomerId`; la fila de `tickets` ya pasó a su nombre y cambió de QR.
+ * - `VOID`: el cupo no se pudo entregar (el dueño canceló el link o la entrada se usó/anuló antes).
+ *
+ * Es además el historial de traspasos de la entrada (de quién a quién y cuándo). `saleId` y
+ * `promoterId` de la entrada NO cambian al traspasarla: la venta y su comisión siguen siendo las
+ * de quien la compró.
+ */
+export const ticketTransfers = mysqlTable(
+  'ticket_transfers',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    shareId: varchar('share_id', { length: 36 }).notNull().references(() => ticketShares.id),
+    ticketId: varchar('ticket_id', { length: 36 }).notNull().references(() => tickets.id),
+    tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+    eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+    fromCustomerId: varchar('from_customer_id', { length: 36 }).notNull().references(() => customers.id),
+    /** Null hasta que alguien la reclama. */
+    toCustomerId: varchar('to_customer_id', { length: 36 }).references(() => customers.id),
+    /**
+     * Nombre tal cual lo escribió quien reclamó. Es lo que ve el dueño del link: no se lee de
+     * `customers.name` porque, si el DNI ya existía, esa ficha conserva su nombre y mostrarlo
+     * permitiría averiguar el nombre de cualquiera escribiendo su DNI.
+     */
+    toName: varchar('to_name', { length: 255 }),
+    /** Orden de entrega dentro del link (`timestamp` no alcanza: es de segundos). */
+    position: int('position').notNull().default(0),
+    status: mysqlEnum('status', ['PENDING', 'CLAIMED', 'VOID']).notNull().default('PENDING'),
+    claimedAt: timestamp('claimed_at'),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    shareStatusIdx: index('ticket_transfers_share_status_idx').on(table.shareId, table.status, table.position),
+    ticketStatusIdx: index('ticket_transfers_ticket_status_idx').on(table.ticketId, table.status),
+    toCustomerIdx: index('ticket_transfers_to_customer_idx').on(table.toCustomerId),
+    eventTenantIdx: index('ticket_transfers_event_tenant_idx').on(table.eventId, table.tenantId),
+    // Una persona reclama una sola entrada por link (varias filas con `to_customer_id` NULL son válidas).
+    shareClaimantUnique: uniqueIndex('ticket_transfers_share_claimant_unique').on(
+      table.shareId,
+      table.toCustomerId
+    ),
+  })
+);
+
+// -----------------------------------------------------------------------------
 // 3. INVENTARIO PRO
 // -----------------------------------------------------------------------------
 

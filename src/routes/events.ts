@@ -34,7 +34,9 @@ import {
   sales,
   staff,
   tenants,
+  ticketShares,
   ticketTiers,
+  ticketTransfers,
   ticketTypes,
   tickets,
 } from "../db/schema"
@@ -761,6 +763,35 @@ async function computePromoterSales(
         decFromDb(b.totalRevenue).cmp(decFromDb(a.totalRevenue)) ||
         a.name.localeCompare(b.name)
     )
+}
+
+/**
+ * Nombre del promotor general al que pertenece cada promotor (`promoters.owner_staff_id`), por id
+ * de promotor. No figuran los promotores de la productora (sin dueño) ni los que quedaron con un
+ * dueño que ya no es promotor general —un admin puede cambiarle el rol—: rotularlo así sería falso.
+ *
+ * Se resuelve aparte de `computePromoterSales` a propósito: esa función alimenta el snapshot del
+ * cierre y `GET /public/events/:id/report` lo sirve sin autenticación, así que quién coordina a
+ * quién es un dato del panel de la productora y no debe congelarse ahí.
+ *
+ * `db: any` por el mismo motivo que en `isAssignedToEvent`; las filas se tipan a mano.
+ */
+async function generalPromoterNameByPromoterId(
+  db: any,
+  tenantId: string
+): Promise<Map<string, string>> {
+  const rows: { promoterId: string; generalPromoterName: string }[] = await db
+    .select({ promoterId: promoters.id, generalPromoterName: staff.name })
+    .from(promoters)
+    .innerJoin(staff, eq(staff.id, promoters.ownerStaffId))
+    .where(
+      and(
+        eq(promoters.tenantId, tenantId),
+        eq(staff.tenantId, tenantId),
+        eq(staff.role, "GENERAL_PROMOTER")
+      )
+    )
+  return new Map(rows.map((r) => [r.promoterId, r.generalPromoterName]))
 }
 
 /** Stock en base units (ml/g/unidad) → unidad contable (botellas/latas/unidades). */
@@ -1490,6 +1521,10 @@ export const eventsRoute = new Hono()
       await tx.delete(digitalConsumptions).where(and(eq(digitalConsumptions.eventId, eventId), eq(digitalConsumptions.tenantId, tenantId)))
       await tx.delete(gateLogs).where(and(eq(gateLogs.eventId, eventId), eq(gateLogs.tenantId, tenantId)))
       await tx.delete(courtesies).where(and(eq(courtesies.eventId, eventId), eq(courtesies.tenantId, tenantId)))
+      // Compartir entradas: los cupos referencian a las entradas y los links al tipo y al evento,
+      // así que salen antes que ambos (primero los cupos, que apuntan a los links).
+      await tx.delete(ticketTransfers).where(and(eq(ticketTransfers.eventId, eventId), eq(ticketTransfers.tenantId, tenantId)))
+      await tx.delete(ticketShares).where(and(eq(ticketShares.eventId, eventId), eq(ticketShares.tenantId, tenantId)))
       if (saleIds.length > 0) {
         await tx.delete(saleItems).where(inArray(saleItems.saleId, saleIds))
         await tx.delete(mpProcessedPayments).where(inArray(mpProcessedPayments.saleId, saleIds))
@@ -2323,6 +2358,29 @@ export const eventsRoute = new Hono()
       .where(and(...conditions))
       .orderBy(orderFn(orderColumn))
 
+    // Entradas que cambiaron de mano por "compartir entradas": el titular actual ya figura en
+    // `buyerName`/`customerId`, así que acá se informa de quién vinieron. Si pasó por varias manos
+    // queda la última (el orden por `claimedAt` hace que la más nueva pise a las anteriores).
+    const transfers = await db
+      .select({
+        ticketId: ticketTransfers.ticketId,
+        fromName: customers.name,
+        claimedAt: ticketTransfers.claimedAt,
+      })
+      .from(ticketTransfers)
+      .innerJoin(customers, eq(ticketTransfers.fromCustomerId, customers.id))
+      .where(
+        and(
+          eq(ticketTransfers.eventId, eventId),
+          eq(ticketTransfers.tenantId, tenantId),
+          eq(ticketTransfers.status, "CLAIMED")
+        )
+      )
+      .orderBy(asc(ticketTransfers.claimedAt))
+    const transferredFrom = new Map(
+      transfers.map((t) => [t.ticketId, { name: t.fromName, at: t.claimedAt }])
+    )
+
     return c.json({
       tickets: rows.map((r) => ({
         id: r.id,
@@ -2338,6 +2396,7 @@ export const eventsRoute = new Hono()
         promoterName: r.promoterName,
         ticketTypeId: r.ticketTypeId,
         ticketTypeName: r.ticketTypeName,
+        transferredFrom: transferredFrom.get(r.id) ?? null,
       })),
     })
   })
@@ -2523,7 +2582,20 @@ export const eventsRoute = new Hono()
     // `computePromoterSales` (mismo shape, congelado en `closingReport.byPromoter`).
     const rows = await computePromoterSales(db, eventId, tenantId, ownerStaffId)
 
-    return c.json({ promoters: rows })
+    // El promotor general no necesita saber a quién pertenece cada uno: su cartera entera es suya.
+    if (ownerStaffId !== undefined) {
+      return c.json({ promoters: rows })
+    }
+
+    // Para la productora, cada promotor lleva el promotor general al que pertenece (null = de la
+    // productora). Sólo en esta respuesta: el cierre congela `rows` sin este dato.
+    const generalPromoters = await generalPromoterNameByPromoterId(db, tenantId)
+    return c.json({
+      promoters: rows.map((row) => ({
+        ...row,
+        generalPromoterName: generalPromoters.get(row.id) ?? null,
+      })),
+    })
   })
   .get("/:id/bar-sales", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -3215,6 +3287,8 @@ export const eventsRoute = new Hono()
       .where(and(eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
       .orderBy(asc(staff.name))
 
+    const generalPromoters = await generalPromoterNameByPromoterId(db, tenantId)
+
     return c.json({
       staff: rows.map((r) => ({
         id: r.id,
@@ -3224,6 +3298,8 @@ export const eventsRoute = new Hono()
         isAssigned: r.assignmentId != null,
         barId: r.barId ?? null,
         promoterId: r.promoterId ?? null,
+        // Promotor general al que pertenece (null = de la productora, o no es un promotor).
+        generalPromoterName: r.promoterId ? (generalPromoters.get(r.promoterId) ?? null) : null,
       })),
     })
   })

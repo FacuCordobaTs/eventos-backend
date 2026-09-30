@@ -192,6 +192,11 @@ export async function sendManualTicketQrEmail(input: {
   db: any
   ticketId: string
   tenantId: string
+  /**
+   * A dónde lleva el botón del mail. Por defecto la home del client; la entrada reclamada de un
+   * amigo apunta al acceso del evento, donde entra con su DNI o celular.
+   */
+  linkUrl?: string
 }): Promise<void> {
   const apiKey = process.env.RESEND_API_KEY
   if (!apiKey?.trim()) {
@@ -248,7 +253,7 @@ export async function sendManualTicketQrEmail(input: {
     /\/$/,
     ""
   )
-  const receiptUrl = baseUrl
+  const receiptUrl = input.linkUrl ?? baseUrl
 
   const itemName = `Entrada · ${row.ticketTypeName}`
   const resend = new Resend(apiKey)
