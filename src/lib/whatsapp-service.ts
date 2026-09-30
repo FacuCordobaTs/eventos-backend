@@ -8,7 +8,8 @@
  * Si faltan esas variables, el envío queda apagado para toda la plataforma. Los
  * templates se aprueban una sola vez en el Meta Business Manager de Crow:
  *   - `crow_prueba`       (MARKETING, es_AR) — mensaje de prueba desde Configuración.
- *   - `crow_recordatorio` (MARKETING, es_AR) — recordatorio 1 h antes (tarea 8.2),
+ *   - `crow_recordatorio` (MARKETING, es_AR) — recordatorio previo al evento (tarea 8.2; cuánto
+ *     antes y si sale lo decide cada evento, ver `lib/whatsapp-reminder.ts`),
  *     cuerpo: {{1}} nombre, {{2}} nombre del evento; botón URL dinámico índice 0:
  *     "Ir al evento". El link no forma parte del texto del mensaje.
  *   - `crow_acceso_perfil` (UTILITY, es_AR) — link al perfil del cliente, con botón URL
@@ -26,6 +27,22 @@ const GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 
 /** Template aprobado para el recordatorio de puertas (tarea 8.2). */
 export const REMINDER_TEMPLATE = "crow_recordatorio"
+/** Texto del botón (CTA) del template de recordatorio. */
+export const REMINDER_BUTTON_LABEL = "Ir al evento"
+/**
+ * Base de la URL del botón del recordatorio. En WhatsApp Manager el botón está configurado como
+ * `https://crow.ar/{{1}}`: la API sólo recibe lo que completa `{{1}}` (la slug o el id del evento).
+ */
+export const REMINDER_URL_BASE = "https://crow.ar/"
+/**
+ * Cuerpo de REFERENCIA del recordatorio, sólo para la vista previa de la pantalla "Mensajes" del
+ * admin. El texto que recibe el cliente es el de la plantilla aprobada en WhatsApp Manager, que el
+ * backend no lee: si esa plantilla cambia, actualizar esta constante para que la vista previa siga
+ * diciendo lo mismo. `{{1}}` = nombre de la persona y `{{2}}` = nombre del evento, en el mismo orden
+ * que los `bodyParameters` con los que se manda.
+ */
+export const REMINDER_BODY_PREVIEW =
+  "Hola {{1}}, ¡ya casi es {{2}}! Recordá que podés comprar por la app desde el botón de abajo."
 /** Template del mensaje de prueba desde Configuración. */
 export const TEST_TEMPLATE = "crow_prueba"
 /**

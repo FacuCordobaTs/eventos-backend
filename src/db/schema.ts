@@ -315,6 +315,15 @@ export const events = mysqlTable(
      */
     whatsappReminderSentAt: timestamp('whatsapp_reminder_sent_at'),
     /**
+     * Configuración del recordatorio de WhatsApp (pantalla "Mensajes" de Entradas, admin).
+     * `whatsappReminderEnabled` es el interruptor por evento: apagado, el runner no manda nada.
+     * `whatsappReminderLeadMinutes` es cuántos minutos antes de la hora del evento sale el mensaje;
+     * la hora de referencia es `doorsAt` y, sin ella, `date` (ver `lib/whatsapp-reminder.ts`).
+     * El interruptor nace apagado (sale sólo si un administrador lo activa) y el adelanto en 60 minutos.
+     */
+    whatsappReminderEnabled: boolean('whatsapp_reminder_enabled').notNull().default(false),
+    whatsappReminderLeadMinutes: int('whatsapp_reminder_lead_minutes').notNull().default(60),
+    /**
      * Tarea 4.4 — Liquidación de la ceremonia de cierre (spec §5 "Cierre"/"Cerrado").
      * Snapshot JSON congelado al cerrar: conteo real de insumos, estimación del sistema, costo
      * de mercadería CONSUMIDA (no comprada), sobrante valuado, caja, ingresos, gastos, neto y

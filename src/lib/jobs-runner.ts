@@ -7,11 +7,13 @@
  * re-envíe un mensaje ni re-transicione dos veces.
  *
  * Cada minuto:
- *   (a) Recordatorio de WhatsApp — eventos `on_sale|live` con `doorsAt` en la próxima hora
- *       y `whatsapp_reminder_sent_at` null (y el número de la plataforma configurado): manda el
- *       template aprobado (`crow_recordatorio`: nombre y evento en el cuerpo + botón URL)
- *       a todos los customers
- *       con tickets del evento, UNA vez por persona, y setea la columna.
+ *   (a) Recordatorio de WhatsApp — eventos `on_sale|live` con el recordatorio activado, sin enviar
+ *       (`whatsapp_reminder_sent_at` null) y cuya hora de envío ya llegó (y el número de la
+ *       plataforma configurado): manda el template aprobado (`crow_recordatorio`: nombre y evento
+ *       en el cuerpo + botón URL) a todos los customers con tickets del evento, UNA vez por
+ *       persona, y setea la columna. Activado y adelanto son configuración de cada evento (pantalla
+ *       "Mensajes" del admin); la hora de envío es `doorsAt` —o `date` si no hay hora de puertas—
+ *       menos el adelanto (60 min por defecto). Ver `lib/whatsapp-reminder.ts`.
  *   (b) Transición on_sale → live — eventos con `doorsAt <= now` pasan solos a En vivo,
  *       sellando `wentLiveAt` (la misma marca que sella el POST /events/:id/transition).
  *       Antes era lazy-only (el admin la disparaba al abrir/refrescar); ahora el backend
@@ -23,29 +25,19 @@
  * del servicio.
  */
 
-import { and, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm"
+import { and, eq, gt, inArray, isNotNull, isNull, lte, or } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
-import { customers, events, tickets } from "../db/schema"
+import { events } from "../db/schema"
 import {
   isWhatsAppConfigured,
   REMINDER_TEMPLATE,
   sendWhatsAppTemplateMessage,
 } from "./whatsapp-service"
-
-/** Ventana previa a la puerta en la que se manda el recordatorio (visión §2.3: 1 h antes). */
-const REMINDER_WINDOW_MS = 60 * 60 * 1000
+import { listReminderAudience, reminderLink, reminderSchedule } from "./whatsapp-reminder"
 
 /** Cadencia del runner: un tick por minuto (el plan exige el chequeo cada minuto). */
 const TICK_INTERVAL_MS = 60 * 1000
-
-/**
- * Parte dinámica del CTA del template. En Meta el botón se configura como
- * `https://crow.ar/{{1}}`; la API recibe únicamente la slug (o id) que completa esa URL.
- */
-function eventShopUrlParameter(event: { slug: string | null; id: string }): string {
-  return encodeURIComponent(event.slug ?? event.id)
-}
 
 /** (b) Eventos on_sale cuya hora de puertas ya llegó → pasan a live, sellando wentLiveAt. */
 async function transitionDueEvents(): Promise<void> {
@@ -80,7 +72,10 @@ async function transitionDueEvents(): Promise<void> {
   }
 }
 
-/** (a) Recordatorio de WhatsApp 1 h antes a los compradores de eventos con puertas próximas. */
+/**
+ * (a) Recordatorio de WhatsApp a los compradores de los eventos cuya hora de envío ya llegó.
+ * Cada evento decide si sale y con cuánto adelanto (`lib/whatsapp-reminder.ts`).
+ */
 async function sendWhatsAppReminders(): Promise<void> {
   // Un solo número para toda la plataforma (`.env` del VPS): sin credenciales no hay a quién
   // mandarle ni con qué, así que el tick entero se saltea.
@@ -88,58 +83,48 @@ async function sendWhatsAppReminders(): Promise<void> {
 
   const db = drizzle(pool)
   const now = new Date()
-  const windowEnd = new Date(now.getTime() + REMINDER_WINDOW_MS)
 
-  const dueEvents = await db
+  // Candidatos: en venta o en vivo, con el recordatorio activado, sin enviar y con la hora del
+  // evento todavía por delante (`doorsAt`, o `date` si no hay hora de puertas). Si la hora de envío
+  // ya llegó depende del adelanto de cada evento, así que eso se decide después, con la misma
+  // función que usa la pantalla "Mensajes" para mostrar el estado.
+  const candidates = await db
     .select({
       id: events.id,
+      tenantId: events.tenantId,
       name: events.name,
       slug: events.slug,
+      status: events.status,
+      date: events.date,
       doorsAt: events.doorsAt,
+      whatsappReminderEnabled: events.whatsappReminderEnabled,
+      whatsappReminderLeadMinutes: events.whatsappReminderLeadMinutes,
+      whatsappReminderSentAt: events.whatsappReminderSentAt,
     })
     .from(events)
     .where(
       and(
         inArray(events.status, ["on_sale", "live"]),
-        isNotNull(events.doorsAt),
-        gt(events.doorsAt, now),
-        lte(events.doorsAt, windowEnd),
-        isNull(events.whatsappReminderSentAt)
+        eq(events.whatsappReminderEnabled, true),
+        isNull(events.whatsappReminderSentAt),
+        or(gt(events.doorsAt, now), and(isNull(events.doorsAt), gt(events.date, now)))
       )
     )
 
+  const dueEvents = candidates.filter(
+    (event) => reminderSchedule(event, now).state === "SENDING"
+  )
+
   for (const event of dueEvents) {
     try {
-      const buyers = await db
-        .select({
-          customerId: customers.id,
-          name: customers.name,
-          phone: customers.phone,
-        })
-        .from(tickets)
-        .innerJoin(customers, eq(tickets.customerId, customers.id))
-        .where(
-          and(
-            eq(tickets.eventId, event.id),
-            ne(tickets.status, "CANCELLED"),
-            isNotNull(customers.phone)
-          )
-        )
-
       // Una persona = un mensaje, aunque haya comprado varias entradas del evento.
-      const seen = new Set<string>()
-      const recipients = buyers.filter((b) => {
-        const key = b.customerId
-        if (!b.phone || seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
+      const { recipients } = await listReminderAudience(db, event)
 
-      const urlButtonParameter = eventShopUrlParameter(event)
+      const urlButtonParameter = reminderLink(event).parameter
       let sent = 0
       for (const recipient of recipients) {
         const result = await sendWhatsAppTemplateMessage({
-          to: recipient.phone!,
+          to: recipient.phone,
           templateName: REMINDER_TEMPLATE,
           // `crow_recordatorio`: dos variables en el cuerpo y un CTA dinámico separado.
           // El link no se inserta como texto visible dentro del mensaje.
@@ -150,7 +135,7 @@ async function sendWhatsAppReminders(): Promise<void> {
           sent++
         } else {
           console.error(
-            `[jobs] WhatsApp recordatorio ${event.name}: falló para ${recipient.phone} (${result.error})`
+            `[jobs] WhatsApp recordatorio ${event.name}: falló para el cliente ${recipient.customerId} (${result.error})`
           )
         }
       }
@@ -160,9 +145,9 @@ async function sendWhatsAppReminders(): Promise<void> {
       await db
         .update(events)
         .set({ whatsappReminderSentAt: new Date() })
-        .where(eq(events.id, event.id))
+        .where(and(eq(events.id, event.id), eq(events.tenantId, event.tenantId)))
       console.log(
-        `[jobs] WhatsApp recordatorio ${event.name}: ${sent}/${recipients.length} enviados (puertas ${event.doorsAt?.toISOString()})`
+        `[jobs] WhatsApp recordatorio ${event.name}: ${sent}/${recipients.length} enviados (evento ${reminderSchedule(event, now).reference.at.toISOString()})`
       )
     } catch (e) {
       console.error(`[jobs] WhatsApp recordatorio ${event.name}: error del lote`, e)

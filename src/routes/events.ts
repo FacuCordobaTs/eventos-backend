@@ -80,6 +80,14 @@ import {
 } from "../lib/inventory-deduction"
 import { findOrCreateInventoryItemByName } from "./inventory"
 import { sendCourtesyInvitationEmail } from "../lib/send-courtesy-invitation-email"
+import { isWhatsAppConfigured } from "../lib/whatsapp-service"
+import {
+  buildReminderOverview,
+  listReminderAudience,
+  reminderSchedule,
+  REMINDER_LEAD_MAX_MINUTES,
+  REMINDER_LEAD_MIN_MINUTES,
+} from "../lib/whatsapp-reminder"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import {
   deleteFileByKey,
@@ -151,6 +159,14 @@ async function ownedPromoterOf(
     )
     .limit(1)
   return row != null
+}
+
+/**
+ * La pantalla "Mensajes" de un evento (recordatorio de WhatsApp a sus compradores) la ven y la
+ * configuran sólo ADMIN y MANAGER: expone cuántos clientes tiene el evento y decide un envío masivo.
+ */
+function canManageEventMessages(ctx: AuthenticatedContext): boolean {
+  return ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER"
 }
 
 /** Slug de la URL pública del evento (`crow.ar/{slug}`). Único global en `events`. */
@@ -234,6 +250,23 @@ const patchEventSchema = z
         path: ["ticketsAvailableFrom"],
       })
     }
+  })
+
+// Recordatorio de WhatsApp del evento: interruptor y adelanto en minutos. `confirmSend` es la
+// confirmación explícita de un cambio que hace que el mensaje salga en el próximo minuto.
+const patchWhatsAppReminderSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    leadMinutes: z
+      .number()
+      .int()
+      .min(REMINDER_LEAD_MIN_MINUTES)
+      .max(REMINDER_LEAD_MAX_MINUTES)
+      .optional(),
+    confirmSend: z.boolean().optional(),
+  })
+  .refine((d) => d.enabled !== undefined || d.leadMinutes !== undefined, {
+    message: "No hay campos para actualizar",
   })
 
 const createTicketTypeSchema = z.object({
@@ -483,6 +516,7 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     designType: row.designType ?? "MINIMAL",
     allowReentry: row.allowReentry ?? false,
     ageRestriction: row.ageRestriction ?? null,
+    whatsappReminderEnabled: row.whatsappReminderEnabled ?? false,
     ticketsAvailableFrom: row.ticketsAvailableFrom
       ? row.ticketsAvailableFrom.toISOString()
       : null,
@@ -1664,6 +1698,9 @@ export const eventsRoute = new Hono()
         status: "draft",
         designType: source.designType,
         imageUrl: source.imageUrl ?? null,
+        // Configuración del recordatorio de WhatsApp; la marca de "ya se envió" no se hereda.
+        whatsappReminderEnabled: source.whatsappReminderEnabled,
+        whatsappReminderLeadMinutes: source.whatsappReminderLeadMinutes,
         createdAt: new Date(),
       })
 
@@ -4379,6 +4416,79 @@ export const eventsRoute = new Hono()
     const readiness = await computeOpenSaleReadiness(db, eventId, tenantId)
     return c.json(readiness)
   })
+  // Recordatorio de WhatsApp del evento (pantalla "Mensajes" de Entradas): estado, horario de envío,
+  // cuántas personas lo reciben y qué mensaje con qué link. Lo calcula `lib/whatsapp-reminder.ts`,
+  // el mismo código con el que el runner decide y manda, así que lo que se ve es lo que sale.
+  .get("/:id/whatsapp-reminder", async (c) => {
+    const ctx = c as AuthenticatedContext
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    if (!canManageEventMessages(ctx)) {
+      return c.json({ error: "No tenés permiso para ver los mensajes del evento." }, 403)
+    }
+    const db = drizzle(pool)
+    const ev = await requireEventForTenant(db, c.req.param("id"), tenantId)
+    if (!ev) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    return c.json(await buildReminderOverview(db, ev))
+  })
+  // Activa/desactiva el recordatorio y fija cuánto antes del evento sale. Un cambio que hace que el
+  // mensaje salga en el próximo minuto (activarlo o mover el adelanto con la ventana ya abierta)
+  // responde 409 `CONFIRM_IMMEDIATE_SEND` hasta que llegue `confirmSend: true`: es un envío masivo
+  // que no se puede deshacer.
+  .patch(
+    "/:id/whatsapp-reminder",
+    zValidator("json", patchWhatsAppReminderSchema),
+    async (c) => {
+      const ctx = c as AuthenticatedContext
+      const tenantId = requireTenantId(ctx)
+      if (!tenantId) {
+        return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+      }
+      if (!canManageEventMessages(ctx)) {
+        return c.json({ error: "No tenés permiso para configurar los mensajes del evento." }, 403)
+      }
+      const eventId = c.req.param("id")
+      const body = c.req.valid("json")
+      const db = drizzle(pool)
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+
+      const now = new Date()
+      const next = {
+        whatsappReminderEnabled: body.enabled ?? ev.whatsappReminderEnabled,
+        whatsappReminderLeadMinutes: body.leadMinutes ?? ev.whatsappReminderLeadMinutes,
+      }
+      const sendsBefore = reminderSchedule(ev, now).state === "SENDING"
+      const sendsAfter = reminderSchedule({ ...ev, ...next }, now).state === "SENDING"
+      if (sendsAfter && !sendsBefore && isWhatsAppConfigured() && body.confirmSend !== true) {
+        const { recipients } = await listReminderAudience(db, ev)
+        return c.json(
+          {
+            error: "Con esta configuración el mensaje sale en el próximo minuto.",
+            code: "CONFIRM_IMMEDIATE_SEND",
+            recipients: recipients.length,
+          },
+          409
+        )
+      }
+
+      await db
+        .update(events)
+        .set(next)
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+      const updated = await requireEventForTenant(db, eventId, tenantId)
+      if (!updated) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      return c.json(await buildReminderOverview(db, updated, now))
+    }
+  )
   // Transición de estado del evento (spec §5). El productor solo empuja dos manualmente:
   // "Abrir venta" (draft→on_sale) y "Cerrar el evento" (live→closed). "Arrancar ahora"
   // (on_sale→live) es override de lo automático a la hora de puertas. Solo se avanza (nunca se
