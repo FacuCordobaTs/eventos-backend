@@ -1008,6 +1008,30 @@ export const mpProcessedPayments = mysqlTable('mp_processed_payments', {
   processedAt: timestamp('processed_at').defaultNow(),
 })
 
+export type PosSaleReplayResponse = {
+  message: string
+  saleId: string
+  receiptToken: string
+  totalAmount: string
+  createdAt: string
+  productTotalAmount: string
+  customerId: string | null
+  consumptions: { productName: string; qrHash: string }[]
+  depositSaleId?: string
+  balanceCharge?: string
+  balance?: string
+}
+
+// The request reservation, sale, balance movements and replay response commit together.
+export const posSaleRequests = mysqlTable('pos_sale_requests', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  staffId: varchar('staff_id', { length: 36 }).notNull(),
+  payloadHash: varchar('payload_hash', { length: 64 }).notNull(),
+  response: json('response').$type<PosSaleReplayResponse | null>(),
+  createdAt: timestamp('created_at').defaultNow(),
+}, (table) => ({ tenantIdx: index('pos_sale_requests_tenant_idx').on(table.tenantId) }))
+
 export const saleItems = mysqlTable('sale_items', {
   id: varchar('id', { length: 36 }).primaryKey(),
   saleId: varchar('sale_id', { length: 36 }).notNull().references(() => sales.id),

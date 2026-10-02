@@ -579,7 +579,7 @@ export const barsRoute = new Hono()
       .select({
         id: products.id,
         name: products.name,
-        price: products.price,
+        price: sql<string>`coalesce(${eventProducts.priceOverride}, ${products.price})`,
         directStock: eventProducts.directStock,
         barProductId: barProducts.id,
         barIsActive: barProducts.isActive,
@@ -609,6 +609,7 @@ export const barsRoute = new Hono()
         productCategories,
         and(
           eq(productCategories.id, products.categoryId),
+          eq(productCategories.tenantId, tenantId),
           eq(productCategories.isActive, true)
         )
       )

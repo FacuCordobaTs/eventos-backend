@@ -5,7 +5,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import { and, asc, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import {
   barInventory,
   bars,
@@ -21,6 +21,8 @@ import {
   promoters,
   saleItems,
   sales,
+  posSaleRequests,
+  type PosSaleReplayResponse,
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
@@ -260,13 +262,24 @@ const createProductSchema = z.object({
 })
 
 const categorySchema = z.object({
-  name: z.string().min(1).max(100),
+  name: z.string().trim().min(1).max(100),
   sortOrder: z.coerce.number().int().optional(),
 })
 
 const updateProductSchema = createProductSchema
 
 const createSaleSchema = z.object({
+  requestId: z.string().uuid().optional(),
+  expectedTotalAmount: z.string().regex(/^\d{1,8}\.\d{2}$/).optional(),
+  clientSale: z.object({
+    receiptToken: z.string().uuid(),
+    createdAt: z.string().datetime(),
+    lines: z.array(z.object({
+      productId: z.string().min(1),
+      priceAtTime: z.string().regex(/^\d{1,8}\.\d{2}$/),
+      qrHashes: z.array(z.string().uuid()).max(1000),
+    })).max(100),
+  }).optional(),
   eventId: z.string().min(1),
   barId: z.preprocess(
     (v) => (v === null || v === "" ? undefined : v),
@@ -307,6 +320,16 @@ const createSaleSchema = z.object({
     z.string().max(36).optional()
   ),
 }).superRefine((data, ctx) => {
+  if (data.clientSale) {
+    const invalid = !data.requestId || !data.barId || data.paymentMethod === "SALDO" ||
+      data.clientSale.lines.length !== data.items.length ||
+      data.clientSale.lines.some((line, index) => line.productId !== data.items[index]?.productId || line.qrHashes.length !== data.items[index]?.quantity) ||
+      new Set(data.items.map((line) => line.productId)).size !== data.items.length ||
+      new Set([data.clientSale.receiptToken, ...data.clientSale.lines.flatMap((line) => line.qrHashes)]).size !== 1 + data.items.reduce((sum, line) => sum + line.quantity, 0) ||
+      !Number.isFinite(new Date(data.clientSale.createdAt).getTime()) ||
+      new Date(data.clientSale.createdAt).getTime() > Date.now() + 300_000
+    if (invalid) ctx.addIssue({ code: "custom", path: ["clientSale"], message: "Documento de venta offline inválido; saldo requiere confirmación online" })
+  }
   if (data.items.length === 0 && data.balanceCharge == null) {
     ctx.addIssue({
       code: "custom",
@@ -594,6 +617,9 @@ export const inventoryRoute = new Hono()
   })
   .post("/categories", zValidator("json", categorySchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar categorías" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -627,6 +653,9 @@ export const inventoryRoute = new Hono()
   })
   .put("/categories/:id", zValidator("json", categorySchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar categorías" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -667,6 +696,9 @@ export const inventoryRoute = new Hono()
   })
   .delete("/categories/:id", async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar categorías" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -778,6 +810,9 @@ export const inventoryRoute = new Hono()
   })
   .post("/products", zValidator("json", createProductSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar productos" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -902,6 +937,9 @@ export const inventoryRoute = new Hono()
   })
   .put("/products/:id", zValidator("json", updateProductSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar productos" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -963,7 +1001,7 @@ export const inventoryRoute = new Hono()
           name: body.name,
           price: priceStr,
           saleType: body.saleType,
-          categoryId: body.categoryId ?? null,
+          ...(body.categoryId === undefined ? {} : { categoryId: body.categoryId }),
         })
         .where(eq(products.id, productId))
       await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
@@ -1498,6 +1536,9 @@ export const inventoryRoute = new Hono()
   })
   .post("/sales", zValidator("json", createSaleSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (!["ADMIN", "MANAGER", "BARTENDER"].includes(ctx.staff.role)) {
+      return c.json({ error: "No tenés permiso para registrar ventas de caja" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -1507,6 +1548,16 @@ export const inventoryRoute = new Hono()
 
     try {
       const result = await db.transaction(async (tx) => {
+        if (body.requestId) {
+          const payloadHash = createHash("sha256").update(JSON.stringify(body)).digest("hex")
+          // A duplicate insert waits for the first transaction. Never replace its owner/hash.
+          await tx.insert(posSaleRequests).values({ id: body.requestId, tenantId, staffId: ctx.staff.id, payloadHash })
+            .onDuplicateKeyUpdate({ set: { id: sql`${posSaleRequests.id}` } })
+          const [request] = await tx.select().from(posSaleRequests)
+            .where(and(eq(posSaleRequests.id, body.requestId), eq(posSaleRequests.tenantId, tenantId))).for("update")
+          if (!request || request.staffId !== ctx.staff.id || request.payloadHash !== payloadHash) return { kind: "request_conflict" as const }
+          if (request.response) return { kind: "replay" as const, response: request.response }
+        }
         const [ev] = await tx
           .select()
           .from(events)
@@ -1565,10 +1616,27 @@ export const inventoryRoute = new Hono()
           return { kind: "inactive_product" as const, name: inactive.name }
         }
 
+        const menuRows = productIds.length === 0 ? [] : await tx
+          .select({ productId: eventProducts.productId, priceOverride: eventProducts.priceOverride })
+          .from(eventProducts)
+          .where(and(
+            eq(eventProducts.tenantId, tenantId),
+            eq(eventProducts.eventId, body.eventId),
+            eq(eventProducts.isActive, true),
+            inArray(eventProducts.productId, productIds)
+          ))
+        if (menuRows.length !== productIds.length) {
+          return { kind: "product_not_in_menu" as const }
+        }
+        const menuByProduct = new Map(menuRows.map((row) => [row.productId, row]))
+        const priceByProduct = new Map(prodRows.map((p) => [p.id, menuByProduct.get(p.id)?.priceOverride ?? p.price]))
+        if (body.clientSale?.lines.some((line) => !dec(line.priceAtTime).eq(decFromDb(priceByProduct.get(line.productId))))) {
+          return { kind: "offline_price_changed" as const }
+        }
+
         let total = dec(0)
         for (const line of body.items) {
-          const p = prodRows.find((x) => x.id === line.productId)!
-          total = total.plus(decFromDb(p.price).times(line.quantity))
+          total = total.plus(decFromDb(priceByProduct.get(line.productId)!).times(line.quantity))
         }
 
         let balanceCharge = dec(0)
@@ -1581,6 +1649,10 @@ export const inventoryRoute = new Hono()
           if (balanceCharge.isNaN() || !balanceCharge.isFinite() || balanceCharge.lte(0)) {
             return { kind: "invalid_balance_charge" as const }
           }
+        }
+
+        if (body.expectedTotalAmount != null && !total.plus(balanceCharge).eq(dec(body.expectedTotalAmount))) {
+          return { kind: "offline_price_changed" as const }
         }
 
         const recipeRows =
@@ -1823,10 +1895,11 @@ export const inventoryRoute = new Hono()
           }
         }
 
-        const productSaleId = body.items.length > 0 ? uuidv4() : null
+        const saleCreatedAt = body.clientSale ? new Date(body.clientSale.createdAt) : new Date()
+        const productSaleId = body.items.length > 0 ? body.requestId ?? uuidv4() : null
         // Tarea 5.2 — El token del recibo se devuelve en la respuesta: el ticket impreso en caja
         // lleva el comprobante y los QRs de las consumiciones para canjear en barra.
-        const productReceiptToken = productSaleId ? randomUUID() : null
+        const productReceiptToken = productSaleId ? body.clientSale?.receiptToken ?? randomUUID() : null
         if (productSaleId != null) await tx.insert(sales).values({
           id: productSaleId,
           eventId: body.eventId,
@@ -1839,17 +1912,16 @@ export const inventoryRoute = new Hono()
           totalAmount: decToDb(total),
           paymentMethod: body.paymentMethod,
           status: "COMPLETED",
-          createdAt: new Date(),
+          createdAt: saleCreatedAt,
         })
 
         for (const line of body.items) {
-          const p = prodRows.find((x) => x.id === line.productId)!
           await tx.insert(saleItems).values({
             id: uuidv4(),
             saleId: productSaleId!,
             productId: line.productId,
             quantity: line.quantity,
-            priceAtTime: p.price,
+            priceAtTime: priceByProduct.get(line.productId)!,
           })
         }
 
@@ -1857,10 +1929,10 @@ export const inventoryRoute = new Hono()
         // los hashes en la respuesta para que la caja imprima el ticket con sus QRs y la barra
         // los canjee con el `redeem` existente (escáner lee el hash crudo).
         const printedConsumptions: { productName: string; qrHash: string }[] = []
-        for (const line of body.items) {
+        for (const [lineIndex, line] of body.items.entries()) {
           const p = prodRows.find((x) => x.id === line.productId)!
           for (let u = 0; u < line.quantity; u++) {
-            const qrHash = randomUUID()
+            const qrHash = body.clientSale?.lines[lineIndex]?.qrHashes[u] ?? randomUUID()
             await tx.insert(digitalConsumptions).values({
               id: uuidv4(),
               // Tarea 5.1 — La consumición queda a nombre del cliente cuando la venta lo tiene
@@ -1872,7 +1944,7 @@ export const inventoryRoute = new Hono()
               saleId: productSaleId!,
               qrHash,
               status: "PENDING",
-              createdAt: new Date(),
+              createdAt: saleCreatedAt,
             })
             printedConsumptions.push({ productName: p.name, qrHash })
           }
@@ -1898,8 +1970,8 @@ export const inventoryRoute = new Hono()
         let depositSaleId: string | null = null
         let depositReceiptToken: string | null = null
         if (balanceCharge.gt(0) && customerId != null) {
-          depositSaleId = uuidv4()
-          depositReceiptToken = randomUUID()
+          depositSaleId = productSaleId ? uuidv4() : body.requestId ?? uuidv4()
+          depositReceiptToken = productSaleId ? randomUUID() : body.clientSale?.receiptToken ?? randomUUID()
           await tx.insert(sales).values({
             id: depositSaleId,
             eventId: body.eventId,
@@ -1922,7 +1994,7 @@ export const inventoryRoute = new Hono()
                 dni: body.customerDni,
               },
             },
-            createdAt: new Date(),
+            createdAt: saleCreatedAt,
           })
           balanceAfter = await creditBalance(tx, {
             customerId,
@@ -1987,24 +2059,33 @@ export const inventoryRoute = new Hono()
             .where(eq(eventProducts.id, entry.rowId))
         }
 
-        return {
-          kind: "ok" as const,
+        const response: PosSaleReplayResponse = {
+          message: "Venta registrada",
           saleId: productSaleId ?? depositSaleId!,
           receiptToken: productReceiptToken ?? depositReceiptToken!,
           totalAmount: decToDb(total.plus(balanceCharge)),
+          createdAt: saleCreatedAt.toISOString(),
           productTotalAmount: decToDb(total),
-          eventId: body.eventId,
-          barId: saleBarId,
           customerId,
           consumptions: printedConsumptions,
-          inventoryItemIds:
-            needs.size > 0 ? [...needs.keys()] : ([] as string[]),
-          ...(depositSaleId != null
-            ? { depositSaleId, balanceCharge: decToDb(balanceCharge) }
-            : {}),
+          ...(depositSaleId != null ? { depositSaleId, balanceCharge: decToDb(balanceCharge) } : {}),
           ...(balanceAfter != null ? { balance: balanceAfter } : {}),
         }
+        if (body.requestId) await tx.update(posSaleRequests).set({ response })
+          .where(and(eq(posSaleRequests.id, body.requestId), eq(posSaleRequests.tenantId, tenantId)))
+        return {
+          kind: "ok" as const,
+          response,
+          eventId: body.eventId,
+          barId: saleBarId,
+          inventoryItemIds:
+            needs.size > 0 ? [...needs.keys()] : ([] as string[]),
+        }
       })
+
+      if (result.kind === "replay") return c.json(result.response, 200)
+      if (result.kind === "request_conflict") return c.json({ error: "El identificador de venta ya pertenece a otra operación" }, 409)
+      if (result.kind === "offline_price_changed") return c.json({ error: "El precio cambió desde que se armó el pedido. Revisá la venta pendiente antes de volver a cobrar." }, 409)
 
       if (result.kind === "bad_event") {
         return c.json({ error: "Evento no encontrado" }, 404)
@@ -2023,6 +2104,9 @@ export const inventoryRoute = new Hono()
       }
       if (result.kind === "bad_product") {
         return c.json({ error: "Uno o más productos no son válidos." }, 400)
+      }
+      if (result.kind === "product_not_in_menu") {
+        return c.json({ error: "Uno o más productos no están activos en el menú del evento. Recargá el catálogo." }, 400)
       }
       if (result.kind === "inactive_product") {
         return c.json(
@@ -2069,18 +2153,7 @@ export const inventoryRoute = new Hono()
         })
       }
 
-      return c.json(
-        {
-          message: "Venta registrada",
-          saleId: result.saleId,
-          // Tarea 5.2 — Token del recibo y QRs canjeables de la venta para el ticket impreso.
-          receiptToken: result.receiptToken,
-          totalAmount: result.totalAmount,
-          customerId: result.customerId,
-          consumptions: result.consumptions,
-        },
-        201
-      )
+      return c.json(result.response, 201)
     } catch (e) {
       if (e instanceof InsufficientStockError) {
         return c.json(
