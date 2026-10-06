@@ -40,3 +40,16 @@ export function buildMpAuthorizationUrl(
   })
   return `https://auth.mercadopago.com.ar/authorization?${params}`
 }
+
+/** La sesión del proveedor vive en el navegador, aunque Crow borre sus tokens. */
+export function buildMpConnectionUrl(
+  tenantId: string,
+  config: Pick<ReturnType<typeof getMpOAuthConfig>, "clientId" | "redirectUri">
+) {
+  const params = new URLSearchParams({
+    go: buildMpAuthorizationUrl(tenantId, config),
+  })
+  // Mercado Pago comparte el servicio de sesión de Mercado Libre. El logout
+  // en mercadopago.com.ar devuelve una página inexistente; usar el servicio central.
+  return `https://www.mercadolibre.com/jms/mla/lgz/logout?${params}`
+}

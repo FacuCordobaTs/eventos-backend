@@ -15,7 +15,7 @@ import { sendGuestCheckoutReceiptEmail } from "../lib/send-checkout-receipt-emai
 import { isMysqlDuplicateKey, processMercadoPagoPaymentNotification } from "../lib/mp-webhook"
 import { fulfillPendingGuestCheckout } from "../lib/client-checkout"
 import { PurchaseError } from "../lib/ticket-purchase"
-import { buildMpAuthorizationUrl, getMpOAuthConfig } from "../lib/mp-oauth-config"
+import { buildMpConnectionUrl, getMpOAuthConfig } from "../lib/mp-oauth-config"
 
 const MP_MARKETPLACE_FEE_RATE = 0.01
 const ADMIN_URL = process.env.ADMIN_URL || 'https://admin.crow.ar'
@@ -39,7 +39,7 @@ export const mercadopagoRoute = new Hono()
         clientId: config.clientId,
         redirectUri: config.redirectUri,
       })
-      return c.json({ url: buildMpAuthorizationUrl(tenantId, config) })
+      return c.json({ url: buildMpConnectionUrl(tenantId, config) })
     } catch (error) {
       console.error("[MP OAuth] Configuración inválida:", error instanceof Error ? error.message : "Error desconocido")
       return c.json({ error: "Mercado Pago no está configurado correctamente. Contactá al administrador de Crow." }, 503)

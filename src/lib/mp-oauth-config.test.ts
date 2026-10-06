@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { buildMpAuthorizationUrl, getMpOAuthConfig } from "./mp-oauth-config"
+import { buildMpAuthorizationUrl, buildMpConnectionUrl, getMpOAuthConfig } from "./mp-oauth-config"
 
 const env = {
   MP_CLIENT_ID: "123456789",
@@ -8,6 +8,24 @@ const env = {
 }
 
 describe("Configuración OAuth de Mercado Pago", () => {
+  test("conectar cierra la sesión anterior del proveedor antes de autorizar otra cuenta", () => {
+    const config = getMpOAuthConfig(env)
+    const connection = new URL(buildMpConnectionUrl("tenant-a", config))
+    expect(connection.origin).toBe("https://www.mercadolibre.com")
+    expect(connection.pathname).toBe("/jms/mla/lgz/logout")
+    expect(connection.searchParams.get("go")).toBe(buildMpAuthorizationUrl("tenant-a", config))
+    expect(connection.toString()).not.toContain(env.MP_CLIENT_SECRET)
+  })
+
+  test("el retorno del logout conserva el tenant y la URL registrada con sus parámetros", () => {
+    const config = getMpOAuthConfig({ ...env, MP_REDIRECT_URI: "https://api.example.com/oauth/callback?source=crow&mode=connect" })
+    const connection = new URL(buildMpConnectionUrl("tenant-b", config))
+    const authorization = new URL(connection.searchParams.get("go")!)
+    expect(authorization.searchParams.get("state")).toBe("tenant-b")
+    expect(authorization.searchParams.get("client_id")).toBe(config.clientId)
+    expect(authorization.searchParams.get("redirect_uri")).toBe(config.redirectUri)
+  })
+
   test("el enlace usa la misma configuración que el intercambio, sin exponer secretos", () => {
     const config = getMpOAuthConfig(env)
     const url = new URL(buildMpAuthorizationUrl("tenant-a", config))
