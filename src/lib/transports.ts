@@ -1,7 +1,7 @@
 import { z } from "zod"
 import { and, eq, sql } from "drizzle-orm"
 import type { MySql2Database } from "drizzle-orm/mysql2"
-import { saleTransports, sales } from "../db/schema"
+import { customers, saleTransports, sales } from "../db/schema"
 import { dec } from "./decimal-money"
 
 export async function transportRevenue<TSchema extends Record<string, unknown>>(
@@ -37,6 +37,42 @@ export const transportSchema = z.object({
     .refine((v) => dec(v).gt(0), "Ingresá un precio mayor a cero"),
   isActive: z.boolean().default(true)
 })
+
+export async function transportPassengerList<
+  TSchema extends Record<string, unknown>
+>(
+  db: MySql2Database<TSchema>,
+  scope: { tenantId: string; eventId: string; transportId?: string }
+) {
+  return db
+    .select({
+      id: saleTransports.id,
+      transportId: saleTransports.transportId,
+      name: saleTransports.name,
+      address: saleTransports.address,
+      quantity: saleTransports.quantity,
+      price: saleTransports.priceAtTime,
+      customerName: customers.name,
+      customerDni: customers.dni,
+      customerPhone: customers.phone
+    })
+    .from(saleTransports)
+    .innerJoin(sales, eq(sales.id, saleTransports.saleId))
+    .innerJoin(customers, eq(customers.id, sales.customerId))
+    .where(
+      and(
+        eq(saleTransports.tenantId, scope.tenantId),
+        eq(saleTransports.eventId, scope.eventId),
+        eq(sales.tenantId, scope.tenantId),
+        eq(sales.eventId, scope.eventId),
+        eq(sales.status, "COMPLETED"),
+        scope.transportId
+          ? eq(saleTransports.transportId, scope.transportId)
+          : undefined
+      )
+    )
+    .orderBy(customers.name, saleTransports.id)
+}
 
 export async function purchasedTransports(
   db: MySql2Database,

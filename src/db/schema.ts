@@ -1052,6 +1052,7 @@ export const eventTransports = mysqlTable('event_transports', {
   longitude: decimal('longitude', { precision: 10, scale: 7 }).notNull(),
   price: decimal('price', { precision: 10, scale: 2 }).notNull(),
   isActive: boolean('is_active').notNull().default(true),
+  driverManifestToken: varchar('driver_manifest_token', { length: 64 }).unique(),
   createdAt: timestamp('created_at').defaultNow(),
 }, (table) => ({ eventTenantIdx: index('event_transports_event_tenant_idx').on(table.eventId, table.tenantId) }));
 

@@ -7,6 +7,7 @@ let role = "ADMIN"
 let closed = false
 let inserted: Record<string, unknown>[] = []
 let queryParams: unknown[][] = []
+let manifestToken: string | null = null
 const db = {
   select: () => {
     let table = ""
@@ -32,7 +33,7 @@ const db = {
             params[1] === "tenant-a"
             ? [{ id: "event-a", status: closed ? "closed" : "on_sale" }]
             : table === "event_transports" && params[0] === "transport-a"
-              ? [{ id: "transport-a" }]
+              ? [{ id: "transport-a", driverManifestToken: manifestToken }]
               : []
         ).then(resolve)
     }
@@ -47,6 +48,8 @@ const db = {
     set: (row: Record<string, unknown>) => ({
       where: async () => {
         inserted.push(row)
+        if ("driverManifestToken" in row)
+          manifestToken = row.driverManifestToken as string | null
       }
     })
   }),
@@ -80,6 +83,7 @@ beforeEach(() => {
   closed = false
   inserted = []
   queryParams = []
+  manifestToken = null
 })
 describe("administración de transporte", () => {
   test("solamente ADMIN y MANAGER pueden leer o modificar", async () => {
@@ -122,5 +126,38 @@ describe("administración de transporte", () => {
     expect((await request("/event-a/transport-a", "PUT")).status).toBe(200)
     expect(queryParams[1]).toEqual(["transport-a", "event-a", "tenant-a"])
     expect((await request("/event-a/transport-other", "PUT")).status).toBe(404)
+  })
+  test("el link se crea bajo lock, se reutiliza y se puede desactivar", async () => {
+    const first = await request("/event-a/transport-a/driver-link")
+    expect(first.status).toBe(200)
+    const data = await first.json()
+    expect(data.token).toMatch(/^[a-f0-9]{64}$/)
+    expect(queryParams[0]).toEqual(["transport-a", "event-a", "tenant-a"])
+    const second = await request("/event-a/transport-a/driver-link")
+    expect((await second.json()).token).toBe(data.token)
+    expect(inserted).toHaveLength(1)
+    const disabled = await transportsRoute.request(
+      "/event-a/transport-a/driver-link",
+      { method: "DELETE" }
+    )
+    expect(disabled.status).toBe(200)
+    expect(manifestToken).toBeNull()
+    const regenerated = await request("/event-a/transport-a/driver-link")
+    expect((await regenerated.json()).token).not.toBe(data.token)
+  })
+  test("no genera ni desactiva links de un transporte ajeno", async () => {
+    expect((await request("/event-a/transport-other/driver-link")).status).toBe(
+      404
+    )
+    expect(
+      (
+        await transportsRoute.request("/event-a/transport-other/driver-link", {
+          method: "DELETE"
+        })
+      ).status
+    ).toBe(404)
+    expect(inserted).toHaveLength(0)
+    role = "SECURITY"
+    expect((await request("/event-a/transport-a/driver-link")).status).toBe(403)
   })
 })

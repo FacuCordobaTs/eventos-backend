@@ -2,17 +2,11 @@ import { Hono } from "hono"
 import { zValidator } from "@hono/zod-validator"
 import { and, eq } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
-import { randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { pool } from "../db"
-import {
-  customers,
-  events,
-  eventTransports,
-  sales,
-  saleTransports
-} from "../db/schema"
+import { events, eventTransports } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { transportSchema } from "../lib/transports"
+import { transportPassengerList, transportSchema } from "../lib/transports"
 import { decToDb, dec } from "../lib/decimal-money"
 
 export const transportsRoute = new Hono()
@@ -47,30 +41,65 @@ export const transportsRoute = new Hono()
         )
       )
       .orderBy(eventTransports.createdAt)
-    const bookings = await db
-      .select({
-        id: saleTransports.id,
-        transportId: saleTransports.transportId,
-        name: saleTransports.name,
-        quantity: saleTransports.quantity,
-        price: saleTransports.priceAtTime,
-        customerName: customers.name,
-        customerDni: customers.dni,
-        customerPhone: customers.phone
-      })
-      .from(saleTransports)
-      .innerJoin(sales, eq(sales.id, saleTransports.saleId))
-      .innerJoin(customers, eq(customers.id, sales.customerId))
-      .where(
-        and(
-          eq(saleTransports.tenantId, tenantId),
-          eq(saleTransports.eventId, eventId),
-          eq(sales.tenantId, tenantId),
-          eq(sales.eventId, eventId),
-          eq(sales.status, "COMPLETED")
-        )
-      )
+    const bookings = await transportPassengerList(db, { tenantId, eventId })
     return c.json({ transports, bookings })
+  })
+  .post("/:eventId/:transportId/driver-link", async (c) => {
+    const tenantId = (c as unknown as AuthenticatedContext).staff.tenantId!
+    const eventId = c.req.param("eventId")
+    const transportId = c.req.param("transportId")
+    const db = drizzle(pool)
+    const token = await db.transaction(async (tx) => {
+      const scope = and(
+        eq(eventTransports.id, transportId),
+        eq(eventTransports.eventId, eventId),
+        eq(eventTransports.tenantId, tenantId)
+      )
+      const [transport] = await tx
+        .select()
+        .from(eventTransports)
+        .where(scope)
+        .limit(1)
+        .for("update")
+      if (!transport) return null
+      if (transport.driverManifestToken) return transport.driverManifestToken
+      const token = randomBytes(32).toString("hex")
+      await tx
+        .update(eventTransports)
+        .set({ driverManifestToken: token })
+        .where(scope)
+      return token
+    })
+    if (!token) return c.json({ error: "Transporte no encontrado" }, 404)
+    c.header("Cache-Control", "no-store")
+    return c.json({ token })
+  })
+  .delete("/:eventId/:transportId/driver-link", async (c) => {
+    const tenantId = (c as unknown as AuthenticatedContext).staff.tenantId!
+    const eventId = c.req.param("eventId")
+    const transportId = c.req.param("transportId")
+    const db = drizzle(pool)
+    const found = await db.transaction(async (tx) => {
+      const scope = and(
+        eq(eventTransports.id, transportId),
+        eq(eventTransports.eventId, eventId),
+        eq(eventTransports.tenantId, tenantId)
+      )
+      const [transport] = await tx
+        .select({ id: eventTransports.id })
+        .from(eventTransports)
+        .where(scope)
+        .limit(1)
+        .for("update")
+      if (!transport) return false
+      await tx
+        .update(eventTransports)
+        .set({ driverManifestToken: null })
+        .where(scope)
+      return true
+    })
+    if (!found) return c.json({ error: "Transporte no encontrado" }, 404)
+    return c.json({ disabled: true })
   })
   .post("/:eventId", zValidator("json", transportSchema), async (c) => {
     const tenantId = (c as unknown as AuthenticatedContext).staff.tenantId!
@@ -87,17 +116,15 @@ export const transportsRoute = new Hono()
       if (!event) return "missing" as const
       if (event.status === "closed") return "closed" as const
       const id = randomUUID()
-      await tx
-        .insert(eventTransports)
-        .values({
-          ...input,
-          id,
-          tenantId,
-          eventId,
-          price: decToDb(dec(input.price)),
-          latitude: input.latitude.toFixed(7),
-          longitude: input.longitude.toFixed(7)
-        })
+      await tx.insert(eventTransports).values({
+        ...input,
+        id,
+        tenantId,
+        eventId,
+        price: decToDb(dec(input.price)),
+        latitude: input.latitude.toFixed(7),
+        longitude: input.longitude.toFixed(7)
+      })
       return { id }
     })
     if (outcome === "missing")

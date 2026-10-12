@@ -4,6 +4,7 @@ import { tenantsRoute } from "./routes/tenants"
 import { staffRoute } from "./routes/staff"
 import { eventsRoute } from "./routes/events"
 import { transportsRoute } from "./routes/transports"
+import { transportManifestsRoute } from "./routes/transport-manifests"
 import { ticketsRoute } from "./routes/tickets"
 import { publicRoute } from "./routes/public"
 import { inventoryRoute } from "./routes/inventory"
@@ -21,7 +22,12 @@ import { websocket as honoWebsocket, serveStatic } from "hono/bun"
 
 const app = new Hono()
 
-app.use(logger())
+const requestLogger = logger()
+app.use("*", (c, next) => {
+  // The manifest token grants access to passenger details; keep it out of request logs.
+  if (c.req.path.startsWith("/public/transport-manifests/")) return next()
+  return requestLogger(c, next)
+})
 
 app.use(
   "/*",
@@ -55,6 +61,7 @@ app.route("/staff", staffRoute)
 app.route("/events", eventsRoute)
 app.route("/event-transports", transportsRoute)
 app.route("/tickets", ticketsRoute)
+app.route("/public/transport-manifests", transportManifestsRoute)
 app.route("/public", publicRoute)
 app.route("/inventory", inventoryRoute)
 app.route("/analytics", analyticsRoute)
