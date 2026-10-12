@@ -9,6 +9,7 @@ let inserted: Record<string, unknown>[] = []
 let queryParams: unknown[][] = []
 let manifestToken: string | null = null
 const db = {
+  selectDistinct: () => { const empty: Record<string, unknown> = {}; for (const method of ["from", "innerJoin", "where"]) empty[method] = () => empty; empty.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve([]).then(resolve); return empty },
   select: () => {
     let table = ""
     let params: unknown[] = []

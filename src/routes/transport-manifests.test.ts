@@ -7,6 +7,7 @@ let active = true
 let failed = false
 let queries: { table: string; params: unknown[] }[] = []
 const db = {
+  selectDistinct: () => { const empty: Record<string, unknown> = {}; for (const method of ["from", "innerJoin", "where"]) empty[method] = () => empty; empty.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve([]).then(resolve); return empty },
   select: () => {
     let table = ""
     let params: unknown[] = []
@@ -50,7 +51,9 @@ const db = {
                     {
                       id: "booking-a",
                       name: "Salida",
-                      quantity: 3,
+                      quantity: 1,
+                      status: "PENDING",
+                      boardedAt: null,
                       price: "18000.00",
                       customerName: "Ana",
                       customerDni: "12345678",
@@ -87,7 +90,9 @@ describe("lista del chofer", () => {
         name: "Ana",
         dni: "12345678",
         phone: "1155550000",
-        quantity: 3
+        quantity: 1,
+        status: "PENDING",
+        boardedAt: null
       }
     ])
     expect(data.passengers[0].price).toBeUndefined()
@@ -98,6 +103,8 @@ describe("lista del chofer", () => {
       "tenant-a",
       "event-a",
       "COMPLETED",
+      "tenant-a",
+      "event-a",
       "transport-a"
     ])
   })

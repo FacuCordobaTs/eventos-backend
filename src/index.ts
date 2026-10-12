@@ -4,6 +4,7 @@ import { tenantsRoute } from "./routes/tenants"
 import { staffRoute } from "./routes/staff"
 import { eventsRoute } from "./routes/events"
 import { transportsRoute } from "./routes/transports"
+import { transportTicketsRoute } from "./routes/transport-tickets"
 import { transportManifestsRoute } from "./routes/transport-manifests"
 import { ticketsRoute } from "./routes/tickets"
 import { publicRoute } from "./routes/public"
@@ -60,6 +61,7 @@ app.route("/tenants", tenantsRoute)
 app.route("/staff", staffRoute)
 app.route("/events", eventsRoute)
 app.route("/event-transports", transportsRoute)
+app.route("/transport-tickets", transportTicketsRoute)
 app.route("/tickets", ticketsRoute)
 app.route("/public/transport-manifests", transportManifestsRoute)
 app.route("/public", publicRoute)

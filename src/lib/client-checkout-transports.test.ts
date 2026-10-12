@@ -55,6 +55,7 @@ function fixture() {
           return chain
         },
         limit: () => chain,
+        orderBy: () => chain,
         for: () => {
           locks.push(table)
           return chain
@@ -137,6 +138,9 @@ describe("checkout con transporte", () => {
       expect(rows.sales[0].paid).toBe(true)
       expect(rows.sales[0].status).toBe("COMPLETED")
       expect(rows.tickets).toHaveLength(1)
+      expect(rows.transport_tickets).toHaveLength(1)
+      expect(rows.transport_tickets[0].ticketId).toBe(rows.tickets[0].id)
+      expect(rows.transport_tickets[0].qrHash).not.toBe(rows.tickets[0].qrHash)
       expect(rows.sale_transports).toHaveLength(1)
       expect(rows.sale_transports[0].address).toBe("Av. 7 de Marzo 1800")
     })
@@ -148,6 +152,7 @@ describe("checkout con transporte", () => {
       paymentMethod: "SALDO"
     })
     expect(result.balance).toBe("72000.00")
+    expect(rows.transport_tickets).toHaveLength(1)
     expect(rows.balance_movements[0].amount).toBe("28000.00")
     expect(rows.sales[0].paid).toBe(true)
     expect(rows.sale_transports).toHaveLength(1)

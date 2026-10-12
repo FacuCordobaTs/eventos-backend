@@ -42,6 +42,7 @@ const roleEnum = z.enum([
   "MANAGER",
   "BARTENDER",
   "SECURITY",
+  "TRANSPORTER",
   "PROMOTER",
   "GENERAL_PROMOTER",
 ])

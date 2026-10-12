@@ -16,6 +16,9 @@ let claimResult: unknown
 let createResult: unknown
 let cancelResult: unknown
 let previewResult: unknown
+let busClaimResult: unknown
+let busCreateResult: unknown
+let busPreviewResult: unknown
 // Efectos que el canje dispara después de responder: nada sale de verdad en los tests.
 const emails: Record<string, unknown>[] = []
 let emailFails = false
@@ -32,6 +35,7 @@ function fakeDb() {
     Promise.resolve(selectQueue.shift() ?? []).then(resolve, reject)
   return {
     select: () => chain,
+    selectDistinct: () => { const empty: Record<string, unknown> = {}; for (const method of ["from", "innerJoin", "where"]) empty[method] = () => empty; empty.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve([]).then(resolve); return empty },
     update: () => ({
       set: (values: Record<string, unknown>) => ({
         where: async () => {
@@ -46,6 +50,7 @@ mock.module("../db", () => ({ pool: {} }))
 mock.module("drizzle-orm/mysql2", () => ({ drizzle: () => fakeDb() }))
 mock.module("../lib/send-checkout-receipt-email", () => ({
   ...realMailer,
+  sendTransportQrEmail: async (input: Record<string, unknown>) => { emails.push(input) },
   sendManualTicketQrEmail: async (input: Record<string, unknown>) => {
     emails.push(input)
     if (emailFails) throw new Error("Resend caído")
@@ -75,6 +80,13 @@ mock.module("../lib/ticket-shares", () => ({
   ownerReceiptTokens: async () => ownerTokens,
 }))
 
+mock.module("../lib/transport-shares", () => ({
+  createTransportShare: async (...args: unknown[]) => { calls.create.push(args); return busCreateResult ?? { ok: false, code: "SHARE_NOT_FOUND" } },
+  cancelTransportShare: async () => ({ ok: false, code: "SHARE_NOT_FOUND" }),
+  getTransportSharePreview: async () => busPreviewResult ?? null,
+  claimTransportShare: async () => busClaimResult ?? { ok: false, code: "SHARE_NOT_FOUND" },
+  loadAllOwnerShares: async () => ({ canShare: false, eligible: [], links: [] }),
+}))
 const { publicRoute } = await import("./public")
 
 /** Los efectos posteriores a la respuesta se disparan sin esperar: se deja correr la cola. */
@@ -123,6 +135,9 @@ beforeEach(() => {
   createResult = undefined
   cancelResult = undefined
   previewResult = null
+  busClaimResult = null
+  busCreateResult = null
+  busPreviewResult = null
   emails.length = 0
   emailFails = false
   broadcasts.length = 0
@@ -299,6 +314,9 @@ describe("Reclamar: límites", () => {
 describe("Vista previa del link", () => {
   test("un link inexistente es 404", async () => {
     previewResult = null
+  busClaimResult = null
+  busCreateResult = null
+  busPreviewResult = null
     const res = await publicRoute.request("/ticket-shares/nope")
     expect(res.status).toBe(404)
     expect((await res.json()).code).toBe("SHARE_NOT_FOUND")
@@ -372,6 +390,7 @@ describe("Armar y cancelar: credenciales del dueño", () => {
       tenantId: "tenant-1",
       ticketTypeId: "type-1",
       quantity: 2,
+      includeTransport: false,
     })
   })
 
@@ -463,4 +482,34 @@ describe("Armar y cancelar: credenciales del dueño", () => {
     expect(anonymous.status).toBe(404)
     expect(calls.cancel).toHaveLength(1)
   })
+})
+
+
+test("el mismo endpoint crea un link de pasaje solo, sin exigir tipo de entrada", async () => {
+  selectQueue = [[{ customerId: "owner-1", eventId: "event-1", tenantId: "tenant-1", status: "COMPLETED" }]]
+  busCreateResult = { ok: true, share: { id: "bus-link", token: "bus-token", kind: "transport" } }
+  const transportId = "22222222-2222-4222-8222-222222222222"
+  const response = await post("/ticket-shares", { receiptToken: "receipt", transportId, quantity: 1 })
+  expect(response.status).toBe(201)
+  expect((await response.json()).share.kind).toBe("transport")
+  expect(calls.create[0]?.[1]).toMatchObject({ transportId, quantity: 1, customerId: "owner-1", tenantId: "tenant-1", eventId: "event-1" })
+})
+test("un pasaje solo se reclama por el link de amigos y recibe QR y email propios", async () => {
+  claimResult = { ok: false, code: "SHARE_NOT_FOUND" }
+  const transport = { id: "bus-pass", qrHash: "bus-qr", name: "Desde Santo Tomé", address: "7 de Marzo", latitude: "-31.66", longitude: "-60.76", price: "18000.00", transportId: "bus", quantity: 1, status: "PENDING" }
+  busClaimResult = { ok: true, claimed: { ...CLAIMED, kind: "transport", ticketId: "bus-pass", qrHash: "bus-qr", transport, claimant: { customerId: "friend", name: "María García", email: "maria@example.com", createdNow: false } } }
+  const response = await post("/ticket-shares/bus-token/claim", VALID_CLAIM)
+  expect(response.status).toBe(201)
+  expect(await response.json()).toMatchObject({ kind: "transport", transport: { qrHash: "bus-qr" }, session: null })
+  await settle()
+  expect(emails).toHaveLength(1)
+  expect(emails[0].pass).toMatchObject({ id: "bus-pass", qrHash: "bus-qr" })
+  expect(dbUpdates).toHaveLength(0)
+})
+test("una sesión con pasaje transferido habilita su evento aunque no tenga entradas", async () => {
+  const token = await createAccessToken("friend", "customer")
+  selectQueue = [[{ id: "friend", name: "Ana", email: "ana@example.com", isActive: true }], [{ tenantId: "tenant-1" }], [], [], [], [{ id: "bus-pass" }]]
+  busCreateResult = { ok: true, share: { id: "next", token: "next", kind: "transport" } }
+  const response = await post("/ticket-shares", { customerToken: token, eventId: "event-1", transportId: "22222222-2222-4222-8222-222222222222", quantity: 1 })
+  expect(response.status).toBe(201)
 })

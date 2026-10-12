@@ -186,7 +186,7 @@ export function TicketEmail({
                   color: color.paperMuted,
                 }}
               >
-                Entrada
+                {item.name.startsWith("Colectivo") ? "Pasaje de colectivo" : item.name.startsWith("Consumo") ? "Consumo" : "Entrada"}
               </Text>
               <Text
                 style={{

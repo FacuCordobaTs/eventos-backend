@@ -11,6 +11,9 @@ import {
   ticketTransfers,
   ticketTypes,
   tickets,
+  transportTickets,
+  transportTransfers,
+  saleTransports,
 } from "../db/schema"
 import { normalizeWhatsAppPhone } from "./whatsapp-service"
 
@@ -148,6 +151,8 @@ export function isTicketDeliverable(
 export type ShareLinkStatus = "ACTIVE" | "COMPLETED" | "CANCELLED"
 
 export type ShareLinkDto = {
+  kind?: "ticket" | "transport"
+  includesTransport?: boolean
   id: string
   token: string
   ticketTypeName: string
@@ -304,6 +309,7 @@ export async function loadOwnerShares(
     const transferRows = await db
       .select({
         shareId: ticketTransfers.shareId,
+        transportTicketId: ticketTransfers.transportTicketId,
         status: ticketTransfers.status,
         claimedAt: ticketTransfers.claimedAt,
         claimantName: ticketTransfers.toName,
@@ -345,6 +351,7 @@ export async function loadOwnerShares(
           id: share.id,
           token: share.token,
           ticketTypeName,
+          includesTransport: transferRows.some((row) => row.shareId === share.id && !!row.transportTicketId),
           ...summary,
           createdAt: share.createdAt ? share.createdAt.toISOString() : null,
         },
@@ -384,6 +391,7 @@ export type CreateShareInput = {
   tenantId: string
   ticketTypeId: string
   quantity: number
+  includeTransport?: boolean
 }
 
 export type CreateShareResult =
@@ -463,7 +471,15 @@ export async function createTicketShare(db: Db, input: CreateShareInput): Promis
               )
             )
     const reserved = new Set(reservedRows.map((r) => r.ticketId))
-    const free = candidates.filter((c) => !reserved.has(c.id))
+    let free = candidates.filter((c) => !reserved.has(c.id))
+    const paired = new Map<string, string>()
+    if (input.includeTransport) {
+      const passes = await tx.select({ id: transportTickets.id, ticketId: transportTickets.ticketId }).from(transportTickets).innerJoin(saleTransports, eq(saleTransports.id, transportTickets.bookingId)).innerJoin(sales, eq(sales.id, saleTransports.saleId)).where(and(eq(transportTickets.customerId, customerId), eq(transportTickets.eventId, eventId), eq(transportTickets.tenantId, tenantId), eq(transportTickets.status, "PENDING"), eq(sales.status, "COMPLETED"))).for("update")
+      const reservedBus = await tx.select({ id: transportTransfers.transportTicketId }).from(transportTransfers).where(eq(transportTransfers.status, "PENDING"))
+      const busyBus = new Set(reservedBus.map((r) => r.id))
+      for (const pass of passes) if (pass.ticketId && !busyBus.has(pass.id)) paired.set(pass.ticketId, pass.id)
+      free = free.filter((ticket) => paired.has(ticket.id))
+    }
     if (free.length < quantity) return { ok: false as const, code: "NOT_ENOUGH_TICKETS" as const }
 
     const shareId = uuidv4()
@@ -483,6 +499,7 @@ export async function createTicketShare(db: Db, input: CreateShareInput): Promis
         id: uuidv4(),
         shareId,
         ticketId: ticket.id,
+        transportTicketId: paired.get(ticket.id) ?? null,
         tenantId,
         eventId,
         fromCustomerId: customerId,
@@ -498,6 +515,7 @@ export async function createTicketShare(db: Db, input: CreateShareInput): Promis
         id: shareId,
         token,
         ticketTypeName: type.name,
+        ...(input.includeTransport ? { includesTransport: true } : {}),
         total: quantity,
         claimed: 0,
         pending: quantity,
@@ -554,6 +572,8 @@ export async function cancelTicketShare(
 export type SharePreviewState = "AVAILABLE" | "SOLD_OUT" | "CANCELLED" | "EVENT_CLOSED"
 
 export type SharePreview = {
+  kind?: "ticket" | "transport"
+  includesTransport?: boolean
   state: SharePreviewState
   /** Nombre de pila de quien armó el link. */
   hostName: string
@@ -603,6 +623,7 @@ export async function getSharePreview(db: Db, token: string): Promise<SharePrevi
   const transferRows = await db
     .select({
       status: ticketTransfers.status,
+      transportTicketId: ticketTransfers.transportTicketId,
       ticketStatus: tickets.status,
       ticketCustomerId: tickets.customerId,
     })
@@ -635,6 +656,7 @@ export async function getSharePreview(db: Db, token: string): Promise<SharePrevi
 
   return {
     state,
+    includesTransport: transferRows.some((r) => !!r.transportTicketId),
     hostName: firstNameOf(row.ownerName),
     event: {
       id: row.eventId,
@@ -663,7 +685,9 @@ export type ClaimInput = {
 }
 
 export type ClaimedTicket = {
+  kind?: "ticket" | "transport"
   ticketId: string
+  transport?: { buyerName: string; boardedAt: null; id: string; qrHash: string; name: string; address: string; latitude: string; longitude: string; price: string; quantity: number; transportId: string; status: "PENDING" }
   qrHash: string
   ticketType: { name: string; validFrom: Date | null; validUntil: Date | null }
   event: SharePreview["event"]
@@ -734,6 +758,7 @@ export async function claimTicketShare(
         .select({
           transferId: ticketTransfers.id,
           ticketId: ticketTransfers.ticketId,
+          transportTicketId: ticketTransfers.transportTicketId,
           ticketStatus: tickets.status,
           ticketCustomerId: tickets.customerId,
         })
@@ -743,7 +768,7 @@ export async function claimTicketShare(
         .orderBy(asc(ticketTransfers.position))
 
       const stale: string[] = []
-      const candidates: { transferId: string; ticketId: string }[] = []
+      const candidates: { transferId: string; ticketId: string; transportTicketId?: string | null }[] = []
       for (const row of pendingRows) {
         const deliverable = isTicketDeliverable(
           { status: row.ticketStatus, customerId: row.ticketCustomerId },
@@ -812,7 +837,7 @@ export async function claimTicketShare(
       // Entrega: UPDATE condicional. Si entre la lectura y acá la entrada cambió de manos o se
       // usó, ese cupo se anula y se prueba con el siguiente.
       const newQrHash = randomUUID()
-      let delivered: { transferId: string; ticketId: string } | null = null
+      let delivered: { transferId: string; ticketId: string; transportTicketId?: string | null } | null = null
       for (const candidate of candidates) {
         const [result] = await tx
           .update(tickets)
@@ -843,6 +868,14 @@ export async function claimTicketShare(
       }
       if (!delivered) throw new ClaimAbort("SOLD_OUT")
 
+      let transport: ClaimedTicket["transport"]
+      if (delivered.transportTicketId) {
+        const [pass] = await tx.select({ pass: transportTickets, booking: saleTransports, saleStatus: sales.status }).from(transportTickets).innerJoin(saleTransports, eq(saleTransports.id, transportTickets.bookingId)).innerJoin(sales, eq(sales.id, saleTransports.saleId)).where(and(eq(transportTickets.id, delivered.transportTicketId), eq(transportTickets.customerId, share.ownerCustomerId), eq(transportTickets.tenantId, share.tenantId), eq(transportTickets.eventId, share.eventId))).limit(1).for("update")
+        if (!pass || pass.pass.status !== "PENDING" || pass.saleStatus !== "COMPLETED") throw new ClaimAbort("SOLD_OUT")
+        const qrHash = randomUUID()
+        await tx.update(transportTickets).set({ customerId, buyerName: fullName, buyerDni: input.dni, buyerPhone: input.phone, qrHash }).where(eq(transportTickets.id, pass.pass.id))
+        transport = { buyerName: fullName, boardedAt: null, id: pass.pass.id, qrHash, name: pass.booking.name, address: pass.booking.address, latitude: pass.booking.latitude, longitude: pass.booking.longitude, price: pass.booking.priceAtTime, quantity: 1, transportId: pass.booking.transportId, status: "PENDING" }
+      }
       try {
         await tx
           .update(ticketTransfers)
@@ -858,6 +891,7 @@ export async function claimTicketShare(
         ok: true,
         claimed: {
           ticketId: delivered.ticketId,
+          ...(transport ? { transport } : {}),
           qrHash: newQrHash,
           ticketType: type,
           event: {
@@ -892,7 +926,7 @@ export async function claimTicketShare(
  * Dos pedidos pueden querer crear el mismo DNI a la vez: el segundo choca con el unique y se
  * resuelve leyendo la ficha que ganó.
  */
-async function insertClaimantCustomer(
+export async function insertClaimantCustomer(
   tx: Tx,
   input: { name: string; email: string; phone: string; dni: string }
 ): Promise<{ id: string; createdNow: boolean }> {

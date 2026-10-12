@@ -50,7 +50,7 @@ export const staff = mysqlTable(
      * invitación, ve sólo los eventos a los que fue asignado y, dentro de ellos, administra
      * únicamente los promotores que él mismo dio de alta (`promoters.owner_staff_id`).
      */
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
@@ -597,6 +597,7 @@ export const ticketTransfers = mysqlTable(
     id: varchar('id', { length: 36 }).primaryKey(),
     shareId: varchar('share_id', { length: 36 }).notNull().references(() => ticketShares.id),
     ticketId: varchar('ticket_id', { length: 36 }).notNull().references(() => tickets.id),
+    transportTicketId: varchar('transport_ticket_id', { length: 36 }).references(() => transportTickets.id),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
     fromCustomerId: varchar('from_customer_id', { length: 36 }).notNull().references(() => customers.id),
@@ -617,6 +618,7 @@ export const ticketTransfers = mysqlTable(
   (table) => ({
     shareStatusIdx: index('ticket_transfers_share_status_idx').on(table.shareId, table.status, table.position),
     ticketStatusIdx: index('ticket_transfers_ticket_status_idx').on(table.ticketId, table.status),
+    transportStatusIdx: index('ticket_transfers_transport_status_idx').on(table.transportTicketId, table.status),
     toCustomerIdx: index('ticket_transfers_to_customer_idx').on(table.toCustomerId),
     eventTenantIdx: index('ticket_transfers_event_tenant_idx').on(table.eventId, table.tenantId),
     // Una persona reclama una sola entrada por link (varias filas con `to_customer_id` NULL son válidas).
@@ -1075,6 +1077,56 @@ export const saleTransports = mysqlTable('sale_transports', {
   eventTenantIdx: index('sale_transports_event_tenant_idx').on(table.eventId, table.tenantId),
 }));
 
+export const transportTickets = mysqlTable('transport_tickets', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  bookingId: varchar('booking_id', { length: 36 }).notNull().references(() => saleTransports.id),
+  unitIndex: int('unit_index').notNull(),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+  customerId: varchar('customer_id', { length: 36 }).notNull().references(() => customers.id),
+  ticketId: varchar('ticket_id', { length: 36 }).references(() => tickets.id),
+  buyerName: varchar('buyer_name', { length: 255 }).notNull(),
+  buyerDni: varchar('buyer_dni', { length: 20 }),
+  buyerPhone: varchar('buyer_phone', { length: 255 }),
+  qrHash: varchar('qr_hash', { length: 64 }).notNull().unique(),
+  status: mysqlEnum('status', ['PENDING', 'USED', 'CANCELLED']).notNull().default('PENDING'),
+  boardedAt: timestamp('boarded_at'),
+  boardedBy: varchar('boarded_by', { length: 36 }).references(() => staff.id),
+  createdAt: timestamp('created_at').defaultNow(),
+}, (table) => ({
+  bookingUnitUnique: uniqueIndex('transport_tickets_booking_unit_unique').on(table.bookingId, table.unitIndex),
+  ticketUnique: uniqueIndex('transport_tickets_ticket_unique').on(table.ticketId),
+  ownerEventIdx: index('transport_tickets_owner_event_idx').on(table.customerId, table.eventId),
+  eventTenantIdx: index('transport_tickets_event_tenant_idx').on(table.eventId, table.tenantId),
+}));
+
+export const transportShares = mysqlTable('transport_shares', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+  transportId: varchar('transport_id', { length: 36 }).notNull().references(() => eventTransports.id),
+  ownerCustomerId: varchar('owner_customer_id', { length: 36 }).notNull().references(() => customers.id),
+  token: varchar('token', { length: 64 }).notNull().unique(),
+  cancelledAt: timestamp('cancelled_at'),
+  createdAt: timestamp('created_at').defaultNow(),
+}, (table) => ({ ownerEventIdx: index('transport_shares_owner_event_idx').on(table.ownerCustomerId, table.eventId) }));
+
+export const transportTransfers = mysqlTable('transport_transfers', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  shareId: varchar('share_id', { length: 36 }).notNull().references(() => transportShares.id),
+  transportTicketId: varchar('transport_ticket_id', { length: 36 }).notNull().references(() => transportTickets.id),
+  fromCustomerId: varchar('from_customer_id', { length: 36 }).notNull().references(() => customers.id),
+  toCustomerId: varchar('to_customer_id', { length: 36 }).references(() => customers.id),
+  toName: varchar('to_name', { length: 255 }),
+  position: int('position').notNull(),
+  status: mysqlEnum('status', ['PENDING', 'CLAIMED', 'VOID']).notNull().default('PENDING'),
+  claimedAt: timestamp('claimed_at'),
+}, (table) => ({
+  shareStatusIdx: index('transport_transfers_share_status_idx').on(table.shareId, table.status),
+  ticketStatusIdx: index('transport_transfers_ticket_status_idx').on(table.transportTicketId, table.status),
+  claimantUnique: uniqueIndex('transport_transfers_claimant_unique').on(table.shareId, table.toCustomerId),
+}));
+
 export const digitalConsumptions = mysqlTable('digital_consumptions', {
   id: varchar('id', { length: 36 }).primaryKey(),
   /** Null cuando la consumición proviene del POS (venta sin cliente en app). */
@@ -1218,7 +1270,7 @@ export const staffInvitations = mysqlTable(
   {
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER']).notNull(),
     // Datos del destinatario: permiten identificar la invitación y enviarla por WhatsApp.
     inviteeName: varchar('invitee_name', { length: 255 }),
     inviteePhone: varchar('invitee_phone', { length: 32 }),

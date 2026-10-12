@@ -46,6 +46,14 @@ export const authMiddleware = async (c: Context, next: Next) => {
       return c.json({ error: "Cuenta desactivada" }, 401)
     }
 
+    // A transport session can only access its own profile and assigned boarding operations.
+    if (staff.role === "TRANSPORTER" &&
+      !c.req.path.startsWith("/transport-tickets/") &&
+      c.req.path !== "/staff/me" && c.req.path !== "/staff/me/shift" &&
+      !/^\/staff\/device-links\/[^/]+\/approve$/.test(c.req.path)) {
+      return c.json({ error: "No tenés permiso para esta operación" }, 403)
+    }
+
     ;(c as AuthenticatedContext).staff = {
       id: staff.id,
       email: staff.email,

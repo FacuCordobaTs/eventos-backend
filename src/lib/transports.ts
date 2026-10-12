@@ -1,7 +1,8 @@
 import { z } from "zod"
 import { and, eq, sql } from "drizzle-orm"
 import type { MySql2Database } from "drizzle-orm/mysql2"
-import { customers, saleTransports, sales } from "../db/schema"
+import { saleTransports, sales, transportTickets } from "../db/schema"
+import { ensureEventTransportTickets } from "./transport-tickets"
 import { dec } from "./decimal-money"
 
 export async function transportRevenue<TSchema extends Record<string, unknown>>(
@@ -44,21 +45,24 @@ export async function transportPassengerList<
   db: MySql2Database<TSchema>,
   scope: { tenantId: string; eventId: string; transportId?: string }
 ) {
+  await ensureEventTransportTickets(db, scope)
   return db
     .select({
-      id: saleTransports.id,
+      id: transportTickets.id,
       transportId: saleTransports.transportId,
       name: saleTransports.name,
       address: saleTransports.address,
-      quantity: saleTransports.quantity,
+      quantity: sql<number>`1`,
       price: saleTransports.priceAtTime,
-      customerName: customers.name,
-      customerDni: customers.dni,
-      customerPhone: customers.phone
+      customerName: transportTickets.buyerName,
+      customerDni: transportTickets.buyerDni,
+      customerPhone: transportTickets.buyerPhone,
+      status: transportTickets.status,
+      boardedAt: transportTickets.boardedAt
     })
     .from(saleTransports)
     .innerJoin(sales, eq(sales.id, saleTransports.saleId))
-    .innerJoin(customers, eq(customers.id, sales.customerId))
+    .innerJoin(transportTickets, eq(transportTickets.bookingId, saleTransports.id))
     .where(
       and(
         eq(saleTransports.tenantId, scope.tenantId),
@@ -66,12 +70,15 @@ export async function transportPassengerList<
         eq(sales.tenantId, scope.tenantId),
         eq(sales.eventId, scope.eventId),
         eq(sales.status, "COMPLETED"),
+        eq(transportTickets.tenantId, scope.tenantId),
+        eq(transportTickets.eventId, scope.eventId),
+        sql`${transportTickets.status} <> 'CANCELLED'`,
         scope.transportId
           ? eq(saleTransports.transportId, scope.transportId)
           : undefined
       )
     )
-    .orderBy(customers.name, saleTransports.id)
+    .orderBy(transportTickets.buyerName, transportTickets.id)
 }
 
 export async function purchasedTransports(
@@ -83,19 +90,25 @@ export async function purchasedTransports(
     saleId?: string
   }
 ) {
+  await ensureEventTransportTickets(db, scope)
   return db
     .select({
-      id: saleTransports.id,
+      id: transportTickets.id,
       transportId: saleTransports.transportId,
       name: saleTransports.name,
       address: saleTransports.address,
       latitude: saleTransports.latitude,
       longitude: saleTransports.longitude,
-      quantity: saleTransports.quantity,
+      qrHash: transportTickets.qrHash,
+      status: transportTickets.status,
+      boardedAt: transportTickets.boardedAt,
+      buyerName: transportTickets.buyerName,
+      quantity: sql<number>`1`,
       price: saleTransports.priceAtTime
     })
     .from(saleTransports)
     .innerJoin(sales, eq(sales.id, saleTransports.saleId))
+    .innerJoin(transportTickets, eq(transportTickets.bookingId, saleTransports.id))
     .where(
       and(
         eq(saleTransports.tenantId, scope.tenantId),
@@ -103,9 +116,12 @@ export async function purchasedTransports(
         eq(sales.tenantId, scope.tenantId),
         eq(sales.eventId, scope.eventId),
         eq(sales.status, "COMPLETED"),
+        eq(transportTickets.tenantId, scope.tenantId),
+        eq(transportTickets.eventId, scope.eventId),
+        sql`${transportTickets.status} <> 'CANCELLED'`,
         scope.customerId
-          ? eq(sales.customerId, scope.customerId)
-          : eq(sales.id, scope.saleId ?? "")
+          ? eq(transportTickets.customerId, scope.customerId)
+          : and(eq(sales.id, scope.saleId ?? ""), eq(transportTickets.customerId, sales.customerId))
       )
     )
 }

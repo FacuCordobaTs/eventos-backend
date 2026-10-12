@@ -9,6 +9,9 @@ import {
   products,
   ticketTypes,
   tickets,
+  transportTickets,
+  saleTransports,
+  sales,
 } from "../db/schema"
 import { TicketEmail } from "../emails/TicketEmail"
 import { formatAdmissionWindow } from "./ticket-admission"
@@ -93,6 +96,10 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     )
     .orderBy(asc(digitalConsumptions.createdAt))
 
+  const transportRows = await db.select({ id: transportTickets.id, qrHash: transportTickets.qrHash, name: saleTransports.name, address: saleTransports.address })
+    .from(transportTickets).innerJoin(saleTransports, eq(saleTransports.id, transportTickets.bookingId)).innerJoin(sales, eq(sales.id, saleTransports.saleId))
+    .where(and(eq(sales.id, saleId), eq(sales.eventId, eventId), eq(transportTickets.tenantId, evRow?.tenantId ?? ""), eq(transportTickets.customerId, sales.customerId), eq(transportTickets.status, "PENDING"), eq(sales.status, "COMPLETED")))
+
   const baseUrl = (process.env.FRONTEND_URL ?? "https://crow.ar").replace(
     /\/$/,
     ""
@@ -139,6 +146,8 @@ export async function sendGuestCheckoutReceiptEmail(input: {
     (r: any) => r.qrHash != null && r.qrHash !== ""
   ).length
 
+  for (const row of transportRows) emailItems.push({ id: row.id, name: `Colectivo · ${row.name} · ${row.address}`, qrBuffer: await toBuffer(row.qrHash, { type: "png", width: 740, margin: 4 }) })
+
   const resend = new Resend(apiKey)
   const subject = receiptEmailSubject(eventName, ticketCount)
 
@@ -182,6 +191,19 @@ export async function sendGuestCheckoutReceiptEmail(input: {
         )
       )
   }
+}
+
+/** QR snapshot after a committed transfer; delivery never grants access to the customer's account. */
+export async function sendTransportQrEmail(input: { email: string; name: string; eventName: string; linkUrl: string; pass: { id: string; name: string; address: string; qrHash: string } }) {
+  const apiKey = process.env.RESEND_API_KEY
+  if (!apiKey?.trim()) return
+  const qr = await toBuffer(input.pass.qrHash, { type: "png", width: 740, margin: 4 })
+  const { error } = await new Resend(apiKey).emails.send({
+    from: "Crow <entradas@crow.ar>", to: input.email, subject: `Tu pasaje de colectivo para ${input.eventName}`,
+    react: React.createElement(TicketEmail, { userName: input.name, eventName: input.eventName, receiptUrl: input.linkUrl, items: [{ id: input.pass.id, name: `Colectivo · ${input.pass.name} · ${input.pass.address}` }] }),
+    attachments: [{ filename: `${input.pass.id}.png`, content: qr, contentId: input.pass.id }]
+  })
+  if (error) throw new Error(error.message)
 }
 
 /**

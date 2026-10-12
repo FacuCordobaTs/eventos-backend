@@ -23,6 +23,7 @@ import { executeTicketPurchase, PurchaseError } from "./ticket-purchase"
 import { dec, decFromDb, decToDb } from "./decimal-money"
 import { debitBalance, fulfillPendingBalanceDeposit, getBalance } from "./balance"
 import { eventSupportsConsumptions } from "./event-operation-mode"
+import { issueTransportTickets } from "./transport-tickets"
 
 type Tx = MySql2Transaction<typeof schema, typeof schema>
 
@@ -542,6 +543,7 @@ export async function executeClientCheckout(
     }
   }
 
+  await issueTransportTickets(tx, saleId)
   const consumptionIds: string[] = []
   for (const line of prep.normalizedDrinks) {
     for (let i = 0; i < line.quantity; i++) {
@@ -745,6 +747,7 @@ export async function fulfillPendingGuestCheckout(
     })
     .where(eq(sales.id, saleId))
 
+  await issueTransportTickets(tx, saleId)
   return {
     saleId,
     receiptToken: sale.receiptToken,

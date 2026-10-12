@@ -19,10 +19,13 @@ import {
   tenants,
   ticketTypes,
   tickets,
+  transportTickets,
 } from "../db/schema"
 import type { PickupItemsJson } from "../db/schema"
 import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
+import { createTransportShare, cancelTransportShare, getTransportSharePreview, claimTransportShare, loadAllOwnerShares } from "../lib/transport-shares"
+import { ensureEventTransportTickets } from "../lib/transport-tickets"
 import { purchasedTransports } from "../lib/transports"
 import type { ClientCheckoutContact } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
@@ -51,7 +54,7 @@ import {
   verifyAccessCode,
 } from "../lib/customer-access"
 import { clientIp, consumeRateLimit, releaseRateLimit } from "../lib/rate-limit"
-import { sendManualTicketQrEmail } from "../lib/send-checkout-receipt-email"
+import { sendManualTicketQrEmail, sendTransportQrEmail } from "../lib/send-checkout-receipt-email"
 import {
   EMPTY_TICKET_SHARES,
   MAX_SHARE_QUANTITY,
@@ -60,7 +63,6 @@ import {
   createTicketShare,
   earmarkedTickets,
   getSharePreview,
-  loadOwnerShares,
   normalizeClaimPhone,
   normalizeDni,
   ownerReceiptTokens,
@@ -108,9 +110,11 @@ const ticketShareOwnerSchema = z.object({
 })
 
 const ticketShareCreateSchema = ticketShareOwnerSchema.extend({
-  ticketTypeId: z.string().min(1).max(36),
+  ticketTypeId: z.string().min(1).max(36).optional(),
+  transportId: z.string().uuid().optional(),
+  includeTransport: z.boolean().default(false),
   quantity: z.number().int().min(1).max(MAX_SHARE_QUANTITY),
-})
+}).refine((v) => Boolean(v.ticketTypeId) !== Boolean(v.transportId), "Elegí entrada o pasaje")
 
 /**
  * Datos de quien reclama. Son los mismos que pide la compra (nombre, DNI, celular, email) pero con
@@ -277,7 +281,10 @@ async function resolveCustomerForEvent(
           )
         )
         .limit(1)
-      if (!held) return null
+      if (!held) {
+        const [pass] = await db.select({ id: transportTickets.id }).from(transportTickets).where(and(eq(transportTickets.customerId, customer.id), eq(transportTickets.eventId, eventId), eq(transportTickets.tenantId, event.tenantId), ne(transportTickets.status, "CANCELLED"))).limit(1)
+        if (!pass) return null
+      }
     }
   }
 
@@ -778,6 +785,8 @@ export const publicRoute = new Hono()
       )
       .orderBy(desc(events.date))
 
+    const transportEventRows = await db.select({ eventId: events.id, eventName: events.name, eventDate: events.date, eventVenue: events.venue, eventLocation: events.location, eventImageUrl: events.imageUrl, eventStatus: events.status, productoraName: tenants.name }).from(transportTickets).innerJoin(events, and(eq(events.id, transportTickets.eventId), eq(events.tenantId, transportTickets.tenantId))).innerJoin(tenants, eq(tenants.id, transportTickets.tenantId)).where(and(eq(transportTickets.customerId, customer.id), ne(transportTickets.status, "CANCELLED")))
+    accessRows.push(...transportEventRows)
     const ticketSaleIds = new Set(ticketRows.map((row) => row.saleId).filter(Boolean))
     const grouped = new Map<string, (typeof saleRows)[number]>()
     for (const row of saleRows) {
@@ -998,7 +1007,7 @@ export const publicRoute = new Hono()
 
     // Compartir entradas: incluye a quien recibió entradas de un amigo y nunca compró (sin `sale`).
     const [shares, reservedTickets] = await Promise.all([
-      loadOwnerShares(db, { customerId: customer.id, eventId: ev.id, tenantId: ev.tenantId }),
+      loadAllOwnerShares(db, { customerId: customer.id, eventId: ev.id, tenantId: ev.tenantId }),
       earmarkedTickets(
         db,
         ticketRows.map((r) => r.id)
@@ -2073,7 +2082,7 @@ export const publicRoute = new Hono()
     const [shares, reservedTickets] =
       holderCustomerId && header.sale.paid
         ? await Promise.all([
-            loadOwnerShares(db, {
+            loadAllOwnerShares(db, {
               customerId: holderCustomerId,
               eventId: header.sale.eventId,
               tenantId: header.sale.tenantId,
@@ -2605,11 +2614,13 @@ export const publicRoute = new Hono()
       return c.json({ error: "Armaste muchos links en poco tiempo. Probá de nuevo más tarde." }, 429)
     }
 
-    const result = await createTicketShare(db, {
+    await ensureEventTransportTickets(db, holder)
+    const result = body.transportId ? await createTransportShare(db, { ...holder, transportId: body.transportId, quantity: body.quantity }) : await createTicketShare(db, {
       customerId: holder.customerId,
       eventId: holder.eventId,
       tenantId: holder.tenantId,
-      ticketTypeId: body.ticketTypeId,
+      ticketTypeId: body.ticketTypeId!,
+      includeTransport: body.includeTransport,
       quantity: body.quantity,
     })
     if (!result.ok) {
@@ -2631,12 +2642,13 @@ export const publicRoute = new Hono()
       return c.json(error, status)
     }
 
-    const result = await cancelTicketShare(db, {
+    let result = await cancelTicketShare(db, {
       shareId: c.req.param("id"),
       customerId: holder.customerId,
       eventId: holder.eventId,
       tenantId: holder.tenantId,
     })
+    if (!result.ok && result.code === "SHARE_NOT_FOUND") result = await cancelTransportShare(db, { ...holder, shareId: c.req.param("id") })
     if (!result.ok) {
       const { status, body: error } = shareErrorResponse(result.code)
       return c.json(error, status)
@@ -2660,7 +2672,7 @@ export const publicRoute = new Hono()
       if (!byIp.ok) return c.json({ error: "Demasiados intentos. Esperá unos minutos." }, 429)
     }
 
-    const preview = await getSharePreview(db, c.req.param("token"))
+    const preview = await getSharePreview(db, c.req.param("token")) ?? await getTransportSharePreview(db, c.req.param("token"))
     if (!preview) {
       const { status, body: error } = shareErrorResponse("SHARE_NOT_FOUND")
       return c.json(error, status)
@@ -2668,6 +2680,9 @@ export const publicRoute = new Hono()
 
     return c.json({
       state: preview.state,
+      kind: preview.kind ?? "ticket",
+      includesTransport: preview.includesTransport ?? false,
+      ...("transport" in preview ? { transport: preview.transport } : {}),
       hostName: preview.hostName,
       event: preview.event,
       productora: { name: preview.productoraName },
@@ -2728,13 +2743,14 @@ export const publicRoute = new Hono()
         return c.json({ error: "Revisá tus datos", code: "INVALID_DATA", field: null }, 400)
       }
 
-      const result = await claimTicketShare(db, token, {
+      let result = await claimTicketShare(db, token, {
         firstName: body.firstName,
         lastName: body.lastName,
         dni,
         phone,
         email: body.email,
       })
+      if (!result.ok && result.code === "SHARE_NOT_FOUND") result = await claimTransportShare(db, token, { firstName: body.firstName, lastName: body.lastName, dni, phone, email: body.email })
       if (!result.ok) {
         const { status, body: error } = shareErrorResponse(result.code)
         return c.json(error, status)
@@ -2750,7 +2766,8 @@ export const publicRoute = new Hono()
         : null
 
       void notifyTicketOwnerChange(db, claimed.ownerCustomerId, claimed.event.id)
-      void emailClaimedTicket(db, claimed)
+      if (claimed.kind !== "transport") void emailClaimedTicket(db, claimed)
+      if (claimed.transport) void sendTransportQrEmail({ email: claimed.claimant.email, name: claimed.claimant.name, eventName: claimed.event.name, pass: claimed.transport, linkUrl: `${CLIENT_URL}/${encodeURIComponent(claimed.event.slug ?? claimed.event.id)}/acceso` }).catch(() => { console.error("[transport-shares] no se pudo enviar el email del pasaje") })
 
       return c.json(
         {
@@ -2764,6 +2781,8 @@ export const publicRoute = new Hono()
               validUntil: claimed.ticketType.validUntil?.toISOString() ?? null,
             },
           },
+          kind: claimed.kind ?? "ticket",
+          transport: claimed.transport ?? null,
           holderName: claimed.claimant.name,
           event: claimed.event,
           session: sessionToken ? { token: sessionToken } : null,

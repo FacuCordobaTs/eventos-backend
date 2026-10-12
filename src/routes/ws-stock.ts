@@ -28,12 +28,12 @@ export function mountStockWebSocket(app: Hono) {
         }
         const db = drizzle(pool)
         const [st] = await db
-          .select({ tenantId: staff.tenantId })
+          .select({ tenantId: staff.tenantId, role: staff.role, isActive: staff.isActive })
           .from(staff)
           .where(eq(staff.id, payload.sub))
           .limit(1)
         const tenantId = st?.tenantId
-        if (!tenantId) {
+        if (!tenantId || !st.isActive || st.role === "TRANSPORTER") {
           throw new Error("no tenant")
         }
         const [ev] = await db

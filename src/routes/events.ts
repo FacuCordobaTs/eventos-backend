@@ -32,6 +32,9 @@ import {
   purchases,
   saleItems,
   saleTransports,
+  transportTickets,
+  transportShares,
+  transportTransfers,
   eventTransports,
   sales,
   staff,
@@ -1564,6 +1567,9 @@ export const eventsRoute = new Hono()
       // Compartir entradas: los cupos referencian a las entradas y los links al tipo y al evento,
       // así que salen antes que ambos (primero los cupos, que apuntan a los links).
       await tx.delete(ticketTransfers).where(and(eq(ticketTransfers.eventId, eventId), eq(ticketTransfers.tenantId, tenantId)))
+      await tx.delete(transportTransfers).where(inArray(transportTransfers.shareId, tx.select({ id: transportShares.id }).from(transportShares).where(and(eq(transportShares.eventId, eventId), eq(transportShares.tenantId, tenantId)))))
+      await tx.delete(transportShares).where(and(eq(transportShares.eventId, eventId), eq(transportShares.tenantId, tenantId)))
+      await tx.delete(transportTickets).where(and(eq(transportTickets.eventId, eventId), eq(transportTickets.tenantId, tenantId)))
       await tx.delete(ticketShares).where(and(eq(ticketShares.eventId, eventId), eq(ticketShares.tenantId, tenantId)))
       if (saleIds.length > 0) {
         await tx.delete(saleItems).where(inArray(saleItems.saleId, saleIds))

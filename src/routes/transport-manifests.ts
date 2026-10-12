@@ -60,7 +60,9 @@ export const transportManifestsRoute = new Hono()
           name: booking.customerName,
           dni: booking.customerDni,
           phone: booking.customerPhone,
-          quantity: booking.quantity
+          quantity: booking.quantity,
+          status: booking.status,
+          boardedAt: booking.boardedAt
         }))
       })
     } catch {

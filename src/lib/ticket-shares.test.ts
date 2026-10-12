@@ -784,3 +784,31 @@ describe("Cancelar un link", () => {
     expect(await cancelTicketShare(missing.db, ARGS)).toEqual({ ok: false, code: "SHARE_NOT_FOUND" })
   })
 })
+
+
+describe("Entrada con transporte", () => {
+  const booking = { name: "Desde Santo Tomé", address: "7 de Marzo", latitude: "-31.66", longitude: "-60.76", priceAtTime: "18000.00", transportId: "bus-1" }
+  test("reserva entrada y pasaje juntos y evita uno reservado en un link de pasajes solos", async () => {
+    const { db, writes } = fakeDb({ selects: [[{ id: "owner-1" }], [EVENT], [TYPE], [{ id: "ticket-1" }, { id: "ticket-2" }], [], [{ id: "pass-1", ticketId: "ticket-1" }, { id: "pass-2", ticketId: "ticket-2" }], [{ id: "pass-1" }]] })
+    const result = await createTicketShare(db, { customerId: "owner-1", eventId: "event-1", tenantId: "tenant-1", ticketTypeId: "type-1", quantity: 1, includeTransport: true })
+    expect(result.ok).toBe(true)
+    const rows = writes.find((w) => w.table === "ticket_transfers")?.values
+    expect(rows).toMatchObject({ ticketId: "ticket-2", transportTicketId: "pass-2" })
+  })
+  test("un canje combinado cambia ambos dueños y ambos QR en la misma transacción", async () => {
+    const { db, writes } = fakeDb({ selects: [[SHARE], [EVENT], [TYPE], [pendingTransfer(1, { transportTicketId: "pass-1" })], [{ id: "friend", phone: "existing", isActive: true }], [], [{ pass: { id: "pass-1", status: "PENDING" }, booking, saleStatus: "COMPLETED" }]] })
+    const result = await claimTicketShare(db, "tok", CLAIM)
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.claimed.transport).toMatchObject({ id: "pass-1", name: "Desde Santo Tomé", status: "PENDING" })
+    const pass = writes.find((w) => w.table === "transport_tickets")
+    expect(pass?.values.customerId).toBe("friend")
+    expect(pass?.values.qrHash).not.toBe(result.claimed.qrHash)
+    expect(pass?.values).not.toHaveProperty("bookingId")
+  })
+  test("si el transportista usó el pasaje, el canje combinado revierte también la entrada", async () => {
+    const { db, state } = fakeDb({ selects: [[SHARE], [EVENT], [TYPE], [pendingTransfer(1, { transportTicketId: "pass-1" })], [{ id: "friend", phone: "existing", isActive: true }], [], [{ pass: { id: "pass-1", status: "USED" }, booking }]] })
+    expect(await claimTicketShare(db, "tok", CLAIM)).toEqual({ ok: false, code: "SOLD_OUT" })
+    expect(state.rolledBack).toBe(true)
+  })
+})
