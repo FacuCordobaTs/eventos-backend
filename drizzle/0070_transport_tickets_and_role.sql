@@ -34,8 +34,6 @@ ALTER TABLE ticket_transfers
   ADD COLUMN transport_ticket_id varchar(36) NULL,
   ADD INDEX ticket_transfers_transport_status_idx (transport_ticket_id, status),
   ADD FOREIGN KEY (transport_ticket_id) REFERENCES transport_tickets(id);
--- Existing completed bookings are materialized idempotently by the transport ticket helper.
--- Neither pending payments nor old localStorage check marks are treated as boarding proof.
 
 CREATE TABLE transport_shares (
   id varchar(36) PRIMARY KEY, tenant_id varchar(36) NOT NULL, event_id varchar(36) NOT NULL,

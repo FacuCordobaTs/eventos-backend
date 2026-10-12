@@ -52,6 +52,7 @@ export const staff = mysqlTable(
      */
     role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
+    roles: json('roles').$type<string[] | null>(), // NULL: compatibility with the single role.
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at').defaultNow(),
   },

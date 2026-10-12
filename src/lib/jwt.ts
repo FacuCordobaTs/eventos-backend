@@ -11,6 +11,8 @@ export type TokenAudience = "staff" | "customer"
 export type AccessTokenPayload = {
   sub: string
   aud: TokenAudience
+  activeRole?: string
+  exp?: number
 }
 
 export function createAccessToken(
@@ -59,8 +61,14 @@ export function verifyToken(
           reject(new Error("Token inválido"))
           return
         }
-        resolve({ sub, aud: expectedAud })
+        resolve({ sub, aud: expectedAud, activeRole: typeof d.activeRole === "string" ? d.activeRole : undefined, exp: typeof d.exp === "number" ? d.exp : undefined })
       }
     })
   })
+}
+
+/** Changing function must not renew the original credential's lifetime. */
+export function createRoleAccessToken(payload: AccessTokenPayload, activeRole: string): string {
+  if (!payload.exp) throw new Error("Token sin vencimiento")
+  return jwt.sign({ sub: payload.sub, aud: "staff", exp: payload.exp, activeRole }, secret())
 }

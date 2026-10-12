@@ -4,6 +4,7 @@ import { pool } from "../db"
 import { staff as StaffTable } from "../db/schema"
 import { eq } from "drizzle-orm"
 import { verifyToken } from "../lib/jwt"
+import { resolveStaffRole } from "../lib/staff-roles"
 
 export interface AuthenticatedContext extends Context {
   staff: {
@@ -46,10 +47,11 @@ export const authMiddleware = async (c: Context, next: Next) => {
       return c.json({ error: "Cuenta desactivada" }, 401)
     }
 
+    const activeRole = resolveStaffRole(staff, payload.activeRole)
     // A transport session can only access its own profile and assigned boarding operations.
-    if (staff.role === "TRANSPORTER" &&
+    if (activeRole === "TRANSPORTER" &&
       !c.req.path.startsWith("/transport-tickets/") &&
-      c.req.path !== "/staff/me" && c.req.path !== "/staff/me/shift" &&
+      c.req.path !== "/staff/me" && c.req.path !== "/staff/me/shift" && c.req.path !== "/staff/me/role" &&
       !/^\/staff\/device-links\/[^/]+\/approve$/.test(c.req.path)) {
       return c.json({ error: "No tenés permiso para esta operación" }, 403)
     }
@@ -58,7 +60,7 @@ export const authMiddleware = async (c: Context, next: Next) => {
       id: staff.id,
       email: staff.email,
       name: staff.name,
-      role: staff.role,
+      role: activeRole,
       tenantId: staff.tenantId ?? undefined,
       isActive: staff.isActive,
     }

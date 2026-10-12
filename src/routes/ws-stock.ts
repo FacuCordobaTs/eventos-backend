@@ -6,6 +6,7 @@ import { and, eq } from "drizzle-orm"
 import { pool } from "../db"
 import { events, staff } from "../db/schema"
 import { verifyToken } from "../lib/jwt"
+import { resolveStaffRole } from "../lib/staff-roles"
 import {
   makeStockRoomKey,
   stockRoomSubscribe,
@@ -28,12 +29,12 @@ export function mountStockWebSocket(app: Hono) {
         }
         const db = drizzle(pool)
         const [st] = await db
-          .select({ tenantId: staff.tenantId, role: staff.role, isActive: staff.isActive })
+          .select({ tenantId: staff.tenantId, role: staff.role, roles: staff.roles, isActive: staff.isActive })
           .from(staff)
           .where(eq(staff.id, payload.sub))
           .limit(1)
         const tenantId = st?.tenantId
-        if (!tenantId || !st.isActive || st.role === "TRANSPORTER") {
+        if (!tenantId || !st.isActive || resolveStaffRole(st, payload.activeRole) === "TRANSPORTER") {
           throw new Error("no tenant")
         }
         const [ev] = await db

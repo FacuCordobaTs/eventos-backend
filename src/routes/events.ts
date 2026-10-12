@@ -2,6 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
+import type { MySql2Database } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   admissionBlacklist,
@@ -64,6 +65,8 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
+import { STAFF_ROLES, staffRoles, staffHasRole, isPromoterAccount } from "../lib/staff-roles"
+import { ensurePromoterAccount } from "../lib/promoter-account"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, getBalance } from "../lib/balance"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
@@ -160,7 +163,7 @@ async function ownedPromoterOf(
         eq(promoters.staffId, input.promoterStaffId),
         eq(promoters.tenantId, input.tenantId),
         eq(promoters.ownerStaffId, input.ownerStaffId),
-        eq(staff.role, "PROMOTER")
+        staffHasRole("PROMOTER")
       )
     )
     .limit(1)
@@ -580,7 +583,7 @@ function guessImageContentType(file: File, filename: string): string | null {
 }
 
 async function requireEventForTenant(
-  db: ReturnType<typeof drizzle>,
+  db: MySql2Database<Record<string, never>>,
   eventId: string,
   tenantId: string
 ): Promise<typeof events.$inferSelect | null> {
@@ -828,7 +831,7 @@ async function generalPromoterNameByPromoterId(
       and(
         eq(promoters.tenantId, tenantId),
         eq(staff.tenantId, tenantId),
-        eq(staff.role, "GENERAL_PROMOTER")
+        staffHasRole("GENERAL_PROMOTER")
       )
     )
   return new Map(rows.map((r) => [r.promoterId, r.generalPromoterName]))
@@ -3272,6 +3275,7 @@ export const eventsRoute = new Hono()
           name: staff.name,
           email: staff.email,
           role: staff.role,
+          roles: staff.roles,
           isActive: staff.isActive,
           assignmentId: eventStaff.id,
           barId: eventStaff.barId,
@@ -3292,7 +3296,7 @@ export const eventsRoute = new Hono()
             eq(promoters.tenantId, tenantId),
             eq(promoters.ownerStaffId, ctx.staff.id),
             eq(staff.isActive, true),
-            eq(staff.role, "PROMOTER")
+            staffHasRole("PROMOTER")
           )
         )
         .orderBy(asc(staff.name))
@@ -3302,6 +3306,7 @@ export const eventsRoute = new Hono()
           name: r.name,
           email: r.email,
           role: r.role,
+          roles: staffRoles(r),
           isAssigned: r.assignmentId != null,
           barId: r.barId ?? null,
           promoterId: r.promoterId ?? null,
@@ -3315,6 +3320,7 @@ export const eventsRoute = new Hono()
         name: staff.name,
         email: staff.email,
         role: staff.role,
+        roles: staff.roles,
         isActive: staff.isActive,
         assignmentId: eventStaff.id,
         barId: eventStaff.barId,
@@ -3348,6 +3354,7 @@ export const eventsRoute = new Hono()
         name: r.name,
         email: r.email,
         role: r.role,
+        roles: staffRoles(r),
         isAssigned: r.assignmentId != null,
         barId: r.barId ?? null,
         promoterId: r.promoterId ?? null,
@@ -3356,11 +3363,49 @@ export const eventsRoute = new Hono()
       })),
     })
   })
+  .patch("/:id/staff/:staffId/roles", zValidator("json", z.object({
+    roles: z.array(z.enum(STAFF_ROLES)).min(1).max(STAFF_ROLES.length),
+  })), async (c) => {
+    const ctx = c as unknown as AuthenticatedContext
+    if (!["ADMIN", "MANAGER"].includes(ctx.staff.role)) {
+      return c.json({ error: "Solo administradores y gerentes pueden asignar roles." }, 403)
+    }
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) return c.json({ error: "Tu cuenta no tiene productora asignada." }, 400)
+    const db = drizzle(pool)
+    const event = await requireEventForTenant(db, c.req.param("id"), tenantId)
+    if (!event) return c.json({ error: "Evento no encontrado" }, 404)
+    const staffId = c.req.param("staffId")
+    const roles = [...new Set(c.req.valid("json").roles)]
+    if (staffId === ctx.staff.id && !roles.includes(ctx.staff.role as typeof roles[number])) {
+      return c.json({ error: "Conservá tu rol actual para no perder el acceso a la gestión." }, 400)
+    }
+    return db.transaction(async (tx) => {
+      const [target] = await tx.select().from(staff)
+        .where(and(eq(staff.id, staffId), eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
+        .limit(1).for("update")
+      if (!target) return c.json({ error: "Empleado no encontrado en tu productora." }, 404)
+      const primaryRole = roles.includes(target.role) ? target.role : roles[0]
+      await tx.update(staff).set({ role: primaryRole, roles }).where(and(eq(staff.id, staffId), eq(staff.tenantId, tenantId)))
+      if (isPromoterAccount({ role: primaryRole, roles })) {
+        await ensurePromoterAccount(tx, { staffId, tenantId, name: target.name, isActive: true })
+        if (roles.some((role) => ["ADMIN", "MANAGER", "GENERAL_PROMOTER"].includes(role))) {
+          await tx.update(promoters).set({ ownerStaffId: null }).where(and(eq(promoters.staffId, staffId), eq(promoters.tenantId, tenantId)))
+        }
+      } else {
+        await tx.update(promoters).set({ isActive: false }).where(and(eq(promoters.staffId, staffId), eq(promoters.tenantId, tenantId)))
+      }
+      return c.json({ staff: { id: staffId, role: primaryRole, roles } })
+    })
+  })
   .post(
     "/:id/staff/assign",
     zValidator("json", assignEventStaffSchema),
     async (c) => {
       const ctx = c as AuthenticatedContext
+      if (!["ADMIN", "MANAGER", "GENERAL_PROMOTER"].includes(ctx.staff.role)) {
+        return c.json({ error: "Sin permiso para asignar empleados." }, 403)
+      }
       const tenantId = requireTenantId(ctx)
       if (!tenantId) {
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)

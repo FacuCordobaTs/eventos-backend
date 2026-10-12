@@ -3,6 +3,7 @@ import type { MiddlewareHandler } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
+import type { MySql2Database } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
   bars,
@@ -20,7 +21,8 @@ import { v4 as uuidv4 } from "uuid"
 import { randomBytes } from "crypto"
 import { setCookie } from "hono/cookie"
 import { and, asc, desc, eq, gt, inArray, isNull, ne, or, type SQL } from "drizzle-orm"
-import { createAccessToken } from "../lib/jwt"
+import { createAccessToken, createRoleAccessToken, verifyToken } from "../lib/jwt"
+import { isPromoterAccount, staffHasRole, staffRoles, STAFF_ROLES } from "../lib/staff-roles"
 import * as bcrypt from "bcrypt"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { eventSupportsConsumptions } from "../lib/event-operation-mode"
@@ -51,6 +53,7 @@ const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 d
 const createInvitationSchema = z.object({
   name: z.string().trim().min(1).max(255),
   role: roleEnum,
+  roles: z.array(roleEnum).min(1).max(STAFF_ROLES.length).optional(),
   // Desde el dashboard el alta también queda asignada al evento actual.
   eventId: z.string().min(1).optional(),
   expiresInDays: z.number().int().positive().max(365).optional(),
@@ -153,6 +156,7 @@ const updateTeamMemberSchema = z
   .object({
     name: z.string().min(1).optional(),
     role: roleEnum.optional(),
+    roles: z.array(roleEnum).min(1).max(STAFF_ROLES.length).optional(),
     password: z.string().min(8).optional(),
     // PIN de 4-6 dígitos para rotación en la sesión de puesto (spec §1). null lo borra.
     pin: z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos").nullable().optional(),
@@ -161,6 +165,7 @@ const updateTeamMemberSchema = z
     (b) =>
       b.name !== undefined ||
       b.role !== undefined ||
+      b.roles !== undefined ||
       b.password !== undefined ||
       b.pin !== undefined,
     {
@@ -208,6 +213,13 @@ const adminOrGeneralPromoter: MiddlewareHandler = async (c, next) => {
   await next()
 }
 
+const teamInviter: MiddlewareHandler = async (c, next) => {
+  if (!["ADMIN", "MANAGER", "GENERAL_PROMOTER"].includes((c as AuthenticatedContext).staff.role)) {
+    return c.json({ error: "Sin permiso para administrar invitaciones." }, 403)
+  }
+  await next()
+}
+
 /**
  * ADMIN o MANAGER: quien puede fijar la barra de una computadora desde el QR, y ver la lista de
  * barras para elegir. El `adminOnly` de las sesiones de puesto queda como estaba.
@@ -235,7 +247,7 @@ const cookieOptions = (
   }
 }
 
-async function staffPayloadForClient(db: ReturnType<typeof drizzle>, row: StaffRow) {
+async function staffPayloadForClient(db: MySql2Database<Record<string, never>>, row: StaffRow) {
   const base = sanitizeStaff(row)
   if (!row.tenantId) {
     return { ...base, tenantName: null as string | null }
@@ -266,7 +278,7 @@ async function ownedPromoterOf(
         eq(promoters.staffId, input.promoterStaffId),
         eq(promoters.tenantId, input.tenantId),
         eq(promoters.ownerStaffId, input.ownerStaffId),
-        eq(staff.role, "PROMOTER")
+        staffHasRole("PROMOTER")
       )
     )
     .limit(1)
@@ -283,11 +295,11 @@ async function invitationOwnerStaffId(
 ): Promise<string | null> {
   if (!invitation.createdBy) return null
   const [creator] = await db
-    .select({ id: staff.id, role: staff.role })
+    .select({ id: staff.id, role: staff.role, roles: staff.roles })
     .from(staff)
     .where(eq(staff.id, invitation.createdBy))
     .limit(1)
-  return creator?.role === "GENERAL_PROMOTER" ? creator.id : null
+  return creator && staffRoles(creator).includes("GENERAL_PROMOTER") ? creator.id : null
 }
 
 function sanitizeInvitation(row: typeof staffInvitations.$inferSelect) {
@@ -371,8 +383,21 @@ export const staffRoute = new Hono()
       return c.json({ error: "Usuario no encontrado" }, 401)
     }
     return c.json({
-      staff: await staffPayloadForClient(db, row),
+      staff: { ...await staffPayloadForClient(db, row), role: ctx.staff.role },
     })
+  })
+  .post("/me/role", authMiddleware, zValidator("json", z.object({ role: roleEnum })), async (c) => {
+    const ctx = c as unknown as AuthenticatedContext
+    const db = drizzle(pool)
+    const [row] = await db.select().from(staff).where(eq(staff.id, ctx.staff.id)).limit(1)
+    const role = c.req.valid("json").role
+    if (!row || !row.isActive || !staffRoles(row).includes(role)) {
+      return c.json({ error: "Ese rol ya no está asignado a tu cuenta." }, 403)
+    }
+    const payload = await verifyToken(c.req.header("Authorization")!.slice(7))
+    const token = createRoleAccessToken(payload, role)
+    setCookie(c, "token", token, cookieOptions(c, Math.max(0, payload.exp! - Math.floor(Date.now() / 1000))))
+    return c.json({ token, staff: { ...await staffPayloadForClient(db, row), role } })
   })
   .get("/team", authMiddleware, async (c) => {
     const db = drizzle(pool)
@@ -488,42 +513,46 @@ export const staffRoute = new Hono()
         return c.json({ error: "Ese PIN ya lo usa otra persona del equipo" }, 409)
       }
 
-      await db
-        .update(staff)
-        .set({
-          ...(body.name !== undefined ? { name: body.name } : {}),
-          ...(body.role !== undefined ? { role: body.role } : {}),
-          ...(passwordHash !== undefined ? { passwordHash } : {}),
-          ...(body.pin !== undefined ? { pinCode: body.pin } : {}),
-        })
-        .where(eq(staff.id, id))
+      const nextRoles = body.roles ? [...new Set(body.roles)] : body.role ? [body.role] : staffRoles(target)
+      const nextRole = nextRoles.includes(body.role ?? target.role) ? (body.role ?? target.role) : nextRoles[0]
+      return db.transaction(async (db) => {
+        await db
+          .update(staff)
+          .set({
+            ...(body.name !== undefined ? { name: body.name } : {}),
+            ...(body.role !== undefined || body.roles !== undefined ? { role: nextRole, roles: nextRoles } : {}),
+            ...(passwordHash !== undefined ? { passwordHash } : {}),
+            ...(body.pin !== undefined ? { pinCode: body.pin } : {}),
+          })
+          .where(eq(staff.id, id))
 
-      const nextRole = body.role ?? target.role
-      if ((nextRole === "PROMOTER" || nextRole === "GENERAL_PROMOTER") && target.tenantId) {
-        await ensurePromoterAccount(db, {
-          staffId: target.id,
-          tenantId: target.tenantId,
-          name: body.name ?? target.name,
-          isActive: target.isActive !== false,
-        })
-        // Al ascender a alguien a promotor general deja de pertenecer a quien lo había invitado:
-        // si conservara el `owner_staff_id`, sus ventas seguirían apareciendo en la cartera de su
-        // antiguo dueño, que ya no lo ve en su equipo.
-        if (body.role === "GENERAL_PROMOTER") {
+        const nextAccount = { role: nextRole, roles: nextRoles }
+        if (isPromoterAccount(nextAccount) && target.tenantId) {
+          await ensurePromoterAccount(db, {
+            staffId: target.id,
+            tenantId: target.tenantId,
+            name: body.name ?? target.name,
+            isActive: target.isActive !== false,
+          })
+          // Al ascender a alguien a promotor general deja de pertenecer a quien lo había invitado:
+          // si conservara el `owner_staff_id`, sus ventas seguirían apareciendo en la cartera de su
+          // antiguo dueño, que ya no lo ve en su equipo.
+          if (nextRoles.some((role) => ["ADMIN", "MANAGER", "GENERAL_PROMOTER"].includes(role))) {
+            await db
+              .update(promoters)
+              .set({ ownerStaffId: null })
+              .where(eq(promoters.staffId, target.id))
+          }
+        } else if (isPromoterAccount(target)) {
           await db
             .update(promoters)
-            .set({ ownerStaffId: null })
+            .set({ isActive: false })
             .where(eq(promoters.staffId, target.id))
         }
-      } else if (target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") {
-        await db
-          .update(promoters)
-          .set({ isActive: false })
-          .where(eq(promoters.staffId, target.id))
-      }
 
-      const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
-      return c.json({ staff: sanitizeStaff(updated) })
+        const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
+        return c.json({ staff: sanitizeStaff(updated) })
+      })
     }
   )
   .delete("/team/:id", authMiddleware, adminOrGeneralPromoter, async (c) => {
@@ -544,6 +573,9 @@ export const staffRoute = new Hono()
     }
     // El promotor general elimina sólo a sus propios promotores; la productora y los demás
     // promotores generales le quedan fuera de alcance.
+    if (ctx.staff.role === "GENERAL_PROMOTER" && staffRoles(target).some((role) => role !== "PROMOTER")) {
+      return c.json({ error: "La cuenta tiene otras funciones; debe gestionarla la productora." }, 403)
+    }
     if (
       ctx.staff.role === "GENERAL_PROMOTER" &&
       !(await ownedPromoterOf(db, {
@@ -559,7 +591,7 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: false }).where(eq(staff.id, id))
-    if (target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") {
+    if (isPromoterAccount(target)) {
       await db.update(promoters).set({ isActive: false }).where(eq(promoters.staffId, id))
     }
     return c.json({ ok: true })
@@ -576,6 +608,9 @@ export const staffRoute = new Hono()
     if (!tenantMatches(ctx.staff.tenantId, target.tenantId)) {
       return c.json({ error: "Sin permiso" }, 403)
     }
+    if (ctx.staff.role === "GENERAL_PROMOTER" && staffRoles(target).some((role) => role !== "PROMOTER")) {
+      return c.json({ error: "La cuenta tiene otras funciones; debe gestionarla la productora." }, 403)
+    }
     if (
       ctx.staff.role === "GENERAL_PROMOTER" &&
       !(await ownedPromoterOf(db, {
@@ -591,7 +626,7 @@ export const staffRoute = new Hono()
     }
 
     await db.update(staff).set({ isActive: true }).where(eq(staff.id, id))
-    if ((target.role === "PROMOTER" || target.role === "GENERAL_PROMOTER") && target.tenantId) {
+    if (isPromoterAccount(target) && target.tenantId) {
       await ensurePromoterAccount(db, { staffId: id, tenantId: target.tenantId, name: target.name, isActive: true })
     }
     const [updated] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
@@ -603,7 +638,7 @@ export const staffRoute = new Hono()
   .post(
     "/invitations",
     authMiddleware,
-    adminOrGeneralPromoter,
+    teamInviter,
     zValidator("json", createInvitationSchema),
     async (c) => {
       const db = drizzle(pool)
@@ -613,9 +648,10 @@ export const staffRoute = new Hono()
         return c.json({ error: "Tu cuenta no tiene productora asignada." }, 400)
       }
       const body = c.req.valid("json")
+      const roles = [...new Set(body.roles ?? [body.role])]
       // El promotor general es un rol acotado: sólo da de alta promotores, y quedan a su nombre.
       const isGeneralPromoter = ctx.staff.role === "GENERAL_PROMOTER"
-      if (isGeneralPromoter && body.role !== "PROMOTER") {
+      if (isGeneralPromoter && (body.role !== "PROMOTER" || roles.some((role) => role !== "PROMOTER"))) {
         return c.json({ error: "Un promotor general sólo puede invitar promotores." }, 403)
       }
       const ownerStaffId = isGeneralPromoter ? ctx.staff.id : null
@@ -657,31 +693,33 @@ export const staffRoute = new Hono()
       // activa su sesión; así se muestra y queda asignado al evento inmediatamente.
       const syntheticEmail = `invite-${staffId}@staff.local`
       const passwordHash = await bcrypt.hash(genToken(), 10)
-      await db.insert(staff).values({
-        id: staffId,
-        tenantId,
-        name: body.name,
-        email: syntheticEmail,
-        passwordHash,
-        role: body.role,
-        isActive: true,
-        createdAt: new Date(),
+      return db.transaction(async (db) => {
+        await db.insert(staff).values({
+          id: staffId,
+          tenantId,
+          name: body.name,
+          email: syntheticEmail,
+          passwordHash,
+          role: roles.includes(body.role) ? body.role : roles[0],
+          roles,
+          isActive: true,
+          createdAt: new Date(),
       })
-      if (body.role === "PROMOTER" || body.role === "GENERAL_PROMOTER") {
+      if (roles.includes("PROMOTER") || roles.includes("GENERAL_PROMOTER")) {
         await ensurePromoterAccount(db, {
           staffId,
           tenantId,
           name: body.name,
           // Sólo los promotores de a pie pertenecen a alguien: el promotor general tiene su fila
           // propia (su link), no la de un tercero.
-          ownerStaffId: body.role === "PROMOTER" ? ownerStaffId : null,
+          ownerStaffId: roles.includes("GENERAL_PROMOTER") ? null : ownerStaffId,
         })
       }
       await db.insert(staffInvitations).values({
         id,
         tenantId,
         inviteeName: body.name,
-        role: body.role,
+        role: roles.includes(body.role) ? body.role : roles[0],
         token,
         status: "PENDING",
         expiresAt,
@@ -703,10 +741,11 @@ export const staffRoute = new Hono()
         .from(staffInvitations)
         .where(eq(staffInvitations.id, id))
         .limit(1)
-      return c.json({ invitation: sanitizeInvitation(row) }, 201)
+      return c.json({ invitation: { ...sanitizeInvitation(row), roles } }, 201)
+      })
     }
   )
-  .get("/invitations", authMiddleware, adminOrGeneralPromoter, async (c) => {
+  .get("/invitations", authMiddleware, teamInviter, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
     const tenantId = ctx.staff.tenantId ?? null
@@ -728,7 +767,13 @@ export const staffRoute = new Hono()
         )
       )
       .orderBy(desc(staffInvitations.createdAt))
-    return c.json({ invitations: rows.map(sanitizeInvitation) })
+    const staffIds = rows.flatMap((row) => row.acceptedStaffId ? [row.acceptedStaffId] : [])
+    const members = staffIds.length ? await db.select().from(staff).where(and(eq(staff.tenantId, tenantId), inArray(staff.id, staffIds))) : []
+    const byId = new Map(members.map((member) => [member.id, member]))
+    return c.json({ invitations: rows.map((row) => {
+      const member = row.acceptedStaffId ? byId.get(row.acceptedStaffId) : null
+      return { ...sanitizeInvitation(row), ...(member ? { name: member.name, role: member.role, roles: staffRoles(member) } : {}) }
+    }) })
   })
   .post("/invitations/:id/revoke", authMiddleware, adminOrGeneralPromoter, async (c) => {
     const db = drizzle(pool)
