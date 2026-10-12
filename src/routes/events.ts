@@ -31,6 +31,8 @@ import {
   promoters,
   purchases,
   saleItems,
+  saleTransports,
+  eventTransports,
   sales,
   staff,
   tenants,
@@ -62,6 +64,7 @@ import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, getBalance } from "../lib/balance"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { transportRevenue } from "../lib/transports"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
 import { admissionWindowFields, isAdmissionWindowOrdered } from "../lib/ticket-admission"
 import {
@@ -659,7 +662,7 @@ type ClosingInsumo = {
   purchasedCost: string
 }
 type ClosingData = {
-  income: { tickets: string; bar: string; gross: string }
+  income: { tickets: string; bar: string; transport: string; gross: string }
   expenses: { operational: string; merchandisePurchased: string }
   /** Agregado a nivel evento (back-compat con la caja única de la tarea 4.4). */
   cash: { expected: string; hasCashSales: boolean }
@@ -676,7 +679,7 @@ type ClosingData = {
   /** Tarea 10.2 — Pendiente de entrega (visión §2.8): consumiciones PENDING (compradas, no retiradas). */
   pendingDelivery: { quantity: number; amount: string }
   /** Tarea 10.3 — Ingresos por origen (entradas / tragos / saldo) — ver `EventClosingReport`. */
-  incomeBySource: { tickets: string; tragos: string; saldo: string; total: string }
+  incomeBySource: { tickets: string; tragos: string; transport: string; saldo: string; total: string }
   /** Tarea 10.3 — Ingresos por método de pago (incluye cargas de saldo por su método; SALDO informativo). */
   incomeByMethod: {
     method: "CASH" | "CARD" | "MERCADOPAGO" | "TRANSFER" | "SALDO"
@@ -1063,7 +1066,8 @@ async function computeClosingData(
 
   const ticketDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
   const barDec = decFromDb(barRevenueRow[0]?.total ?? "0")
-  const grossDec = ticketDec.plus(barDec)
+  const transportDec = dec(await transportRevenue(db, { tenantId, eventId }))
+  const grossDec = ticketDec.plus(barDec).plus(transportDec)
 
   // Tarea 10.1 — Caja por puesto: agrupa las ventas COMPLETED por (barra, método) y arma un
   // cierre por barra con efectivo esperado (el cajón). `barId` null = caja de puerta (ventas
@@ -1172,10 +1176,11 @@ async function computeClosingData(
     dec(0)
   )
   const incomeBySource: ClosingData["incomeBySource"] = {
+    transport: decToDb(transportDec),
     tickets: decToDb(ticketDec),
     tragos: decToDb(barDec),
     saldo: decToDb(saldoDec),
-    total: decToDb(ticketDec.plus(barDec).plus(saldoDec)),
+    total: decToDb(grossDec.plus(saldoDec)),
   }
 
   // Tarea 10.3 — Ventas por hora (shape de `analytics/dashboard`): buckets locales de 0 a 23.
@@ -1222,6 +1227,7 @@ async function computeClosingData(
 
   return {
     income: {
+      transport: decToDb(transportDec),
       tickets: decToDb(ticketDec),
       bar: decToDb(barDec),
       gross: decToDb(grossDec),
@@ -1569,6 +1575,8 @@ export const eventsRoute = new Hono()
       }
 
       await tx.delete(tickets).where(and(eq(tickets.eventId, eventId), eq(tickets.tenantId, tenantId)))
+      await tx.delete(saleTransports).where(and(eq(saleTransports.eventId, eventId), eq(saleTransports.tenantId, tenantId)))
+      await tx.delete(eventTransports).where(and(eq(eventTransports.eventId, eventId), eq(eventTransports.tenantId, tenantId)))
       await tx.delete(sales).where(and(eq(sales.eventId, eventId), eq(sales.tenantId, tenantId)))
       await tx.delete(ticketTiers).where(and(eq(ticketTiers.eventId, eventId), eq(ticketTiers.tenantId, tenantId)))
 
@@ -2555,7 +2563,8 @@ export const eventsRoute = new Hono()
     const ticketsCheckedIn = Number(ticketsUsedRow[0]?.n ?? 0)
     const ticketRevenueDec = decFromDb(ticketRevenueRow[0]?.total ?? "0")
     const barSalesDec = decFromDb(barProductRevenueRow[0]?.total ?? "0")
-    const grossDec = ticketRevenueDec.plus(barSalesDec)
+    const transportDec = dec(await transportRevenue(db, { tenantId, eventId }))
+    const grossDec = ticketRevenueDec.plus(barSalesDec).plus(transportDec)
     const expensesDec = canViewFinancials
       ? decFromDb(expenseRow[0]?.total ?? "0")
       : dec(0)
@@ -2581,6 +2590,7 @@ export const eventsRoute = new Hono()
       ticketsCheckedIn,
       ticketCapacity,
       ticketRevenue: decToDb(ticketRevenueDec),
+      transportRevenue: decToDb(transportDec),
       barSalesRevenue: decToDb(barSalesDec),
       grossRevenue: decToDb(grossDec),
       totalExpenses: canViewFinancials ? decToDb(expensesDec) : null,

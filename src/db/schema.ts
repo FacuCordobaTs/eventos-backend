@@ -175,7 +175,7 @@ export type PromoterSalesRow = {
  */
 export type EventClosingReport = {
   closedAt: string
-  income: { tickets: string; bar: string; gross: string }
+  income: { tickets: string; bar: string; transport?: string; gross: string }
   expenses: {
     operational: string
     merchandisePurchased: string
@@ -202,6 +202,7 @@ export type EventClosingReport = {
    * que entró de verdad, sin items de producto); `total` = la suma.
    */
   incomeBySource?: {
+    transport?: string
     tickets: string
     tragos: string
     saldo: string
@@ -961,6 +962,7 @@ export type GuestCheckoutSnapshotJson = {
   kind?: "checkout" | "deposit"
   ticketLines: { ticketTypeId: string; quantity: number }[]
   drinkLines: { productId: string; quantity: number }[]
+  transportLines?: { transportId: string; quantity: number }[]
   contact: { name: string; email: string; phone: string; dni?: string }
 }
 
@@ -1039,6 +1041,38 @@ export const saleItems = mysqlTable('sale_items', {
   quantity: int('quantity').notNull(),
   priceAtTime: decimal('price_at_time', { precision: 10, scale: 2 }).notNull(),
 });
+
+export const eventTransports = mysqlTable('event_transports', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+  name: varchar('name', { length: 255 }).notNull(),
+  address: varchar('address', { length: 500 }).notNull(),
+  latitude: decimal('latitude', { precision: 10, scale: 7 }).notNull(),
+  longitude: decimal('longitude', { precision: 10, scale: 7 }).notNull(),
+  price: decimal('price', { precision: 10, scale: 2 }).notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at').defaultNow(),
+}, (table) => ({ eventTenantIdx: index('event_transports_event_tenant_idx').on(table.eventId, table.tenantId) }));
+
+// Booking lines belong to a sale. They are valid only when that sale is COMPLETED.
+// Keep the pickup point and price at purchase time, including for delayed payments.
+export const saleTransports = mysqlTable('sale_transports', {
+  id: varchar('id', { length: 36 }).primaryKey(),
+  saleId: varchar('sale_id', { length: 36 }).notNull().references(() => sales.id),
+  transportId: varchar('transport_id', { length: 36 }).notNull().references(() => eventTransports.id),
+  tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
+  eventId: varchar('event_id', { length: 36 }).notNull().references(() => events.id),
+  name: varchar('name', { length: 255 }).notNull(),
+  address: varchar('address', { length: 500 }).notNull(),
+  latitude: decimal('latitude', { precision: 10, scale: 7 }).notNull(),
+  longitude: decimal('longitude', { precision: 10, scale: 7 }).notNull(),
+  quantity: int('quantity').notNull(),
+  priceAtTime: decimal('price_at_time', { precision: 10, scale: 2 }).notNull(),
+}, (table) => ({
+  saleTransportUnique: uniqueIndex('sale_transports_sale_transport_unique').on(table.saleId, table.transportId),
+  eventTenantIdx: index('sale_transports_event_tenant_idx').on(table.eventId, table.tenantId),
+}));
 
 export const digitalConsumptions = mysqlTable('digital_consumptions', {
   id: varchar('id', { length: 36 }).primaryKey(),

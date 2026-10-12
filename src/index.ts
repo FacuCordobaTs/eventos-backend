@@ -3,6 +3,7 @@ import { logger } from "hono/logger"
 import { tenantsRoute } from "./routes/tenants"
 import { staffRoute } from "./routes/staff"
 import { eventsRoute } from "./routes/events"
+import { transportsRoute } from "./routes/transports"
 import { ticketsRoute } from "./routes/tickets"
 import { publicRoute } from "./routes/public"
 import { inventoryRoute } from "./routes/inventory"
@@ -52,6 +53,7 @@ app.use("/public/updates/*", serveStatic({ root: "./" }))
 app.route("/tenants", tenantsRoute)
 app.route("/staff", staffRoute)
 app.route("/events", eventsRoute)
+app.route("/event-transports", transportsRoute)
 app.route("/tickets", ticketsRoute)
 app.route("/public", publicRoute)
 app.route("/inventory", inventoryRoute)

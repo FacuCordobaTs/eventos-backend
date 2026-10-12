@@ -19,6 +19,8 @@ export type PurchaseErrorCode =
   | "BALANCE_REQUIRES_DNI"
   | "INSUFFICIENT_BALANCE"
   | "PROMOTER_NOT_FOUND"
+  | "TRANSPORT_NOT_FOUND"
+  | "INVALID_TRANSPORT_QUANTITY"
 
 export class PurchaseError extends Error {
   readonly code: PurchaseErrorCode
@@ -190,6 +192,10 @@ export function purchaseErrorStatus(
       }
     case "PRODUCT_NOT_FOUND":
       return { status: 404, body: { error: "Producto no disponible" } }
+    case "TRANSPORT_NOT_FOUND":
+      return { status: 409, body: { error: "El transporte ya no está disponible. Volvé al evento para actualizar tu selección." } }
+    case "INVALID_TRANSPORT_QUANTITY":
+      return { status: 400, body: { error: "Elegí hasta un pasaje de transporte por entrada" } }
     case "TICKETS_NOT_YET_AVAILABLE":
       return {
         status: 403,

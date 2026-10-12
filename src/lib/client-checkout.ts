@@ -7,6 +7,8 @@ import {
   digitalConsumptions,
   eventStaff,
   eventProducts,
+  eventTransports,
+  saleTransports,
   events,
   products,
   promoters,
@@ -23,6 +25,33 @@ import { debitBalance, fulfillPendingBalanceDeposit, getBalance } from "./balanc
 import { eventSupportsConsumptions } from "./event-operation-mode"
 
 type Tx = MySql2Transaction<typeof schema, typeof schema>
+
+export function normalizeTransportLines(
+  lines: { transportId: string; quantity: number }[],
+  ticketLines: { quantity: number }[],
+) {
+  const quantities = new Map<string, number>()
+  for (const line of lines) {
+    if (!Number.isInteger(line.quantity) || line.quantity < 1 || line.quantity > 99) {
+      throw new PurchaseError("INVALID_TRANSPORT_QUANTITY")
+    }
+    quantities.set(line.transportId, (quantities.get(line.transportId) ?? 0) + line.quantity)
+  }
+  const seats = [...quantities.values()].reduce((sum, q) => sum + q, 0)
+  if (seats > ticketLines.reduce((sum, l) => sum + l.quantity, 0)) {
+    throw new PurchaseError("INVALID_TRANSPORT_QUANTITY")
+  }
+  return [...quantities].map(([transportId, quantity]) => ({ transportId, quantity }))
+}
+
+async function insertTransportBookings(
+  tx: Tx, saleId: string,
+  bookings: Omit<typeof saleTransports.$inferInsert, "id" | "saleId">[],
+) {
+  for (const booking of bookings) {
+    await tx.insert(saleTransports).values({ ...booking, id: uuidv4(), saleId })
+  }
+}
 
 export type ClientCheckoutTicketLine = { ticketTypeId: string; quantity: number }
 export type ClientCheckoutDrinkLine = { productId: string; quantity: number }
@@ -47,6 +76,7 @@ export type ClientCheckoutParams = {
   clientTotal: string
   ticketLines: ClientCheckoutTicketLine[]
   drinkLines: ClientCheckoutDrinkLine[]
+  transportLines?: { transportId: string; quantity: number }[]
   /** Promotor del enlace público compartido. Ausente en compras sin referido. */
   promoterId?: string
 }
@@ -206,6 +236,7 @@ type PreparedGuestCheckout = {
   normalizedTickets: ClientCheckoutTicketLine[]
   normalizedDrinks: ClientCheckoutDrinkLine[]
   drinkPrices: Map<string, PricedDrink>
+  transportBookings: Omit<typeof saleTransports.$inferInsert, "id" | "saleId">[]
 }
 
 async function prepareGuestCheckout(
@@ -241,6 +272,8 @@ async function prepareGuestCheckout(
   }
 
   const tenantId = ev.tenantId
+  const transportLines = normalizeTransportLines(params.transportLines ?? [], normalizedTickets)
+  const transportBookings: PreparedGuestCheckout["transportBookings"] = []
 
   // El identificador llega desde un link público, así que nunca se acepta a ciegas:
   // debe ser un promotor activo de la misma productora y estar asignado al evento. Esto
@@ -341,6 +374,23 @@ async function prepareGuestCheckout(
     total = total.add(unit.mul(line.quantity))
   }
 
+  for (const line of transportLines) {
+    const [transport] = await tx.select().from(eventTransports).where(and(
+      eq(eventTransports.id, line.transportId),
+      eq(eventTransports.eventId, ev.id),
+      eq(eventTransports.tenantId, tenantId),
+      eq(eventTransports.isActive, true),
+    )).limit(1)
+    if (!transport) throw new PurchaseError("TRANSPORT_NOT_FOUND")
+    total = total.add(decFromDb(transport.price).mul(line.quantity))
+    transportBookings.push({
+      transportId: transport.id, eventId: ev.id, tenantId,
+      name: transport.name, address: transport.address,
+      latitude: transport.latitude, longitude: transport.longitude,
+      quantity: line.quantity, priceAtTime: transport.price,
+    })
+  }
+
   const serverTotalStr = decToDb(total)
   if (!total.eq(dec(params.clientTotal.trim()))) {
     throw new PurchaseError("CHECKOUT_TOTAL_MISMATCH")
@@ -355,6 +405,7 @@ async function prepareGuestCheckout(
     normalizedTickets,
     normalizedDrinks,
     drinkPrices,
+    transportBookings,
   }
 }
 
@@ -396,6 +447,7 @@ export async function executeClientCheckout(
         productId: l.productId,
         quantity: l.quantity,
       })),
+      transportLines: prep.transportBookings.map((l) => ({ transportId: l.transportId, quantity: l.quantity })),
       contact: {
         name: params.contact.name.trim(),
         email: params.contact.email.toLowerCase().trim(),
@@ -419,6 +471,7 @@ export async function executeClientCheckout(
       createdAt: new Date(),
     })
 
+    await insertTransportBookings(tx, saleId, prep.transportBookings)
     for (const line of prep.normalizedDrinks) {
       const priced = prep.drinkPrices.get(line.productId)!
       await tx.insert(saleItems).values({
@@ -455,9 +508,12 @@ export async function executeClientCheckout(
     totalAmount: prep.serverTotalStr,
     paymentMethod: params.paymentMethod,
     status: "COMPLETED",
+    paid: true,
+    paidAt: new Date(),
     createdAt: new Date(),
   })
 
+  await insertTransportBookings(tx, saleId, prep.transportBookings)
   for (const line of prep.normalizedDrinks) {
     const priced = prep.drinkPrices.get(line.productId)!
     await tx.insert(saleItems).values({
@@ -537,7 +593,7 @@ export async function fulfillPendingGuestCheckout(
   tx: Tx,
   saleId: string
 ): Promise<ClientCheckoutResult> {
-  const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId)).limit(1)
+  const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId)).limit(1).for("update")
   if (!sale) {
     throw new Error("FULFILL_SALE_NOT_FOUND")
   }

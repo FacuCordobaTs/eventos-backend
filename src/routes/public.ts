@@ -10,6 +10,7 @@ import {
   customers,
   digitalConsumptions,
   eventProducts,
+  eventTransports,
   events,
   pickupOrders,
   productCategories,
@@ -22,6 +23,7 @@ import {
 import type { PickupItemsJson } from "../db/schema"
 import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
+import { purchasedTransports } from "../lib/transports"
 import type { ClientCheckoutContact } from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { getBalance } from "../lib/balance"
@@ -600,6 +602,7 @@ const guestCheckoutSchema = z.object({
      */
     dni: z.string().regex(/^\d{6,9}$/).optional(),
   }),
+  transportLines: z.array(z.object({ transportId: z.string().uuid(), quantity: z.number().int().min(1).max(99) })).max(99).default([]),
   ticketLines: z
     .array(
       z.object({
@@ -1019,6 +1022,7 @@ export const publicRoute = new Hono()
       // La clave pública de Mercado Pago sólo hace falta para reintentar una compra con tarjeta
       // pendiente, y acá `sale` siempre es una compra completada.
       productora: { name: ev.productoraName, mpPublicKey: null },
+      transports: await purchasedTransports(db, { tenantId: ev.tenantId, eventId: ev.id, customerId: customer.id }),
       tickets: ticketRows.map((r) => ({
         id: r.id,
         qrHash: r.qrHash,
@@ -1367,6 +1371,10 @@ export const publicRoute = new Hono()
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },
       ticketTypes: ticketTypesOut,
+      transports: await db.select({ id: eventTransports.id, name: eventTransports.name,
+        address: eventTransports.address, latitude: eventTransports.latitude,
+        longitude: eventTransports.longitude, price: eventTransports.price,
+      }).from(eventTransports).where(and(eq(eventTransports.eventId, ev.id), eq(eventTransports.tenantId, ev.tenantId), eq(eventTransports.isActive, true))).orderBy(eventTransports.createdAt),
       drinkProducts,
       productCategories: productCategoriesOut,
     })
@@ -1457,6 +1465,7 @@ export const publicRoute = new Hono()
           clientTotal: body.clientTotal.trim(),
           ticketLines: body.ticketLines ?? [],
           drinkLines: body.drinkLines ?? [],
+          transportLines: body.transportLines ?? [],
           ...(body.promoterId !== undefined ? { promoterId: body.promoterId } : {}),
         })
       )
@@ -2078,6 +2087,10 @@ export const publicRoute = new Hono()
 
     return c.json({
       receiptToken: header.sale.receiptToken,
+      transports: await purchasedTransports(db, { tenantId: header.sale.tenantId,
+        eventId: header.sale.eventId,
+        ...(header.sale.customerId && header.sale.paid ? { customerId: header.sale.customerId } : { saleId }),
+      }),
       customerName:
         checkoutSnapshot?.contact?.name?.trim() ||
         ticketRows.find((ticket) => ticket.buyerName?.trim())?.buyerName?.trim() ||
