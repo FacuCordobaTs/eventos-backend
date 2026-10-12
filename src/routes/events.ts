@@ -219,6 +219,8 @@ const duplicateEventSchema = z.object({
 /** ISO 8601 instant from client (UTC or offset); null clears the window. */
 const patchEventSchema = z
   .object({
+    venue: z.string().max(255).nullable().optional(),
+    location: z.string().max(255).nullable().optional(),
     description: z.union([z.string().max(500), z.null()]).optional(),
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
@@ -4916,6 +4918,8 @@ export const eventsRoute = new Hono()
     }
 
     const setPayload: {
+      venue?: string | null
+      location?: string | null
       description?: string | null
       ticketsAvailableFrom?: Date | null
       consumptionsAvailableFrom?: Date | null
@@ -4924,6 +4928,13 @@ export const eventsRoute = new Hono()
       allowReentry?: boolean
       ageRestriction?: number | null
     } = {}
+    if (body.venue !== undefined || body.location !== undefined) {
+      if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+        return c.json({ error: "Solo administradores y gerentes pueden editar la ubicación." }, 403)
+      }
+      if (body.venue !== undefined) setPayload.venue = body.venue?.trim() || null
+      if (body.location !== undefined) setPayload.location = body.location?.trim() || null
+    }
     if (body.description !== undefined) {
       setPayload.description =
         body.description === null ? null : body.description.trim() || null
