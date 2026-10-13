@@ -70,6 +70,7 @@ import { ensurePromoterAccount } from "../lib/promoter-account"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, getBalance } from "../lib/balance"
 import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { cashPeriod, computeEventCashPeriod } from "../lib/event-cash-period"
 import { transportRevenue } from "../lib/transports"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
 import { admissionWindowFields, isAdmissionWindowOrdered } from "../lib/ticket-admission"
@@ -4642,6 +4643,26 @@ export const eventsRoute = new Hono()
   // Ceremonia de cierre (tarea 4.4 / spec §5). GET prepara los datos del flujo por pasos:
   // insumos con su estimación de sobrante + costo unitario, ingresos, gastos y caja esperada.
   // Si el evento ya está cerrado, devuelve además el `report` congelado (para 4.5).
+  .get("/:id/cash-period", async (c) => {
+    const ctx = c as unknown as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para ver la caja del evento." }, 403)
+    }
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    let period: ReturnType<typeof cashPeriod>
+    try {
+      period = cashPeriod(c.req.query("from") ?? "", c.req.query("to") ?? "")
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "Fechas inválidas." }, 400)
+    }
+    const db = drizzle(pool)
+    const eventId = c.req.param("id")
+    if (!(await requireEventForTenant(db, eventId, tenantId))) {
+      return c.json({ error: "Evento no encontrado" }, 404)
+    }
+    return c.json(await computeEventCashPeriod(db, tenantId, eventId, period))
+  })
   .get("/:id/closing", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
