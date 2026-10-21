@@ -1,3 +1,4 @@
+import { publicEventOrigin, publicEventApiPath } from "./lib/public-event-origin"
 import { Hono } from "hono"
 import { logger } from "hono/logger"
 import { tenantsRoute } from "./routes/tenants"
@@ -33,18 +34,21 @@ app.use("*", (c, next) => {
 app.use(
   "/*",
   cors({
-    origin: [
-      "https://crow.ar",
-      "https://admin.crow.ar",
-      "http://localhost:5173",
-      "http://127.0.0.1:5173",
-      // Tauri no sirve el frontend desde admin.crow.ar: en Windows WebView2 usa
-      // http://tauri.localhost (o https en configuraciones particulares) y en
-      // otros runtimes tauri://localhost.
-      "http://tauri.localhost",
-      "https://tauri.localhost",
-      "tauri://localhost",
-    ],  
+    origin: (origin, c) => {
+      if (publicEventApiPath(c.req.path) && publicEventOrigin(origin)) return origin
+      return [
+        "https://crow.ar",
+        "https://admin.crow.ar",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        // Tauri no sirve el frontend desde admin.crow.ar: en Windows WebView2 usa
+        // http://tauri.localhost (o https en configuraciones particulares) y en
+        // otros runtimes tauri://localhost.
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+      ].includes(origin) ? origin : null
+    },
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
     credentials: true,
