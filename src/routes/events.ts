@@ -99,6 +99,7 @@ import {
   REMINDER_LEAD_MIN_MINUTES,
 } from "../lib/whatsapp-reminder"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
+import { isValidTicketPromo, PROMO_INVALID_MESSAGE } from "../lib/ticket-promo"
 import {
   deleteFileByKey,
   keyFromPublicUrl,
@@ -281,8 +282,15 @@ const patchWhatsAppReminderSchema = z
     message: "No hay campos para actualizar",
   })
 
+// Promo "llevás X, pagás Y": ambos campos juntos, o ambos null para quitarla.
+const promoFields = {
+  promoBuy: z.union([z.number().int(), z.null()]).optional(),
+  promoPay: z.union([z.number().int(), z.null()]).optional(),
+}
+
 const createTicketTypeSchema = z.object({
   ...admissionWindowFields,
+  ...promoFields,
   name: z.string().min(1).max(100),
   price: z.coerce.number().nonnegative(),
   stockLimit: z
@@ -294,6 +302,7 @@ const createTicketTypeSchema = z.object({
 // Todos los campos opcionales: el front manda solo lo que cambió.
 const patchTicketTypeSchema = z.object({
   ...admissionWindowFields,
+  ...promoFields,
   name: z.string().min(1).max(100).optional(),
   price: z.coerce.number().nonnegative().optional(),
   stockLimit: z
@@ -1449,6 +1458,8 @@ function sanitizeTicketType(
     sold,
     validFrom: row.validFrom?.toISOString() ?? null,
     validUntil: row.validUntil?.toISOString() ?? null,
+    promoBuy: row.promoBuy ?? null,
+    promoPay: row.promoPay ?? null,
     remaining,
     // Cortesías canjeadas de este tipo, contadas aparte de `sold`.
     courtesies: courtesyCount,
@@ -1893,6 +1904,13 @@ export const eventsRoute = new Hono()
     if (!isAdmissionWindowOrdered(body)) {
       return c.json({ error: "El horario hasta debe ser posterior al horario desde." }, 400)
     }
+    const promo = {
+      promoBuy: body.promoBuy ?? null,
+      promoPay: body.promoPay ?? null,
+    }
+    if (!isValidTicketPromo(promo)) {
+      return c.json({ error: PROMO_INVALID_MESSAGE }, 400)
+    }
     await db.insert(ticketTypes).values({
       id,
       eventId,
@@ -1900,6 +1918,7 @@ export const eventsRoute = new Hono()
       name: body.name,
       price: priceStr,
       stockLimit: body.stockLimit ?? null,
+      ...promo,
       validFrom: body.validFrom ? new Date(body.validFrom) : null,
       validUntil: body.validUntil ? new Date(body.validUntil) : null,
     })
@@ -1945,6 +1964,13 @@ export const eventsRoute = new Hono()
       if (body.validUntil !== undefined) patch.validUntil = body.validUntil ? new Date(body.validUntil) : null
       if (!isAdmissionWindowOrdered({ ...row, ...patch })) {
         return c.json({ error: "El horario hasta debe ser posterior al horario desde." }, 400)
+      }
+      if (body.promoBuy !== undefined || body.promoPay !== undefined) {
+        patch.promoBuy = body.promoBuy !== undefined ? body.promoBuy : row.promoBuy
+        patch.promoPay = body.promoPay !== undefined ? body.promoPay : row.promoPay
+        if (!isValidTicketPromo({ promoBuy: patch.promoBuy, promoPay: patch.promoPay })) {
+          return c.json({ error: PROMO_INVALID_MESSAGE }, 400)
+        }
       }
       if (Object.keys(patch).length > 0) {
         await db

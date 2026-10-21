@@ -20,6 +20,7 @@ import {
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
 import { executeTicketPurchase, PurchaseError } from "./ticket-purchase"
+import { ticketPaidUnits } from "./ticket-promo"
 import { dec, decFromDb, decToDb } from "./decimal-money"
 import { debitBalance, fulfillPendingBalanceDeposit, getBalance } from "./balance"
 import { eventSupportsConsumptions } from "./event-operation-mode"
@@ -339,7 +340,7 @@ async function prepareGuestCheckout(
       throw new PurchaseError("OUT_OF_STOCK")
     }
 
-    total = total.add(decFromDb(tt.price).mul(line.quantity))
+    total = total.add(decFromDb(tt.price).mul(ticketPaidUnits(tt, line.quantity)))
   }
 
   for (const line of normalizedDrinks) {

@@ -1312,6 +1312,8 @@ export const publicRoute = new Hono()
         stockLimit: t.stockLimit,
         validFrom: t.validFrom?.toISOString() ?? null,
         validUntil: t.validUntil?.toISOString() ?? null,
+        promoBuy: t.promoBuy ?? null,
+        promoPay: t.promoPay ?? null,
         sold,
         remaining,
         availableForPurchase: limit == null || sold < limit,

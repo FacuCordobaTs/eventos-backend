@@ -351,6 +351,9 @@ export const ticketTypes = mysqlTable(
     // Ventana de ingreso/reingreso, instantes UTC. null = sin límite en ese extremo.
     validFrom: timestamp('valid_from'),
     validUntil: timestamp('valid_until'),
+    // Promo "llevás X, pagás Y" (2x1 = 2/1, 3x2 = 3/2). Ambas null = sin promo. Ver src/lib/ticket-promo.ts.
+    promoBuy: int('promo_buy'),
+    promoPay: int('promo_pay'),
   },
   (table) => ({
     tenantIdIdx: index('ticket_types_tenant_id_idx').on(table.tenantId),
