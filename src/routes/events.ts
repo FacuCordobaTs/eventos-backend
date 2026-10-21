@@ -476,7 +476,7 @@ async function countRedeemedCourtesies(
   ticketTypeId: string
 ): Promise<number> {
   const [row] = await db
-    .select({ n: count() })
+    .select({ n: sql<number>`COUNT(*) + COALESCE(SUM(JSON_LENGTH(${courtesies.extraTicketIds})), 0)` })
     .from(courtesies)
     .innerJoin(tickets, eq(courtesies.ticketId, tickets.id))
     .where(

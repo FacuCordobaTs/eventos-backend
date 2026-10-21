@@ -27,3 +27,8 @@ export function ticketPaidUnits(promo: TicketPromo, quantity: number): number {
   }
   return Math.floor(quantity / promo.promoBuy) * promo.promoPay + (quantity % promo.promoBuy)
 }
+
+/** Entradas que entrega una cortesía de este tipo: las X de la promo, o 1 si no hay. */
+export function courtesyTicketCount(promo: TicketPromo): number {
+  return isValidTicketPromo(promo) && promo.promoBuy != null ? promo.promoBuy : 1
+}

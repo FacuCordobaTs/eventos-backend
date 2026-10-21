@@ -527,6 +527,8 @@ export const courtesies = mysqlTable(
     status: mysqlEnum('status', ['PENDING', 'REDEEMED', 'REVOKED']).notNull().default('PENDING'),
     // Entrada emitida al canjear. Null hasta que se canjea.
     ticketId: varchar('ticket_id', { length: 36 }).references(() => tickets.id),
+    // Entradas adicionales emitidas al canjear un tipo con promo (2x1 = 1 extra). Null = ninguna.
+    extraTicketIds: json('extra_ticket_ids').$type<string[] | null>(),
     // Tragos de regalo (tarea 7.1): [{productId, quantity}] de consumiciones que el canje
     // emite además de la entrada. Null = invitación solo con entrada (como antes).
     drinkLines: json('drink_lines').$type<CourtesyDrinkLine[] | null>(),

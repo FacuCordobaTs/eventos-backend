@@ -23,6 +23,7 @@ import {
 } from "../db/schema"
 import type { PickupItemsJson } from "../db/schema"
 import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
+import { courtesyTicketCount } from "../lib/ticket-promo"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
 import { createTransportShare, cancelTransportShare, getTransportSharePreview, claimTransportShare, loadAllOwnerShares } from "../lib/transport-shares"
 import { ensureEventTransportTickets } from "../lib/transport-tickets"
@@ -2366,6 +2367,8 @@ export const publicRoute = new Hono()
         eventVenue: events.venue,
         eventLocation: events.location,
         ticketTypeName: ticketTypes.name,
+        ticketTypePromoBuy: ticketTypes.promoBuy,
+        ticketTypePromoPay: ticketTypes.promoPay,
       })
       .from(courtesies)
       .innerJoin(events, eq(courtesies.eventId, events.id))
@@ -2417,6 +2420,8 @@ export const publicRoute = new Hono()
         location: row.eventLocation,
       },
       ticketTypeName: row.ticketTypeName,
+      // Entradas que emite el canje (promo 2x1 = 2).
+      ticketCount: courtesyTicketCount({ promoBuy: row.ticketTypePromoBuy, promoPay: row.ticketTypePromoPay }),
       drinks,
       // Si ya se canjeó, exponemos el QR para que pueda volver a verlo.
       ticketId: row.courtesy.ticketId ?? null,
@@ -2454,7 +2459,12 @@ export const publicRoute = new Hono()
           const drinks = cty.drinkSaleId
             ? await courtesyDrinkQrs(tx, cty.drinkSaleId, cty.tenantId)
             : []
-          return { kind: "ok" as const, ticket: existing, alreadyRedeemed: true, drinks }
+          const extraIds = Array.isArray(cty.extraTicketIds) ? cty.extraTicketIds : []
+          const extraTickets =
+            extraIds.length > 0
+              ? await tx.select().from(tickets).where(inArray(tickets.id, extraIds))
+              : []
+          return { kind: "ok" as const, ticket: existing, extraTickets, alreadyRedeemed: true, drinks }
         }
       }
 
@@ -2481,20 +2491,27 @@ export const publicRoute = new Hono()
         return { kind: "err" as const, status: 404 as const, error: "Tipo de entrada no disponible" }
       }
 
-      const ticketId = uuidv4()
-      const qrHash = randomUUID()
-      await tx.insert(tickets).values({
-        id: ticketId,
-        ticketTypeId: cty.ticketTypeId,
-        eventId: cty.eventId,
-        tenantId: cty.tenantId,
-        qrHash,
-        status: "PENDING",
-        buyerName: cty.guestName,
-        buyerEmail: cty.guestEmail ?? null,
-        buyerDni: cty.guestDni ?? null,
-        createdAt: new Date(),
-      })
+      // Promo "llevás X, pagás Y": la cortesía entrega las X entradas, cada una con su QR.
+      const ticketCount = courtesyTicketCount(tt)
+      const issuedIds: string[] = []
+      for (let i = 0; i < ticketCount; i++) {
+        const id = uuidv4()
+        issuedIds.push(id)
+        await tx.insert(tickets).values({
+          id,
+          ticketTypeId: cty.ticketTypeId,
+          eventId: cty.eventId,
+          tenantId: cty.tenantId,
+          qrHash: randomUUID(),
+          status: "PENDING",
+          buyerName: cty.guestName,
+          buyerEmail: cty.guestEmail ?? null,
+          buyerDni: cty.guestDni ?? null,
+          createdAt: new Date(),
+        })
+      }
+      const ticketId = issuedIds[0]
+      const extraIds = issuedIds.slice(1)
 
       // Tragos de regalo (tarea 7.1): emite consumiciones PENDING canjeables en barra como
       // cualquier otra. Decisión de implementación (documentada en la migración 0047): se cuelgan
@@ -2553,7 +2570,13 @@ export const publicRoute = new Hono()
 
       await tx
         .update(courtesies)
-        .set({ status: "REDEEMED", ticketId, drinkSaleId, redeemedAt: new Date() })
+        .set({
+          status: "REDEEMED",
+          ticketId,
+          extraTicketIds: extraIds.length > 0 ? extraIds : null,
+          drinkSaleId,
+          redeemedAt: new Date(),
+        })
         .where(eq(courtesies.id, cty.id))
 
       const [row] = await tx
@@ -2566,7 +2589,12 @@ export const publicRoute = new Hono()
         ? await courtesyDrinkQrs(tx, drinkSaleId, cty.tenantId)
         : []
 
-      return { kind: "ok" as const, ticket: row!, alreadyRedeemed: false, drinks }
+      const extraTickets =
+        extraIds.length > 0
+          ? await tx.select().from(tickets).where(inArray(tickets.id, extraIds))
+          : []
+
+      return { kind: "ok" as const, ticket: row!, extraTickets, alreadyRedeemed: false, drinks }
     })
 
     if (outcome.kind === "err") {
@@ -2574,6 +2602,14 @@ export const publicRoute = new Hono()
     }
 
     const qrDataUrl = await qrCodeDataUrl(outcome.ticket.qrHash)
+    const extraTickets = await Promise.all(
+      outcome.extraTickets.map(async (t) => ({
+        id: t.id,
+        qrHash: t.qrHash,
+        status: t.status,
+        qrDataUrl: await qrCodeDataUrl(t.qrHash),
+      }))
+    )
     return c.json({
       message: outcome.alreadyRedeemed ? "Invitación ya canjeada" : "Invitación canjeada",
       alreadyRedeemed: outcome.alreadyRedeemed,
@@ -2585,6 +2621,8 @@ export const publicRoute = new Hono()
         buyerName: outcome.ticket.buyerName,
       },
       qrDataUrl,
+      // Entradas adicionales de la promo (2x1 = 1 extra), cada una con su QR.
+      extraTickets,
       // Tragos de regalo emitidos (tarea 7.1): consumiciones PENDING con su QR, listas para
       // retirar en barra como cualquier otra. Vacío si la invitación no traía tragos.
       drinks: outcome.drinks,
