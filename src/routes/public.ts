@@ -1380,6 +1380,7 @@ export const publicRoute = new Hono()
         designType: ev.designType ?? "MINIMAL",
         operationMode: ev.operationMode ?? "FULL_OPERATION",
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
+        ticketsSalesClosedAt: ev.ticketsSalesClosedAt ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
       },
       ticketTypes: ticketTypesOut,

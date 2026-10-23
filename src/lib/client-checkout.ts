@@ -306,6 +306,12 @@ async function prepareGuestCheckout(
 
   if (normalizedTickets.length > 0) {
     assertWindow(ev.ticketsAvailableFrom, "TICKETS_NOT_YET_AVAILABLE")
+    if (
+      ev.ticketsSalesClosedAt != null &&
+      Date.now() >= ev.ticketsSalesClosedAt.getTime()
+    ) {
+      throw new PurchaseError("TICKETS_SALES_CLOSED")
+    }
   }
   if (normalizedDrinks.length > 0) {
     assertWindow(ev.consumptionsAvailableFrom, "CONSUMPTIONS_NOT_YET_AVAILABLE")

@@ -12,6 +12,7 @@ export type PurchaseErrorCode =
   | "EVENT_INACTIVE"
   | "PRODUCT_NOT_FOUND"
   | "TICKETS_NOT_YET_AVAILABLE"
+  | "TICKETS_SALES_CLOSED"
   | "CONSUMPTIONS_NOT_YET_AVAILABLE"
   | "CONSUMPTIONS_DISABLED"
   | "CHECKOUT_TOTAL_MISMATCH"
@@ -200,6 +201,11 @@ export function purchaseErrorStatus(
       return {
         status: 403,
         body: { error: "La venta de entradas aún no está habilitada" },
+      }
+    case "TICKETS_SALES_CLOSED":
+      return {
+        status: 403,
+        body: { error: "La venta de entradas para este evento ya cerró" },
       }
     case "CONSUMPTIONS_NOT_YET_AVAILABLE":
       return {

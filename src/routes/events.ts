@@ -225,6 +225,7 @@ const patchEventSchema = z
     location: z.string().max(255).nullable().optional(),
     description: z.union([z.string().max(500), z.null()]).optional(),
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
+    ticketsSalesClosedAt: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     slug: z.union([eventSlugSchema, z.null()]).optional(),
     designType: z.enum(["GLASS", "MINIMAL"]).optional(),
@@ -234,7 +235,9 @@ const patchEventSchema = z
     ageRestriction: z.union([z.number().int().min(0).max(120), z.null()]).optional(),
   })
   .superRefine((data, ctx) => {
-    const check = (key: "ticketsAvailableFrom" | "consumptionsAvailableFrom") => {
+    const check = (
+      key: "ticketsAvailableFrom" | "ticketsSalesClosedAt" | "consumptionsAvailableFrom"
+    ) => {
       const v = data[key]
       if (v === undefined || v === null) return
       const t = Date.parse(v)
@@ -247,10 +250,12 @@ const patchEventSchema = z
       }
     }
     check("ticketsAvailableFrom")
+    check("ticketsSalesClosedAt")
     check("consumptionsAvailableFrom")
     if (
       data.description === undefined &&
       data.ticketsAvailableFrom === undefined &&
+      data.ticketsSalesClosedAt === undefined &&
       data.consumptionsAvailableFrom === undefined &&
       data.slug === undefined &&
       data.designType === undefined &&
@@ -540,6 +545,9 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     whatsappReminderEnabled: row.whatsappReminderEnabled ?? false,
     ticketsAvailableFrom: row.ticketsAvailableFrom
       ? row.ticketsAvailableFrom.toISOString()
+      : null,
+    ticketsSalesClosedAt: row.ticketsSalesClosedAt
+      ? row.ticketsSalesClosedAt.toISOString()
       : null,
     consumptionsAvailableFrom: row.consumptionsAvailableFrom
       ? row.consumptionsAvailableFrom.toISOString()
@@ -4969,6 +4977,7 @@ export const eventsRoute = new Hono()
       location?: string | null
       description?: string | null
       ticketsAvailableFrom?: Date | null
+      ticketsSalesClosedAt?: Date | null
       consumptionsAvailableFrom?: Date | null
       slug?: string | null
       designType?: "GLASS" | "MINIMAL"
@@ -4991,6 +5000,12 @@ export const eventsRoute = new Hono()
         body.ticketsAvailableFrom === null
           ? null
           : new Date(body.ticketsAvailableFrom)
+    }
+    if (body.ticketsSalesClosedAt !== undefined) {
+      setPayload.ticketsSalesClosedAt =
+        body.ticketsSalesClosedAt === null
+          ? null
+          : new Date(body.ticketsSalesClosedAt)
     }
     if (body.consumptionsAvailableFrom !== undefined) {
       setPayload.consumptionsAvailableFrom =

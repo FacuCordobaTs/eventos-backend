@@ -264,6 +264,8 @@ export const events = mysqlTable(
     /** Dirección geográfica usada para el mapa y "Cómo llegar". */
     location: varchar('location', { length: 255 }),
     ticketsAvailableFrom: timestamp('tickets_available_from'),
+    /** Cierre de venta de entradas: pasada esta fecha no se puede comprar más. NULL = sin cierre. */
+    ticketsSalesClosedAt: timestamp('tickets_sales_closed_at'),
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
     /**
      * Alcance operativo elegido al crear el evento.
