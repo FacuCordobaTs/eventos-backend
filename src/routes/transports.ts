@@ -114,7 +114,6 @@ export const transportsRoute = new Hono()
         .limit(1)
         .for("update")
       if (!event) return "missing" as const
-      if (event.status === "closed") return "closed" as const
       const id = randomUUID()
       await tx.insert(eventTransports).values({
         ...input,
@@ -129,8 +128,6 @@ export const transportsRoute = new Hono()
     })
     if (outcome === "missing")
       return c.json({ error: "Evento no encontrado" }, 404)
-    if (outcome === "closed")
-      return c.json({ error: "El evento ya está cerrado" }, 409)
     return c.json(outcome, 201)
   })
   .put(
@@ -150,7 +147,6 @@ export const transportsRoute = new Hono()
           .limit(1)
           .for("update")
         if (!event) return "missing"
-        if (event.status === "closed") return "closed"
         const scope = and(
           eq(eventTransports.id, transportId),
           eq(eventTransports.eventId, eventId),
@@ -175,8 +171,6 @@ export const transportsRoute = new Hono()
       })
       if (outcome === "missing")
         return c.json({ error: "Transporte o evento no encontrado" }, 404)
-      if (outcome === "closed")
-        return c.json({ error: "El evento ya está cerrado" }, 409)
       return c.json({ id: transportId })
     }
   )

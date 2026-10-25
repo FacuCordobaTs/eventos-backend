@@ -261,10 +261,6 @@ async function prepareGuestCheckout(
   if (!ev) {
     throw new PurchaseError("EVENT_NOT_FOUND")
   }
-  // Tarea 11.3 — `isActive` retirado: el evento no disponible es el cerrado.
-  if (ev.status === "closed") {
-    throw new PurchaseError("EVENT_INACTIVE")
-  }
 
   if (
     normalizedDrinks.length > 0 &&

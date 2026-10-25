@@ -78,17 +78,10 @@ describe("estado del recordatorio", () => {
     expect(stateOf({ date: at(-10), doorsAt: at(30) })).toBe("SENDING")
   })
 
-  test("en vivo también sale mientras falte para la hora del evento", () => {
-    expect(stateOf({ status: "live", date: at(30) })).toBe("SENDING")
-  })
-
-  test("en borrador espera a que se abra la venta, aunque esté dentro de la ventana", () => {
-    expect(stateOf({ status: "draft", date: at(30) })).toBe("WAITING_SALE")
-    expect(stateOf({ status: "draft", date: at(300) })).toBe("WAITING_SALE")
-  })
-
-  test("un evento cerrado no manda más recordatorios", () => {
-    expect(stateOf({ status: "closed", date: at(30) })).toBe("EVENT_CLOSED")
+  test.each(["draft", "on_sale", "live", "closed"] as const)("%s: programa por horario, sin depender del estado histórico", (status: "draft" | "on_sale" | "live" | "closed") => {
+    expect(stateOf({ status, date: at(30) })).toBe("SENDING")
+    expect(stateOf({ status, date: at(300) })).toBe("SCHEDULED")
+    expect(stateOf({ status, date: at(-1) })).toBe("MISSED")
   })
 
   test("apagado no sale, y apagado gana sobre 'se perdió la hora'", () => {

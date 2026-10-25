@@ -1187,9 +1187,6 @@ export const publicRoute = new Hono()
     const tenantFilter = c.req.query("productoraId")
 
     const filters: SQL[] = [
-      // Tarea 11.3 — `isActive` retirado: la visibilidad pública vive en `status`
-      // (el viejo sync de transición hacía `isActive = status !== "closed"`).
-      ne(events.status, "closed"),
       eq(tenants.isActive, true),
       gte(events.date, new Date()),
     ]
@@ -1227,19 +1224,13 @@ export const publicRoute = new Hono()
     const slugOrId = c.req.param("id")
     const db = drizzle(pool)
 
-    console.log("slugOrId")
-    console.log(slugOrId)
-
     const [ev] = await db
       .select()
       .from(events)
       .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
       .limit(1)
 
-    console.log("ev")
-    console.log(ev)
-
-    if (!ev || ev.status === "closed") {
+    if (!ev) {
       return c.json({ error: "Evento no encontrado" }, 404)
     }
 
@@ -1253,18 +1244,12 @@ export const publicRoute = new Hono()
       .where(eq(tenants.id, ev.tenantId))
       .limit(1)
 
-    console.log("productoraRow")
-    console.log(productoraRow)
-
     const types = await db
       .select()
       .from(ticketTypes)
       .where(
         and(eq(ticketTypes.eventId, ev.id), eq(ticketTypes.tenantId, ev.tenantId))
       )
-
-    console.log("types")
-    console.log(types)
 
     const consumptionRows = eventSupportsConsumptions(
       ev.operationMode ?? "FULL_OPERATION"
@@ -1321,9 +1306,6 @@ export const publicRoute = new Hono()
       })
     }
 
-    console.log("ticketTypesOut")
-    console.log(ticketTypesOut)
-
     const drinkProducts = consumptionRows.map((r) => ({
       id: r.id,
       name: r.name,
@@ -1354,9 +1336,6 @@ export const publicRoute = new Hono()
     const productCategoriesOut = [...categoryMap.values()].sort(
       (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name)
     )
-
-    console.log("drinkProducts")
-    console.log(drinkProducts)
 
     return c.json({
       productora: {
@@ -1392,9 +1371,7 @@ export const publicRoute = new Hono()
       productCategories: productCategoriesOut,
     })
   })
-  // Reporte de cierre público y de solo lectura (tarea 4.5 / spec §5 "Cerrado": compartible por
-  // link). Solo responde para eventos ya cerrados con su liquidación congelada; los eventos
-  // cerrados tienen `status = "closed"`, por eso NO reusamos el filtro de `/events/:id`.
+  // Los enlaces históricos de reportes siguen resolviendo su snapshot guardado.
   .get("/events/:id/report", async (c) => {
     const slugOrId = c.req.param("id")
     const db = drizzle(pool)
@@ -1405,7 +1382,7 @@ export const publicRoute = new Hono()
       .where(or(eq(events.id, slugOrId), eq(events.slug, slugOrId)))
       .limit(1)
 
-    if (!ev || ev.status !== "closed" || !ev.closingReport) {
+    if (!ev || !ev.closingReport) {
       return c.json({ error: "Reporte no disponible" }, 404)
     }
 
@@ -1671,7 +1648,7 @@ export const publicRoute = new Hono()
     const [ev] = await db
       .select({ id: events.id })
       .from(events)
-      .where(and(eq(events.id, eventId), ne(events.status, "closed")))
+      .where(and(eq(events.id, eventId)))
       .limit(1)
     if (!ev) {
       return c.json({ error: "Evento no encontrado" }, 404)
@@ -1712,7 +1689,6 @@ export const publicRoute = new Hono()
     const [paymentCtx] = await db
       .select({
         tenantId: events.tenantId,
-        status: events.status,
         cucuruEnabled: tenants.cucuruEnabled,
         mpConnected: tenants.mpConnected,
         mpPublicKey: tenants.mpPublicKey,
@@ -1724,9 +1700,6 @@ export const publicRoute = new Hono()
 
     if (!paymentCtx) {
       return c.json({ error: "Evento no encontrado" }, 404)
-    }
-    if (paymentCtx.status === "closed") {
-      return c.json({ error: "Evento no disponible" }, 404)
     }
     if (body.paymentMethod === "TRANSFER" && !paymentCtx.cucuruEnabled) {
       return c.json(
@@ -2474,7 +2447,7 @@ export const publicRoute = new Hono()
         .from(events)
         .where(eq(events.id, cty.eventId))
         .limit(1)
-      if (!ev || ev.status === "closed") {
+      if (!ev) {
         return { kind: "err" as const, status: 404 as const, error: "Evento no disponible" }
       }
 

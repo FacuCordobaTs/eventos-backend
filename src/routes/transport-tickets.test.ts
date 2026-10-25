@@ -68,9 +68,14 @@ test("requiere rol autorizado y asignación vigente en el evento", async () => {
   role = "TRANSPORTER"; assigned = false; expect((await scan()).status).toBe(403)
   expect(writes).toHaveLength(0)
 })
-test("pasaje cancelado, pago pendiente y evento cerrado no registran subidas", async () => {
+test("pasaje cancelado y pago pendiente no registran subidas", async () => {
   pass.status = "CANCELLED"; expect((await scan()).status).toBe(409)
   pass.status = "PENDING"; payment = "PENDING"; expect((await scan()).status).toBe(409)
-  payment = "COMPLETED"; closed = true; expect((await scan()).status).toBe(409)
   expect(writes).toHaveLength(0)
+})
+
+test("un evento con estado histórico cerrado permite subir un pasaje pagado", async () => {
+  closed = true
+  expect((await scan()).status).toBe(200)
+  expect(writes).toHaveLength(1)
 })

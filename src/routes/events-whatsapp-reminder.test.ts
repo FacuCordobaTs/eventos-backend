@@ -43,7 +43,7 @@ let queries: string[]
 function fakeDb() {
   const thenable = (table: () => string) => {
     const chain: Record<string, unknown> = {}
-    for (const method of ["from", "innerJoin", "leftJoin", "where", "orderBy", "limit"]) {
+    for (const method of ["from", "innerJoin", "leftJoin", "where", "orderBy", "groupBy", "limit"]) {
       chain[method] = () => chain
     }
     chain.from = (source: unknown) => {
@@ -74,7 +74,7 @@ function fakeDb() {
         where: () => {
           updates.push(values)
           Object.assign(eventRow ?? {}, values)
-          return Promise.resolve()
+          return Promise.resolve([{ affectedRows: 1 }])
         },
       }),
     }),
@@ -324,9 +324,13 @@ describe("confirmación de un envío inmediato", () => {
     expect(((await res.json()) as { state: string }).state).toBe("DISABLED")
   })
 
-  test("no la pide si el evento sigue en borrador: no sale hasta abrir la venta", async () => {
-    eventRow = insideWindow({ status: "draft", whatsappReminderEnabled: false })
-    expect((await patch({ enabled: true })).status).toBe(200)
+  test.each(["draft", "on_sale", "live", "closed"])("%s: activar dentro de la ventana pide confirmar el envío inmediato", async (status: string) => {
+    eventRow = insideWindow({ status, whatsappReminderEnabled: false })
+    expect((await patch({ enabled: true })).status).toBe(409)
+    expect(updates).toEqual([])
+    const res = await patch({ enabled: true, confirmSend: true })
+    expect(res.status).toBe(200)
+    expect((await res.json()).state).toBe("SENDING")
   })
 
   test("no la pide si el WhatsApp de la plataforma no está configurado: no sale nada", async () => {
@@ -371,5 +375,56 @@ describe("el evento y su duplicado", () => {
     })
     // El duplicado es un evento nuevo: su recordatorio todavía no salió.
     expect(created?.values).not.toHaveProperty("whatsappReminderSentAt")
+  })
+})
+
+describe("compatibilidad sin ciclo de estados", () => {
+  test.each(["draft", "on_sale", "live", "closed"])("%s: pedir transiciones antiguas conserva el evento y el reporte", async (status: string) => {
+    eventRow = { ...baseEvent(), status, closedAt: at(-60), closingReport: { netReal: "12345.67" } }
+    for (const to of ["draft", "on_sale", "live", "closed"]) {
+      const res = await eventsRoute.request("/event-1/transition", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to }),
+      })
+      expect(res.status).toBe(200)
+      expect((await res.json()).event).toMatchObject({ status, closingReport: { netReal: "12345.67" } })
+    }
+    expect(updates).toEqual([])
+  })
+})
+
+describe("protección de reportes históricos", () => {
+  test("un cliente anterior no puede sobrescribir el reporte existente", async () => {
+    eventRow = { ...baseEvent(), status: "closed", closingReport: { netReal: "12345.67" } }
+    const res = await eventsRoute.request("/event-1/closing", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counts: [] }),
+    })
+    expect(res.status).toBe(409)
+    expect(updates).toEqual([])
+    expect(eventRow.closingReport).toEqual({ netReal: "12345.67" })
+  })
+
+  test.each(["BARTENDER", "SECURITY", "PROMOTER", "GENERAL_PROMOTER"])("%s no puede guardar reportes", async (role: string) => {
+    asRole(role)
+    const res = await eventsRoute.request("/event-1/closing", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counts: [] }),
+    })
+    expect(res.status).toBe(403)
+    expect(updates).toEqual([])
+  })
+})
+
+describe("reporte de clientes anteriores sin cierre operativo", () => {
+  test.each(["draft", "on_sale", "live", "closed"])("%s: guardar el primer reporte conserva estado y marcas", async (status: string) => {
+    const historicalDate = at(-60)
+    eventRow = { ...baseEvent(), status, closingReport: null, closedAt: historicalDate, salesOpenedAt: historicalDate, wentLiveAt: historicalDate }
+    const res = await eventsRoute.request("/event-1/closing", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ counts: [] }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).event).toMatchObject({ status, closedAt: historicalDate.toISOString() })
+    expect(updates).toHaveLength(1)
+    expect(Object.keys(updates[0])).toEqual(["closingReport"])
+    expect(eventRow.salesOpenedAt).toBe(historicalDate)
+    expect(eventRow.wentLiveAt).toBe(historicalDate)
   })
 })

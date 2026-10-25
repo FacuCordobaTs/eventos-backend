@@ -23,18 +23,6 @@ function alertThreshold() {
   return dec(process.env.INVENTORY_ALERT_THRESHOLD ?? "100")
 }
 
-function deriveEventStatus(ev: {
-  date: Date
-  status: "draft" | "on_sale" | "live" | "closed"
-}): "active" | "draft" | "finished" {
-  // Tarea 11.3 — `isActive` retirado: el estado de la máquina es la fuente de verdad.
-  if (ev.status === "draft") return "draft"
-  if (ev.status === "closed") return "finished"
-  const d = new Date(ev.date)
-  if (Number.isNaN(d.getTime())) return "active"
-  return d.getTime() < Date.now() ? "finished" : "active"
-}
-
 export const analyticsRoute = new Hono()
   .use("*", authMiddleware)
   .get("/dashboard", async (c) => {
@@ -56,7 +44,6 @@ export const analyticsRoute = new Hono()
       .where(
         and(
           eq(events.tenantId, tenantId),
-          ne(events.status, "closed"),
           gte(events.date, now)
         )
       )
@@ -262,7 +249,7 @@ export const analyticsRoute = new Hono()
         eventId: ev.id,
         name: ev.name,
         date: ev.date,
-        status: deriveEventStatus(ev),
+        status: "active" as const,
         ticketRevenue: decToDb(ticketRev),
         productRevenue: decToDb(productRev),
         totalRevenue: decToDb(totalEv),

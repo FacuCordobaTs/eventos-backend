@@ -91,10 +91,6 @@ export async function executeTicketPurchase(
   if (!ev) {
     throw new PurchaseError("EVENT_NOT_FOUND")
   }
-  // Tarea 11.3 — `isActive` retirado: el evento no disponible es el cerrado.
-  if (ev.status === "closed") {
-    throw new PurchaseError("EVENT_INACTIVE")
-  }
 
   const tenantId = ev.tenantId
   if (

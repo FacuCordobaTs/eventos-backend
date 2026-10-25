@@ -303,11 +303,11 @@ const CLAIM = {
 }
 
 describe("Reclamar una entrada", () => {
-  test("un amigo nuevo queda registrado como cliente y recibe la entrada con un QR nuevo", async () => {
+  test.each(["draft", "on_sale", "live", "closed"])("%s: un amigo recibe la entrada con un QR nuevo", async (status: string) => {
     const { db, writes } = fakeDb({
       selects: [
         [SHARE],
-        [EVENT],
+        [{ ...EVENT, status }],
         [TYPE],
         [pendingTransfer(1), pendingTransfer(2)],
         [], // no hay cliente con ese DNI
@@ -542,17 +542,17 @@ describe("Reclamar una entrada", () => {
     expect(writes).toHaveLength(0)
   })
 
-  test("un link inexistente, cancelado o de un evento cerrado no entrega nada", async () => {
+  test("un link inexistente, cancelado o de un evento eliminado no entrega nada", async () => {
     const none = fakeDb({ selects: [[]] })
     expect(await claimTicketShare(none.db, "tok", CLAIM)).toEqual({ ok: false, code: "SHARE_NOT_FOUND" })
 
     const cancelled = fakeDb({ selects: [[{ ...SHARE, cancelledAt: new Date() }]] })
     expect(await claimTicketShare(cancelled.db, "tok", CLAIM)).toEqual({ ok: false, code: "SHARE_CANCELLED" })
 
-    const closed = fakeDb({ selects: [[SHARE], [{ ...EVENT, status: "closed" }]] })
-    expect(await claimTicketShare(closed.db, "tok", CLAIM)).toEqual({ ok: false, code: "EVENT_CLOSED" })
+    const missingEvent = fakeDb({ selects: [[SHARE], []] })
+    expect(await claimTicketShare(missingEvent.db, "tok", CLAIM)).toEqual({ ok: false, code: "EVENT_CLOSED" })
 
-    for (const scenario of [none, cancelled, closed]) expect(scenario.writes).toHaveLength(0)
+    for (const scenario of [none, cancelled, missingEvent]) expect(scenario.writes).toHaveLength(0)
   })
 
   test("sin cupos entregables el link está agotado, y los cupos muertos se anulan sin crear ningún cliente", async () => {
@@ -649,11 +649,11 @@ describe("Armar un link", () => {
   }
   const OWNER_ROW = { id: "owner-1" }
 
-  test("reserva la cantidad pedida entre las entradas que no están en otro link", async () => {
+  test.each(["draft", "on_sale", "live", "closed"])("%s: reserva entradas libres sin duplicar reservas", async (status: string) => {
     const { db, writes } = fakeDb({
       selects: [
         [OWNER_ROW],
-        [{ status: "on_sale" }],
+        [{ status }],
         [{ name: "General", validUntil: null }],
         [{ id: "t1" }, { id: "t2" }, { id: "t3" }],
         [{ ticketId: "t1" }], // t1 ya está en otro link
@@ -700,14 +700,14 @@ describe("Armar un link", () => {
     expect(writes).toHaveLength(0)
   })
 
-  test("rechaza cantidades inválidas, eventos cerrados, tipos ajenos y ventanas vencidas", async () => {
+  test("rechaza cantidades inválidas, eventos eliminados, tipos ajenos y ventanas vencidas", async () => {
     for (const quantity of [0, -1, 1.5, 51]) {
       const { db } = fakeDb({ selects: [] })
       expect(await createTicketShare(db, { ...ARGS, quantity })).toEqual({ ok: false, code: "INVALID_QUANTITY" })
     }
 
-    const closed = fakeDb({ selects: [[OWNER_ROW], [{ status: "closed" }]] })
-    expect(await createTicketShare(closed.db, ARGS)).toEqual({ ok: false, code: "EVENT_CLOSED" })
+    const missingEvent = fakeDb({ selects: [[OWNER_ROW], []] })
+    expect(await createTicketShare(missingEvent.db, ARGS)).toEqual({ ok: false, code: "EVENT_CLOSED" })
 
     const noType = fakeDb({ selects: [[OWNER_ROW], [{ status: "on_sale" }], []] })
     expect(await createTicketShare(noType.db, ARGS)).toEqual({ ok: false, code: "TICKET_TYPE_NOT_FOUND" })

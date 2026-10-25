@@ -76,8 +76,6 @@ import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
 import { admissionWindowFields, isAdmissionWindowOrdered } from "../lib/ticket-admission"
 import {
   EVENT_STATUSES,
-  eventStatusRank,
-  outgoingTransition,
   type EventStatus,
 } from "../lib/event-status"
 import {
@@ -631,11 +629,7 @@ function sanitizeBlacklistEntry(row: typeof admissionBlacklist.$inferSelect) {
   }
 }
 
-/**
- * Requisitos esenciales para "Abrir venta" (spec §5). Devuelve las piezas que faltan como
- * fragmentos ("al menos un tipo de entrada", "configurar el cobro") para que el header las una
- * en una sola frase. Esencial = al menos un tipo de entrada + el cobro configurado a nivel tenant.
- */
+/** Diagnóstico legado de configuración comercial para clientes anteriores. No bloquea operaciones. */
 type OpenSaleReadiness = { canOpenSale: boolean; missing: string[] }
 
 async function computeOpenSaleReadiness(
@@ -4497,8 +4491,7 @@ export const eventsRoute = new Hono()
 
     return c.json({ items })
   })
-  // Readiness para "Abrir venta" (spec §5). El header lee esto en borrador para atenuar el
-  // botón y mostrar en una línea qué falta. Ver `computeOpenSaleReadiness`.
+  // Diagnóstico de configuración conservado por compatibilidad de la API.
   .get("/:id/readiness", async (c) => {
     const ctx = c as AuthenticatedContext
     const tenantId = requireTenantId(ctx)
@@ -4587,12 +4580,7 @@ export const eventsRoute = new Hono()
       return c.json(await buildReminderOverview(db, updated, now))
     }
   )
-  // Transición de estado del evento (spec §5). El productor solo empuja dos manualmente:
-  // "Abrir venta" (draft→on_sale) y "Cerrar el evento" (live→closed). "Arrancar ahora"
-  // (on_sale→live) es override de lo automático a la hora de puertas. Solo se avanza (nunca se
-  // retrocede). El grafo es lineal (draft→on_sale→live→closed): para llegar a `to` se recorre
-  // el camino sellando las marcas efectivas. Abrir venta exige readiness. Si algún `to` saltea
-  // estados (p. ej. cerrar directo desde on_sale) se sellan todas las marcas intermedias.
+  // Compatibilidad con instalaciones anteriores: la transición ya no modifica el evento.
   .post(
     "/:id/transition",
     zValidator(
@@ -4608,7 +4596,6 @@ export const eventsRoute = new Hono()
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
       }
       const eventId = c.req.param("id")
-      const { to } = c.req.valid("json")
       const db = drizzle(pool)
 
       const ev = await requireEventForTenant(db, eventId, tenantId)
@@ -4616,62 +4603,7 @@ export const eventsRoute = new Hono()
         return c.json({ error: "Evento no encontrado" }, 404)
       }
 
-      const from = (ev.status ?? "draft") as EventStatus
-      if (from === to) {
-        return c.json({ event: sanitizeEvent(ev) })
-      }
-      if (eventStatusRank(to) <= eventStatusRank(from)) {
-        return c.json(
-          { error: "El estado del evento solo avanza, no retrocede." },
-          400
-        )
-      }
-
-      // Abrir venta exige lo esencial (tipo de entrada + cobro configurado).
-      if (from === "draft") {
-        const readiness = await computeOpenSaleReadiness(db, eventId, tenantId)
-        if (!readiness.canOpenSale) {
-          return c.json(
-            {
-              error: `Falta ${readiness.missing.join(" y ")}.`,
-              missing: readiness.missing,
-            },
-            422
-          )
-        }
-      }
-
-      const now = new Date()
-      const setPayload: {
-        status: EventStatus
-        salesOpenedAt?: Date
-        wentLiveAt?: Date
-        closedAt?: Date
-      } = { status: to }
-
-      // Recorrer el grafo lineal desde `from` hasta `to`, sellando cada marca efectiva.
-      let cursor: EventStatus | undefined = from
-      while (cursor && cursor !== to) {
-        const step = outgoingTransition(cursor)
-        if (!step) break
-        const next = step.to
-        if (next === "on_sale" && !ev.salesOpenedAt) setPayload.salesOpenedAt = now
-        if (next === "live" && !ev.wentLiveAt) setPayload.wentLiveAt = now
-        if (next === "closed") setPayload.closedAt = now
-        cursor = next
-      }
-
-      await db
-        .update(events)
-        .set(setPayload)
-        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
-
-      const [row] = await db
-        .select()
-        .from(events)
-        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
-        .limit(1)
-      return c.json({ event: sanitizeEvent(row) })
+      return c.json({ event: sanitizeEvent(ev) })
     }
   )
   // Ceremonia de cierre (tarea 4.4 / spec §5). GET prepara los datos del flujo por pasos:
@@ -4712,11 +4644,8 @@ export const eventsRoute = new Hono()
     const data = await computeClosingData(db, eventId, tenantId)
     return c.json({ ...data, report: ev.closingReport ?? null })
   })
-  // POST cierra el evento con la liquidación de la ceremonia: recibe el conteo REAL de insumos y
-  // la caja contada, recalcula todo del lado servidor (autoridad), congela el reporte en
-  // `events.closing_report` y transiciona el evento a `closed`. El costo se cuenta sobre la
-  // mercadería CONSUMIDA (lo comprado menos lo que sobró, valuado al costo unitario): el sobrante
-  // no es pérdida, viaja como stock valuado. La merma es la diferencia estimado − contado.
+  // Compatibilidad: guarda una liquidación sin bloquear el evento ni alterar su historial.
+  // Los snapshots anteriores se conservan; el balance actual se consulta por GET /closing.
   .post(
     "/:id/closing",
     zValidator(
@@ -4743,6 +4672,9 @@ export const eventsRoute = new Hono()
     ),
     async (c) => {
       const ctx = c as AuthenticatedContext
+      if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+        return c.json({ error: "No tenés permiso para guardar reportes del evento." }, 403)
+      }
       const tenantId = requireTenantId(ctx)
       if (!tenantId) {
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -4755,9 +4687,8 @@ export const eventsRoute = new Hono()
       if (!ev) {
         return c.json({ error: "Evento no encontrado" }, 404)
       }
-      const from = (ev.status ?? "draft") as EventStatus
-      if (from === "closed") {
-        return c.json({ error: "El evento ya está cerrado." }, 409)
+      if (ev.closingReport) {
+        return c.json({ error: "El evento ya tiene un reporte guardado." }, 409)
       }
 
       const data = await computeClosingData(db, eventId, tenantId)
@@ -4887,34 +4818,14 @@ export const eventsRoute = new Hono()
         insumos: reportInsumos,
       }
 
-      // Cierre = transición a `closed` sellando las marcas efectivas intermedias (grafo lineal).
-      const setPayload: {
-        status: EventStatus
-        isActive: boolean
-        salesOpenedAt?: Date
-        wentLiveAt?: Date
-        closedAt: Date
-        closingReport: EventClosingReport
-      } = {
-        status: "closed",
-        isActive: false,
-        closedAt: now,
-        closingReport: report,
-      }
-      let cursor: EventStatus | undefined = from
-      while (cursor && cursor !== "closed") {
-        const step = outgoingTransition(cursor)
-        if (!step) break
-        if (step.to === "on_sale" && !ev.salesOpenedAt)
-          setPayload.salesOpenedAt = now
-        if (step.to === "live" && !ev.wentLiveAt) setPayload.wentLiveAt = now
-        cursor = step.to
-      }
-
-      await db
+      // La condición evita reemplazar un reporte si dos clientes antiguos confirman a la vez.
+      const [saved] = await db
         .update(events)
-        .set(setPayload)
-        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+        .set({ closingReport: report })
+        .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId), isNull(events.closingReport)))
+      if (saved.affectedRows !== 1) {
+        return c.json({ error: "El evento ya tiene un reporte guardado." }, 409)
+      }
 
       const [row] = await db
         .select()

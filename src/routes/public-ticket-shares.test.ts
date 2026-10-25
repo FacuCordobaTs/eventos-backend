@@ -513,3 +513,33 @@ test("una sesión con pasaje transferido habilita su evento aunque no tenga entr
   const response = await post("/ticket-shares", { customerToken: token, eventId: "event-1", transportId: "22222222-2222-4222-8222-222222222222", quantity: 1 })
   expect(response.status).toBe(201)
 })
+
+describe("tienda y reportes sin estados de evento", () => {
+  const legacyEvent = (status: string) => ({
+    id: "event-1", tenantId: "tenant-1", slug: "fiesta", name: "Fiesta",
+    date: new Date("2026-10-10T20:00:00.000Z"), status, operationMode: "TICKETS_ONLY",
+    closingReport: { closedAt: "2026-10-11T04:00:00.000Z", netReal: "12345.67" },
+  })
+
+  test.each(["draft", "on_sale", "live", "closed"])("%s: la tienda existente responde por su enlace", async (status: string) => {
+    selectQueue = [[legacyEvent(status)], [{ name: "Productora", mpConnected: true }], [], []]
+    const res = await publicRoute.request("/events/fiesta")
+    expect(res.status).toBe(200)
+    expect((await res.json()).event).toMatchObject({ id: "event-1", slug: "fiesta", name: "Fiesta" })
+    expect(dbUpdates).toEqual([])
+  })
+
+  test.each(["draft", "on_sale", "live", "closed"])("%s: el enlace público conserva el reporte guardado", async (status: string) => {
+    const ev = legacyEvent(status)
+    selectQueue = [[ev], [{ name: "Productora" }]]
+    const res = await publicRoute.request("/events/fiesta/report")
+    expect(res.status).toBe(200)
+    expect((await res.json()).report).toEqual(ev.closingReport)
+    expect(dbUpdates).toEqual([])
+  })
+
+  test("sin snapshot no inventa un reporte", async () => {
+    selectQueue = [[{ ...legacyEvent("closed"), closingReport: null }]]
+    expect((await publicRoute.request("/events/fiesta/report")).status).toBe(404)
+  })
+})

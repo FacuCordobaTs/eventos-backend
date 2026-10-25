@@ -14,7 +14,7 @@ const freePass = (owner: string) => and(eq(transportTickets.customerId, owner), 
 export async function loadAllOwnerShares(db: Db, scope: Scope) {
   await ensureEventTransportTickets(db, scope)
   const original = await loadOwnerShares(db, scope)
-  const [event] = await db.select({ status: events.status }).from(events).where(and(eq(events.id, scope.eventId), eq(events.tenantId, scope.tenantId))).limit(1)
+  const [event] = await db.select({ id: events.id }).from(events).where(and(eq(events.id, scope.eventId), eq(events.tenantId, scope.tenantId))).limit(1)
   const passes = await db.select({ id: transportTickets.id, ticketId: transportTickets.ticketId, ticketTypeId: tickets.ticketTypeId, entryOwner: tickets.customerId, entryStatus: tickets.status, entryUnreserved: sql<number>`not exists (select 1 from ${ticketTransfers} where ${ticketTransfers.ticketId} = ${tickets.id} and ${ticketTransfers.status} = 'PENDING')`, transportId: saleTransports.transportId, name: saleTransports.name }).from(transportTickets).innerJoin(saleTransports, eq(saleTransports.id, transportTickets.bookingId)).innerJoin(sales, eq(sales.id, saleTransports.saleId)).leftJoin(tickets, eq(tickets.id, transportTickets.ticketId)).where(and(eq(transportTickets.tenantId, scope.tenantId), eq(transportTickets.eventId, scope.eventId), eq(sales.status, "COMPLETED"), freePass(scope.customerId)))
   const byRoute = new Map<string, { ticketTypeId: string; transportId: string; ticketTypeName: string; available: number; kind: "transport" }>()
   for (const pass of passes) {
@@ -26,10 +26,10 @@ export async function loadAllOwnerShares(db: Db, scope: Scope) {
   const busLinks = []
   for (const { share, name } of links) {
     const rows = await db.select({ transfer: transportTransfers, pass: transportTickets }).from(transportTransfers).innerJoin(transportTickets, eq(transportTickets.id, transportTransfers.transportTicketId)).where(eq(transportTransfers.shareId, share.id))
-    const summary = summarizeShare({ cancelledAt: share.cancelledAt, rows: rows.map(({ transfer, pass }) => ({ status: transfer.status, deliverable: pass.status === "PENDING" && pass.customerId === scope.customerId && event?.status !== "closed", claimantName: transfer.toName, claimedAt: transfer.claimedAt })) })
+    const summary = summarizeShare({ cancelledAt: share.cancelledAt, rows: rows.map(({ transfer, pass }) => ({ status: transfer.status, deliverable: pass.status === "PENDING" && pass.customerId === scope.customerId && event != null, claimantName: transfer.toName, claimedAt: transfer.claimedAt })) })
     if (summary.status === "ACTIVE" || summary.claimed) busLinks.push({ id: share.id, token: share.token, ticketTypeName: `Colectivo · ${name}`, kind: "transport" as const, createdAt: share.createdAt?.toISOString() ?? null, ...summary })
   }
-  const eligible = event && event.status !== "closed" ? [...original.eligible.map((entry) => ({ ...entry, transportAvailable: passes.filter((pass) => pass.ticketTypeId === entry.ticketTypeId && pass.entryOwner === scope.customerId && pass.entryStatus === "PENDING" && !!Number(pass.entryUnreserved)).length })), ...byRoute.values()] : []
+  const eligible = event != null ? [...original.eligible.map((entry) => ({ ...entry, transportAvailable: passes.filter((pass) => pass.ticketTypeId === entry.ticketTypeId && pass.entryOwner === scope.customerId && pass.entryStatus === "PENDING" && !!Number(pass.entryUnreserved)).length })), ...byRoute.values()] : []
   return { canShare: eligible.length > 0, eligible, links: [...original.links, ...busLinks], canIncludeTransport: passes.some((p) => !!p.ticketId && p.entryOwner === scope.customerId && p.entryStatus === "PENDING" && !!Number(p.entryUnreserved)) }
 }
 
@@ -39,8 +39,8 @@ export async function createTransportShare(db: Db, input: Scope & { transportId:
   return db.transaction(async (tx) => {
     const [owner] = await tx.select({ id: customers.id }).from(customers).where(eq(customers.id, input.customerId)).limit(1).for("update")
     if (!owner) return { ok: false, code: "HOLDER_NOT_FOUND" }
-    const [event] = await tx.select({ status: events.status }).from(events).where(and(eq(events.id, input.eventId), eq(events.tenantId, input.tenantId))).limit(1)
-    if (!event || event.status === "closed") return { ok: false, code: "EVENT_CLOSED" }
+    const [event] = await tx.select({ id: events.id }).from(events).where(and(eq(events.id, input.eventId), eq(events.tenantId, input.tenantId))).limit(1)
+    if (!event) return { ok: false, code: "EVENT_CLOSED" }
     const [route] = await tx.select().from(eventTransports).where(and(eq(eventTransports.id, input.transportId), eq(eventTransports.eventId, input.eventId), eq(eventTransports.tenantId, input.tenantId))).limit(1)
     if (!route) return { ok: false, code: "TICKET_TYPE_NOT_FOUND" }
     const passes = await tx.select({ id: transportTickets.id }).from(transportTickets).innerJoin(saleTransports, eq(saleTransports.id, transportTickets.bookingId)).innerJoin(sales, eq(sales.id, saleTransports.saleId)).where(and(eq(transportTickets.tenantId, input.tenantId), eq(transportTickets.eventId, input.eventId), eq(saleTransports.transportId, input.transportId), eq(sales.status, "COMPLETED"), freePass(input.customerId))).orderBy(asc(transportTickets.createdAt), asc(transportTickets.id)).limit(input.quantity).for("update")
@@ -68,7 +68,7 @@ export async function getTransportSharePreview(db: Db, token: string): Promise<(
   const rows = await db.select({ transfer: transportTransfers, pass: transportTickets }).from(transportTransfers).innerJoin(transportTickets, eq(transportTickets.id, transportTransfers.transportTicketId)).where(eq(transportTransfers.shareId, row.share.id))
   const summary = summarizeShare({ cancelledAt: row.share.cancelledAt, rows: rows.map(({ transfer, pass }) => ({ status: transfer.status, deliverable: pass.customerId === row.share.ownerCustomerId && pass.status === "PENDING", claimantName: null, claimedAt: null })) })
   const { id, slug, name, date, venue, location, imageUrl } = row.event
-  return { kind: "transport", transport: { name: row.route.name, address: row.route.address, latitude: row.route.latitude, longitude: row.route.longitude }, state: row.share.cancelledAt ? "CANCELLED" : row.event.status === "closed" ? "EVENT_CLOSED" : summary.pending ? "AVAILABLE" : "SOLD_OUT", hostName: firstNameOf(row.ownerName), productoraName: row.productoraName, event: { id, slug, name, date, venue, location, imageUrl }, ticketType: { name: `Colectivo · ${row.route.name}`, validFrom: null, validUntil: null }, remaining: summary.pending, total: summary.total }
+  return { kind: "transport", transport: { name: row.route.name, address: row.route.address, latitude: row.route.latitude, longitude: row.route.longitude }, state: row.share.cancelledAt ? "CANCELLED" : summary.pending ? "AVAILABLE" : "SOLD_OUT", hostName: firstNameOf(row.ownerName), productoraName: row.productoraName, event: { id, slug, name, date, venue, location, imageUrl }, ticketType: { name: `Colectivo · ${row.route.name}`, validFrom: null, validUntil: null }, remaining: summary.pending, total: summary.total }
 }
 
 class AbortClaim extends Error { constructor(readonly code: ShareErrorCode) { super(code) } }
@@ -79,7 +79,7 @@ export async function claimTransportShare(db: Db, token: string, input: ClaimInp
       if (!share) return { ok: false, code: "SHARE_NOT_FOUND" }
       if (share.cancelledAt) return { ok: false, code: "SHARE_CANCELLED" }
       const [event] = await tx.select().from(events).where(and(eq(events.id, share.eventId), eq(events.tenantId, share.tenantId))).limit(1)
-      if (!event || event.status === "closed") return { ok: false, code: "EVENT_CLOSED" }
+      if (!event) return { ok: false, code: "EVENT_CLOSED" }
       const [existing] = await tx.select().from(customers).where(eq(customers.dni, input.dni)).limit(1)
       if (existing?.isActive === false) return { ok: false, code: "CUSTOMER_INACTIVE" }
       if (existing?.id === share.ownerCustomerId) return { ok: false, code: "OWN_SHARE" }

@@ -106,8 +106,8 @@ afterEach(() => {
 })
 
 describe("recordatorio de WhatsApp", () => {
-  test("manda la plantilla a cada persona con su nombre, el del evento y el botón, y marca el evento", async () => {
-    candidates = [candidate()]
+  test.each(["draft", "on_sale", "live", "closed"])("%s: manda una vez por persona y sólo escribe la marca de envío", async (status: string) => {
+    candidates = [candidate({ status })]
     audiences = [[ANA, BETO]]
 
     await runJobsTick()
@@ -118,6 +118,8 @@ describe("recordatorio de WhatsApp", () => {
     ])
     expect(updates).toHaveLength(1)
     expect(updates[0].whatsappReminderSentAt).toBeInstanceOf(Date)
+    expect(Object.keys(updates[0])).toEqual(["whatsappReminderSentAt"])
+    expect(queries).not.toContain("transition")
   })
 
   test("sin slug el botón lleva el id del evento", async () => {

@@ -79,9 +79,8 @@ app.route("/api/webhook", webhookRoute)
 mountStockWebSocket(app)
 mountPublicQrWebSocket(app)
 
-// Tarea 8.2 — Runner de jobs de fondo (visión §2.3): recordatorio de WhatsApp 1 h antes y
-// transición on_sale → live a la hora de puertas. Tick inmediato + cada minuto. El estado
-// vive en DB (idempotente por columna), ver src/lib/jobs-runner.ts.
+// Recordatorios por horario y configuración del evento: tick inmediato y cada minuto.
+// La marca de envío vive en DB; el runner no cambia estados del evento.
 startJobsRunner()
 
 const port = Number(process.env.PORT ?? 3000)

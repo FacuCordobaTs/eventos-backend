@@ -1,7 +1,7 @@
 import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
-import { and, desc, eq, ne, sql } from "drizzle-orm"
+import { and, desc, eq, sql } from "drizzle-orm"
 import { drizzle } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import { events, eventStaff, eventTransports, saleTransports, sales, transportTickets } from "../db/schema"
@@ -19,7 +19,7 @@ export const transportTicketsRoute = new Hono().use("*", authMiddleware)
   .get("/events", async (c) => {
     const { staff } = c as unknown as AuthenticatedContext
     const db = drizzle(pool)
-    const rows = await db.select().from(events).where(and(eq(events.tenantId, staff.tenantId!), ne(events.status, "closed"), staff.role === "TRANSPORTER" ? sql`exists (select 1 from ${eventStaff} where ${eventStaff.eventId} = ${events.id} and ${eventStaff.tenantId} = ${staff.tenantId!} and ${eventStaff.staffId} = ${staff.id})` : undefined))
+    const rows = await db.select().from(events).where(and(eq(events.tenantId, staff.tenantId!), staff.role === "TRANSPORTER" ? sql`exists (select 1 from ${eventStaff} where ${eventStaff.eventId} = ${events.id} and ${eventStaff.tenantId} = ${staff.tenantId!} and ${eventStaff.staffId} = ${staff.id})` : undefined))
     const result = []
     for (const event of rows) {
       const transports = await db.select({ id: eventTransports.id, name: eventTransports.name, address: eventTransports.address }).from(eventTransports).where(and(eq(eventTransports.eventId, event.id), eq(eventTransports.tenantId, staff.tenantId!)))
@@ -32,7 +32,7 @@ export const transportTicketsRoute = new Hono().use("*", authMiddleware)
     const input = c.req.method === "GET" ? c.req.query() : await c.req.json().catch(() => ({}))
     const eventId = typeof input.eventId === "string" ? input.eventId : ""
     const db = drizzle(pool)
-    const [event] = await db.select({ id: events.id }).from(events).where(and(eq(events.id, eventId), eq(events.tenantId, staff.tenantId!), ne(events.status, "closed"), staff.role === "TRANSPORTER" ? sql`exists (select 1 from ${eventStaff} where ${eventStaff.eventId} = ${events.id} and ${eventStaff.tenantId} = ${staff.tenantId!} and ${eventStaff.staffId} = ${staff.id})` : undefined)).limit(1)
+    const [event] = await db.select({ id: events.id }).from(events).where(and(eq(events.id, eventId), eq(events.tenantId, staff.tenantId!), staff.role === "TRANSPORTER" ? sql`exists (select 1 from ${eventStaff} where ${eventStaff.eventId} = ${events.id} and ${eventStaff.tenantId} = ${staff.tenantId!} and ${eventStaff.staffId} = ${staff.id})` : undefined)).limit(1)
     if (!event) return c.json({ error: "No tenés acceso a este evento" }, 403)
     await ensureEventTransportTickets(db, { eventId, tenantId: staff.tenantId! })
     await next()
@@ -57,8 +57,8 @@ async function board(c: import("hono").Context) {
       const [assignment] = await tx.select({ id: eventStaff.id }).from(eventStaff).where(and(eq(eventStaff.eventId, input.eventId), eq(eventStaff.tenantId, staff.tenantId!), eq(eventStaff.staffId, staff.id))).limit(1).for("update")
       if (!assignment) return { error: "No tenés acceso a este evento", status: 403 as const }
     }
-    const [event] = await tx.select({ status: events.status }).from(events).where(and(eq(events.id, input.eventId), eq(events.tenantId, staff.tenantId!))).limit(1).for("update")
-    if (!event || event.status === "closed") return { error: "El evento está cerrado", status: 409 as const }
+    const [event] = await tx.select({ id: events.id }).from(events).where(and(eq(events.id, input.eventId), eq(events.tenantId, staff.tenantId!))).limit(1).for("update")
+    if (!event) return { error: "Evento no encontrado", status: 404 as const }
     const [row] = await tx.select({ pass: transportTickets, booking: saleTransports, saleStatus: sales.status, receiptToken: sales.receiptToken }).from(transportTickets).innerJoin(saleTransports, and(eq(saleTransports.id, transportTickets.bookingId), eq(saleTransports.tenantId, transportTickets.tenantId), eq(saleTransports.eventId, transportTickets.eventId))).innerJoin(sales, eq(sales.id, saleTransports.saleId)).where(and(eq(transportTickets.tenantId, staff.tenantId!), eq(transportTickets.eventId, input.eventId), eq(saleTransports.transportId, input.transportId), byDni ? and(eq(transportTickets.buyerDni, input.dni!), eq(transportTickets.status, "PENDING")) : eq(transportTickets.qrHash, input.qrHash!))).orderBy(transportTickets.createdAt, transportTickets.id).limit(1).for("update")
     if (!row) return { error: "No hay un pasaje válido para este transporte", status: 404 as const }
     if (row.saleStatus !== "COMPLETED") return { error: "El pasaje no está pagado", status: 409 as const }

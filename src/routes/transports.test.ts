@@ -114,14 +114,17 @@ describe("administración de transporte", () => {
     })
     expect(queryParams[0]).toEqual(["event-a", "tenant-a"])
   })
-  test("rechaza eventos ajenos, cerrados y ubicación inválida sin escribir", async () => {
+  test("rechaza eventos ajenos y ubicación inválida sin escribir", async () => {
     expect((await request("/event-other-tenant")).status).toBe(404)
-    closed = true
-    expect((await request()).status).toBe(409)
     expect(
       (await request("/event-a", "POST", { ...body, latitude: 91 })).status
     ).toBe(400)
     expect(inserted).toHaveLength(0)
+  })
+  test("un estado histórico cerrado permite crear y editar transportes", async () => {
+    closed = true
+    expect((await request()).status).toBe(201)
+    expect((await request("/event-a/transport-a", "PUT")).status).toBe(200)
   })
   test("la edición valida el transporte dentro del evento y tenant", async () => {
     expect((await request("/event-a/transport-a", "PUT")).status).toBe(200)

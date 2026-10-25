@@ -37,7 +37,8 @@ export const REMINDER_LEAD_MAX_MINUTES = 7 * 24 * 60
 
 /** Columnas del evento que deciden si el recordatorio sale y cuándo. */
 export type ReminderEventRow = {
-  status: EventStatus
+  /** Aceptado por compatibilidad; el horario no depende del estado histórico. */
+  status?: EventStatus
   date: Date
   doorsAt: Date | null
   whatsappReminderEnabled: boolean
@@ -65,20 +66,15 @@ export function reminderSendAt(referenceAt: Date, leadMinutes: number): Date {
  * Qué le pasa al recordatorio ahora mismo. El orden de las preguntas es el de la precedencia:
  *
  * - `SENT`: ya salió; no se repite.
- * - `EVENT_CLOSED`: el evento cerró; no hay más recordatorios.
  * - `DISABLED`: el administrador lo apagó.
  * - `MISSED`: la hora del evento ya pasó y no salió; no sale más.
- * - `WAITING_SALE`: el evento sigue en borrador; sale recién cuando se abra la venta (si todavía
- *   falta para el evento).
  * - `SENDING`: dentro de la ventana de envío; sale en el próximo minuto del runner.
  * - `SCHEDULED`: todavía no llegó la hora de envío.
  */
 export type ReminderState =
   | "SENT"
-  | "EVENT_CLOSED"
   | "DISABLED"
   | "MISSED"
-  | "WAITING_SALE"
   | "SENDING"
   | "SCHEDULED"
 
@@ -102,10 +98,8 @@ function stateOf(
   now: Date
 ): ReminderState {
   if (event.whatsappReminderSentAt) return "SENT"
-  if (event.status === "closed") return "EVENT_CLOSED"
   if (!event.whatsappReminderEnabled) return "DISABLED"
   if (now.getTime() >= referenceAt.getTime()) return "MISSED"
-  if (event.status === "draft") return "WAITING_SALE"
   if (now.getTime() >= sendAt.getTime()) return "SENDING"
   return "SCHEDULED"
 }

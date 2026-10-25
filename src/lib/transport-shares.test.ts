@@ -31,8 +31,8 @@ const share = { id: "share", eventId: "event", tenantId: "tenant", ownerCustomer
 const booking = { transportId: "bus", name: "Desde Santo Tomé", address: "7 de Marzo", latitude: "-31.66", longitude: "-60.76", priceAtTime: "18000.00" }
 const input = { firstName: "Ana", lastName: "García", dni: "30123456", phone: "5491155555555", email: "ana@example.com" }
 const row = { transfer: { id: "transfer" }, pass: { id: "pass", qrHash: "old-qr", status: "PENDING" }, booking }
-test("un pasaje solo reserva el cupo con locks, scope y exclusión de links combinados", async () => {
-  const f = fixture([[{ id: "buyer" }], [event], [{ id: "bus", name: booking.name }], [{ id: "pass" }]])
+test.each(["draft", "on_sale", "live", "closed"])("%s: reserva pasajes con locks, scope y exclusión de links combinados", async (status: string) => {
+  const f = fixture([[{ id: "buyer" }], [{ ...event, status }], [{ id: "bus", name: booking.name }], [{ id: "pass" }]])
   const result = await createTransportShare(f.db, { ...scope, transportId: "bus", quantity: 1 })
   expect(result.ok).toBe(true)
   expect(f.writes.map((w) => w.table)).toEqual(["transport_shares", "transport_transfers"])
@@ -43,8 +43,8 @@ test("un pasaje solo reserva el cupo con locks, scope y exclusión de links comb
   expect(passes.sql).toContain("transport_transfers")
   expect(passes.params).toEqual(["tenant", "event", "bus", "COMPLETED", "buyer", "PENDING"])
 })
-test("un traspaso de pasaje cambia titular y QR sin escribir entradas ni ventas", async () => {
-  const f = fixture([[share], [event], [{ id: "friend", isActive: true, name: "Privado", phone: "old", email: "private@example.com" }], [], [row]])
+test.each(["draft", "on_sale", "live", "closed"])("%s: traspasa el pasaje con un QR nuevo sin cambiar ventas", async (status: string) => {
+  const f = fixture([[share], [{ ...event, status }], [{ id: "friend", isActive: true, name: "Privado", phone: "old", email: "private@example.com" }], [], [row]])
   const result = await claimTransportShare(f.db, "token", input)
   expect(result.ok).toBe(true)
   if (!result.ok) return
@@ -66,9 +66,9 @@ test("si se escaneó durante el canje se revierte el traspaso completo", async (
   expect(await claimTransportShare(f.db, "token", input)).toEqual({ ok: false, code: "SOLD_OUT" })
   expect(f.rollback()).toBe(true)
 })
-test("link cancelado o evento cerrado nunca entrega pasajes", async () => {
-  for (const [s, ev, code] of [[{ ...share, cancelledAt: new Date() }, event, "SHARE_CANCELLED"], [share, { ...event, status: "closed" }, "EVENT_CLOSED"]] as const) {
-    const f = fixture([[s], [ev]])
+test("link cancelado o evento eliminado nunca entrega pasajes", async () => {
+  for (const [s, ev, code] of [[{ ...share, cancelledAt: new Date() }, event, "SHARE_CANCELLED"], [share, null, "EVENT_CLOSED"]] as const) {
+    const f = fixture([[s], ev ? [ev] : []])
     expect(await claimTransportShare(f.db, "token", input)).toEqual({ ok: false, code })
     expect(f.writes).toHaveLength(0)
   }

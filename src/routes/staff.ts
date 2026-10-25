@@ -351,7 +351,6 @@ export const staffRoute = new Hono()
           eq(eventStaff.staffId, ctx.staff.id),
           eq(eventStaff.tenantId, tenantId),
           eq(events.tenantId, tenantId),
-          ne(events.status, "closed")
         )
       )
       .orderBy(desc(events.date))
@@ -1184,7 +1183,6 @@ export const staffRoute = new Hono()
           eq(bars.tenantId, tenantId),
           eq(events.tenantId, tenantId),
           or(eq(bars.isActive, true), isNull(bars.isActive)),
-          ne(events.status, "closed"),
           ne(events.operationMode, "TICKETS_ONLY")
         )
       )

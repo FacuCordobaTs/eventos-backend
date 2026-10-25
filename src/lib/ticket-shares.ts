@@ -59,7 +59,7 @@ const SHARE_ERRORS: Record<ShareErrorCode, { status: 400 | 403 | 404 | 409 | 410
     status: 410,
     error: "Quien te lo mandó canceló este link. Pedile uno nuevo.",
   },
-  EVENT_CLOSED: { status: 410, error: "Este evento ya finalizó." },
+  EVENT_CLOSED: { status: 410, error: "Este evento no está disponible." },
   SOLD_OUT: { status: 409, error: "Ya se reclamaron todas las entradas de este link." },
   ALREADY_CLAIMED: {
     status: 409,
@@ -247,11 +247,11 @@ export async function loadOwnerShares(
   const now = new Date()
 
   const [ev] = await db
-    .select({ status: events.status })
+    .select({ id: events.id })
     .from(events)
     .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
     .limit(1)
-  const open = ev != null && ev.status !== "closed"
+  const open = ev != null
 
   const owned = await db
     .select({
@@ -418,11 +418,11 @@ export async function createTicketShare(db: Db, input: CreateShareInput): Promis
     if (!owner) return { ok: false as const, code: "HOLDER_NOT_FOUND" as const }
 
     const [ev] = await tx
-      .select({ status: events.status })
+      .select({ id: events.id })
       .from(events)
       .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
       .limit(1)
-    if (!ev || ev.status === "closed") return { ok: false as const, code: "EVENT_CLOSED" as const }
+    if (!ev) return { ok: false as const, code: "EVENT_CLOSED" as const }
 
     const [type] = await tx
       .select({ name: ticketTypes.name, validUntil: ticketTypes.validUntil })
@@ -607,7 +607,6 @@ export async function getSharePreview(db: Db, token: string): Promise<SharePrevi
       eventVenue: events.venue,
       eventLocation: events.location,
       eventImageUrl: events.imageUrl,
-      eventStatus: events.status,
       productoraName: tenants.name,
     })
     .from(ticketShares)
@@ -648,11 +647,9 @@ export async function getSharePreview(db: Db, token: string): Promise<SharePrevi
   const state: SharePreviewState =
     row.share.cancelledAt != null
       ? "CANCELLED"
-      : row.eventStatus === "closed"
-        ? "EVENT_CLOSED"
-        : summary.pending === 0
-          ? "SOLD_OUT"
-          : "AVAILABLE"
+      : summary.pending === 0
+        ? "SOLD_OUT"
+        : "AVAILABLE"
 
   return {
     state,
@@ -733,12 +730,11 @@ export async function claimTicketShare(
           venue: events.venue,
           location: events.location,
           imageUrl: events.imageUrl,
-          status: events.status,
         })
         .from(events)
         .where(and(eq(events.id, share.eventId), eq(events.tenantId, share.tenantId)))
         .limit(1)
-      if (!ev || ev.status === "closed") return { ok: false, code: "EVENT_CLOSED" }
+      if (!ev) return { ok: false, code: "EVENT_CLOSED" }
 
       const [type] = await tx
         .select({

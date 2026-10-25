@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { getTableName } from "drizzle-orm"
 import { MySqlDialect } from "drizzle-orm/mysql-core"
+import { executeTicketPurchase } from "./ticket-purchase"
 import {
   executeClientCheckout,
   fulfillPendingGuestCheckout
@@ -176,5 +177,28 @@ describe("checkout con transporte", () => {
       })
     ).rejects.toThrow("TRANSPORT_NOT_FOUND")
     expect(unavailable.rows.sale_transports).toHaveLength(0)
+  })
+})
+
+describe("operación con estados históricos", () => {
+  test.each(["draft", "on_sale", "live", "closed"])("%s: el checkout cobra y emite sin cambiar el evento", async (status: string) => {
+    const { db, rows } = fixture()
+    rows.events[0].status = status
+    const eventBefore = { ...rows.events[0] }
+    await executeClientCheckout(db, { ...params, paymentMethod: "SALDO" })
+    expect(rows.sales[0]).toMatchObject({ status: "COMPLETED", totalAmount: "28000.00" })
+    expect(rows.tickets).toHaveLength(1)
+    expect(rows.events[0]).toEqual(eventBefore)
+  })
+
+  test.each(["draft", "on_sale", "live", "closed"])("%s: emite entradas conservando tenant, cupo y horario", async (status: string) => {
+    const { db, rows, queries } = fixture()
+    rows.events[0].status = status
+    rows.ticket_types[0] = { ...rows.ticket_types[0], tenantId: "tenant-a", eventId: "event-a", name: "General" }
+    const result = await executeTicketPurchase(db, { eventId: "event-a", ticketTypeId: "ticket-a", buyerName: "Ana", buyerEmail: null, enforceTenantId: "tenant-a" })
+    expect(result.ticket.tenantId).toBe("tenant-a")
+    expect(rows.tickets).toHaveLength(1)
+    expect(queries.find((q) => q.table === "ticket_types")?.params).toContain("tenant-a")
+    expect(rows.events[0].status).toBe(status)
   })
 })
