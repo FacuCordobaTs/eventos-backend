@@ -41,7 +41,7 @@ function fakeDb() {
       const chain: Row = {}
       chain.from = (source: never) => { table = getTableName(source); return chain }
       chain.where = (sql: SQL) => { condition = sql; return chain }
-      for (const method of ["innerJoin", "leftJoin", "orderBy", "limit", "for"]) chain[method] = () => chain
+      for (const method of ["innerJoin", "leftJoin", "orderBy", "limit", "for", "for"]) chain[method] = () => chain
       chain.then = (resolve: (rows: Row[]) => unknown, reject: (e: unknown) => unknown) => {
         const query = condition ? dialect.sqlToQuery(condition) : { sql: "", params: [] }
         queries.push({ table, ...query })
@@ -136,6 +136,7 @@ beforeEach(() => {
     events: [{ id: "event-1", tenantId: "tenant-1", operationMode: "FULL_OPERATION" }],
     bars: [{ id: "bar-1", eventId: "event-1", tenantId: "tenant-1" }],
     products: [{ id: "water", tenantId: "tenant-1", name: "Agua", price: "0.10", saleType: "GLASS", isActive: true }],
+    bar_products: [{ id: "bp-water", tenantId: "tenant-1", barId: "bar-1", productId: "water", isActive: true, directStock: "10.00" }],
     event_products: [{ id: "ep-water", tenantId: "tenant-1", eventId: "event-1", productId: "water", isActive: true, priceOverride: null, directStock: "10.00" }],
   }
 })
@@ -149,7 +150,7 @@ describe("POST /inventory/sales: cola POS e idempotencia", () => {
     expect(response).toMatchObject({ saleId: body.requestId, receiptToken: body.clientSale.receiptToken, totalAmount: "0.30" })
     expect(response.consumptions.map((line: any) => line.qrHash)).toEqual(body.clientSale.lines[0].qrHashes)
     expect(tables.sales[0].createdAt.toISOString()).toBe(body.clientSale.createdAt)
-    expect(tables.event_products[0].directStock).toBe("7.00")
+    expect(tables.bar_products[0].directStock).toBe("7.00")
     expect(tables.pos_sale_requests[0].response).toEqual(response)
   })
   test("reintentar tras perder la respuesta no duplica venta, QR ni stock", async () => {
@@ -163,14 +164,14 @@ describe("POST /inventory/sales: cola POS e idempotencia", () => {
     expect(writes.length).toBe(writesAfterFirst)
     expect(tables.sales).toHaveLength(1)
     expect(tables.digital_consumptions).toHaveLength(3)
-    expect(tables.event_products[0].directStock).toBe("7.00")
+    expect(tables.bar_products[0].directStock).toBe("7.00")
   })
   test("dos envíos simultáneos de la misma venta retornan una sola operación", async () => {
     const body = baseSale()
     const responses = await Promise.all([request(body), request(body)])
     expect(responses.map((res) => res.status).sort()).toEqual([200, 201])
     expect(tables.sales).toHaveLength(1)
-    expect(tables.event_products[0].directStock).toBe("7.00")
+    expect(tables.bar_products[0].directStock).toBe("7.00")
   })
   test("cambiar la carga útil de un identificador usado responde 409", async () => {
     const body = baseSale()
@@ -192,7 +193,7 @@ describe("POST /inventory/sales: cola POS e idempotencia", () => {
     tables.event_products[0].priceOverride = "0.20"
     expect((await request(body)).status).toBe(409)
     expect(tables.sales ?? []).toHaveLength(0)
-    expect(tables.event_products[0].directStock).toBe("10.00")
+    expect(tables.bar_products[0].directStock).toBe("10.00")
   })
   test("saldo online se debita una única vez incluso al reintentar", async () => {
     const { clientSale, ...body } = baseSale()
@@ -254,10 +255,10 @@ describe("POST /inventory/sales: cola POS e idempotencia", () => {
     expect((await request(body)).status).toBe(500)
     expect(tables.sales ?? []).toHaveLength(0)
     expect(tables.pos_sale_requests ?? []).toHaveLength(0)
-    expect(tables.event_products[0].directStock).toBe("10.00")
+    expect(tables.bar_products[0].directStock).toBe("10.00")
     failingTable = null
     expect((await request(body)).status).toBe(201)
     expect(tables.sales).toHaveLength(1)
-    expect(tables.event_products[0].directStock).toBe("7.00")
+    expect(tables.bar_products[0].directStock).toBe("7.00")
   })
 })

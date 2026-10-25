@@ -9,6 +9,8 @@ import { resolveStaffRole, staffRoles } from "../lib/staff-roles"
 type Row = Record<string, any>
 let tables: Record<string, Row[]>
 let failPromoterInsert = false
+let failAssignmentInsert = false
+let failPromoterUpdate = false
 const dialect = new MySqlDialect()
 const person = (id: string, role: string, roles: string[] | null = null, tenantId = "tenant-a") => ({
   id, tenantId, role, roles, name: id, email: `${id}@example.test`, isActive: true,
@@ -37,12 +39,14 @@ function fakeDb() {
     },
     update: (source: any) => ({ set: (values: Row) => ({ where: async (condition: SQL) => {
       const table = getTableName(source)
+      if (table === "promoters" && failPromoterUpdate) throw new Error("fixture promoter update failed")
       for (const row of tables[table] ?? []) if (matches(table, row, condition)) Object.assign(row, values)
     } }) }),
-    insert: (source: any) => ({ values: async (values: Row) => {
+    insert: (source: any) => ({ values: async (values: Row | Row[]) => {
       const table = getTableName(source)
       if (table === "promoters" && failPromoterInsert) throw new Error("fixture insert failed")
-      ;(tables[table] ??= []).push({ ...values })
+      if (table === "event_staff" && failAssignmentInsert) throw new Error("fixture assignment failed")
+      ;(tables[table] ??= []).push(...(Array.isArray(values) ? values : [values]).map((row) => ({ ...row })))
     } }),
     transaction: async (callback: (tx: any) => any) => {
       const snapshot = structuredClone(tables)
@@ -60,6 +64,8 @@ app.onError(() => new Response("fixture transaction error", { status: 500 }))
 
 beforeEach(() => {
   failPromoterInsert = false
+  failAssignmentInsert = false
+  failPromoterUpdate = false
   tables = {
     staff: [person("admin", "ADMIN"), person("manager", "MANAGER"), person("employee", "TRANSPORTER", ["TRANSPORTER", "GENERAL_PROMOTER"]), person("other", "ADMIN", null, "tenant-b")],
     events: [{ id: "event-a", tenantId: "tenant-a" }, { id: "event-b", tenantId: "tenant-b" }],
@@ -159,4 +165,89 @@ test("general promoter cannot deactivate or reactivate a multi-function account"
 test("editing a name through the team endpoint preserves all roles", async () => {
   expect((await request("/staff/team/employee", "admin", { name: "Nombre nuevo" }, "PATCH")).status).toBe(200)
   expect(tables.staff[2].roles).toEqual(["TRANSPORTER", "GENERAL_PROMOTER"])
+})
+
+test("new events assign the whole active tenant team, for ADMIN and MANAGER in every operation mode", async () => {
+  tables.staff.push(person("inactive", "SECURITY"))
+  tables.staff.at(-1)!.isActive = false
+  for (const actor of ["admin", "manager"]) {
+    for (const operationMode of ["TICKETS_ONLY", "TICKETS_AND_CONSUMPTIONS", "FULL_OPERATION"]) {
+      const response = await request("/events", actor, { name: "Nuevo evento", date: "2026-11-12T22:00:00Z", operationMode })
+      expect(response.status).toBe(201)
+      const { event } = await response.json() as { event: { id: string } }
+      const assignments = tables.event_staff.filter((row) => row.eventId === event.id)
+      expect(assignments.map((row) => row.staffId).sort()).toEqual(["admin", "employee", "manager"])
+      expect(assignments.every((row) => row.tenantId === "tenant-a" && row.barId === null)).toBe(true)
+      expect(new Set(assignments.map((row) => row.id)).size).toBe(3)
+    }
+  }
+})
+
+test("event creation and default assignments roll back together without changing existing events", async () => {
+  tables.event_staff.push({ id: "previous", eventId: "event-a", tenantId: "tenant-a", staffId: "admin", barId: "bar-a" })
+  const snapshot = structuredClone(tables)
+  failAssignmentInsert = true
+  expect((await request("/events", "admin", { name: "Nuevo evento", date: "2026-11-12T22:00:00Z" })).status).toBe(500)
+  expect(tables).toEqual(snapshot)
+})
+
+test("operational roles cannot create events and grant default team access", async () => {
+  for (const role of ["GENERAL_PROMOTER", "PROMOTER", "BARTENDER", "SECURITY", "TRANSPORTER"]) {
+    tables.staff.push(person(`actor-${role}`, role))
+    expect((await request("/events", `actor-${role}`, { name: "Sin permiso", date: "2026-11-12T22:00:00Z" })).status).toBe(403)
+  }
+  expect(tables.events).toHaveLength(2)
+  expect(tables.event_staff).toHaveLength(0)
+})
+
+test("duplicated events include active tenant staff in all modes and preserve remapped bars", async () => {
+  tables.events[0] = { ...tables.events[0], name: "Origen", date: new Date("2026-11-12T22:00:00Z"), operationMode: "FULL_OPERATION" }
+  tables.staff.push({ ...person("inactive", "SECURITY"), isActive: false })
+  tables.bars = [{ id: "old-bar", eventId: "event-a", tenantId: "tenant-a", name: "Barra", isActive: true, isDefault: true }]
+  tables.event_staff = [{ id: "old-assignment", eventId: "event-a", tenantId: "tenant-a", staffId: "employee", barId: "old-bar" }]
+  for (const operationMode of ["TICKETS_ONLY", "FULL_OPERATION"]) {
+    const response = await request("/events/event-a/duplicate", "admin", { name: "Nuevo evento", date: "2026-11-13T22:00:00Z", operationMode })
+    expect(response.status).toBe(201)
+    const { event } = await response.json() as { event: { id: string } }
+    const assignments = tables.event_staff.filter((row) => row.eventId === event.id)
+    expect(assignments.map((row) => row.staffId).sort()).toEqual(["admin", "employee", "manager"])
+    const employeeBar = assignments.find((row) => row.staffId === "employee")!.barId
+    if (operationMode === "TICKETS_ONLY") expect(employeeBar).toBeNull()
+    else {
+      expect(employeeBar).not.toBe("old-bar")
+      expect(tables.bars.find((row) => row.id === employeeBar)?.eventId).toBe(event.id)
+    }
+  }
+  expect((await request("/events/event-a/duplicate", "employee", { name: "Sin permiso" })).status).toBe(403)
+})
+
+test("ADMIN removes employees from active team and revokes their sessions while preserving history", async () => {
+  tables.promoters.push({ id: "profile", staffId: "employee", tenantId: "tenant-a", isActive: true })
+  tables.event_staff.push({ id: "assignment", staffId: "employee", eventId: "event-a", tenantId: "tenant-a" })
+  const employeeToken = await createAccessToken("employee")
+  const assignments = structuredClone(tables.event_staff)
+  expect((await request("/staff/team/employee", "admin", undefined, "DELETE")).status).toBe(200)
+  expect(tables.staff.find((row) => row.id === "employee")?.isActive).toBe(false)
+  expect(tables.promoters[0].isActive).toBe(false)
+  expect(tables.event_staff).toEqual(assignments)
+  const team = await request("/staff/team", "admin", undefined, "GET")
+  expect((await team.json() as { staff: Row[] }).staff.some((row) => row.id === "employee")).toBe(false)
+  expect((await request("/staff/me", "employee", undefined, "GET", employeeToken)).status).toBe(401)
+})
+
+test("employee removal rejects self, other tenants, managers and unrelated operational roles", async () => {
+  expect((await request("/staff/team/admin", "admin", undefined, "DELETE")).status).toBe(400)
+  expect((await request("/staff/team/other", "admin", undefined, "DELETE")).status).toBe(403)
+  expect((await request("/staff/team/employee", "manager", undefined, "DELETE")).status).toBe(403)
+  tables.staff.push(person("security", "SECURITY"))
+  expect((await request("/staff/team/employee", "security", undefined, "DELETE")).status).toBe(403)
+  expect(tables.staff.every((row) => row.isActive)).toBe(true)
+})
+
+test("employee and promoter removal roll back together on failure", async () => {
+  tables.promoters.push({ id: "profile", staffId: "employee", tenantId: "tenant-a", isActive: true })
+  const snapshot = structuredClone(tables)
+  failPromoterUpdate = true
+  expect((await request("/staff/team/employee", "admin", undefined, "DELETE")).status).toBe(500)
+  expect(tables).toEqual(snapshot)
 })

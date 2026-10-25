@@ -1514,6 +1514,9 @@ export const eventsRoute = new Hono()
   })
   .post("/", zValidator("json", createEventSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (!["ADMIN", "MANAGER"].includes(ctx.staff.role)) {
+      return c.json({ error: "Solo administradores y gerentes pueden crear eventos." }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -1531,18 +1534,30 @@ export const eventsRoute = new Hono()
         return c.json({ error: SLUG_TAKEN_ERROR }, 409)
       }
     }
-    await db.insert(events).values({
-      id,
-      tenantId,
-      name: body.name,
-      description: body.description?.trim() || null,
-      date: new Date(body.date),
-      venue: body.venue ?? null,
-      location: body.location ?? null,
-      slug: body.slug ?? null,
-      operationMode: body.operationMode,
-      status: "draft",
-      createdAt: new Date(),
+    await db.transaction(async (tx) => {
+      await tx.insert(events).values({
+        id,
+        tenantId,
+        name: body.name,
+        description: body.description?.trim() || null,
+        date: new Date(body.date),
+        venue: body.venue ?? null,
+        location: body.location ?? null,
+        slug: body.slug ?? null,
+        operationMode: body.operationMode,
+        status: "draft",
+        createdAt: new Date(),
+      })
+      // El equipo activo participa por defecto. Crear el evento y sus asignaciones es
+      // atómico; abrir Equipo nunca agrega personas ni repone asignaciones quitadas.
+      const activeTeam = await tx.select({ id: staff.id }).from(staff)
+        .where(and(eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
+      if (activeTeam.length > 0) {
+        await tx.insert(eventStaff).values(activeTeam.map((member) => ({
+          id: uuidv4(), eventId: id, tenantId, staffId: member.id,
+          barId: null, createdAt: new Date(),
+        })))
+      }
     })
     const [row] = await db
       .select()
@@ -1638,6 +1653,9 @@ export const eventsRoute = new Hono()
   // 'draft', sin slug propio (el del origen es su link y no se hereda), sin fechas de apertura/cierre.
   .post("/:id/duplicate", zValidator("json", duplicateEventSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (!["ADMIN", "MANAGER"].includes(ctx.staff.role)) {
+      return c.json({ error: "Solo administradores y gerentes pueden crear eventos." }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -1812,18 +1830,24 @@ export const eventsRoute = new Hono()
           productId: bp.productId,
           tenantId,
           isActive: bp.isActive,
+          directStock: bp.directStock == null ? null : "0.00",
           createdAt: new Date(),
         })
       }
 
-      // Equipo: cada persona con su puesto (barId remapeado si estaba asignada a uno).
-      for (const es of supportsConsumptions ? srcEventStaff : []) {
-        const newBarId = es.barId ? barIdMap.get(es.barId) ?? null : null
+      // Todo evento nuevo incluye al equipo activo. Al partir de otro evento, se
+      // conserva además la barra de las personas que ya estaban en el origen.
+      const activeTeam = await tx.select({ id: staff.id }).from(staff)
+        .where(and(eq(staff.tenantId, tenantId), eq(staff.isActive, true)))
+      const sourceAssignments = new Map(srcEventStaff.map((member) => [member.staffId, member]))
+      for (const member of activeTeam) {
+        const sourceBarId = sourceAssignments.get(member.id)?.barId
+        const newBarId = supportsConsumptions && sourceBarId ? barIdMap.get(sourceBarId) ?? null : null
         await tx.insert(eventStaff).values({
           id: uuidv4(),
           eventId: newEventId,
           tenantId,
-          staffId: es.staffId,
+          staffId: member.id,
           barId: newBarId,
           createdAt: new Date(),
         })
@@ -2854,6 +2878,7 @@ export const eventsRoute = new Hono()
     zValidator("json", toggleEventProductSchema),
     async (c) => {
       const ctx = c as AuthenticatedContext
+      if (!(ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER")) return c.json({ error: "No tenés permiso para modificar productos" }, 403)
       const tenantId = requireTenantId(ctx)
       if (!tenantId) {
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -2958,6 +2983,7 @@ export const eventsRoute = new Hono()
     ),
     async (c) => {
       const ctx = c as AuthenticatedContext
+      if (!(ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER")) return c.json({ error: "No tenés permiso para modificar productos" }, 403)
       const tenantId = requireTenantId(ctx)
       if (!tenantId) {
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -3716,6 +3742,7 @@ export const eventsRoute = new Hono()
   })
   .post("/:id/bars", zValidator("json", createBarSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (!(ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER")) return c.json({ error: "No tenés permiso para modificar barras" }, 403)
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -3766,6 +3793,7 @@ export const eventsRoute = new Hono()
           .select({
             productId: barProducts.productId,
             isActive: barProducts.isActive,
+            directStock: barProducts.directStock,
           })
           .from(barProducts)
           .where(
@@ -3782,6 +3810,7 @@ export const eventsRoute = new Hono()
           productId: m.productId,
           tenantId,
           isActive: m.isActive ?? true,
+          directStock: m.directStock == null ? null : "0.00",
           createdAt: new Date(),
         }))
       )
@@ -3805,7 +3834,8 @@ export const eventsRoute = new Hono()
     zValidator("json", updateBarSchema),
     async (c) => {
       const ctx = c as AuthenticatedContext
-      const tenantId = requireTenantId(ctx)
+        if (!(ctx.staff.role === "ADMIN" || ctx.staff.role === "MANAGER")) return c.json({ error: "No tenés permiso para modificar barras" }, 403)
+    const tenantId = requireTenantId(ctx)
       if (!tenantId) {
         return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
       }

@@ -37,7 +37,7 @@ function fakeDb() {
       const chain: Row = {}
       chain.from = (source: never) => { table = getTableName(source); return chain }
       chain.where = (sql: SQL) => { condition = sql; return chain }
-      for (const method of ["innerJoin", "leftJoin", "orderBy", "limit"]) chain[method] = () => chain
+      for (const method of ["innerJoin", "leftJoin", "orderBy", "limit", "for"]) chain[method] = () => chain
       chain.then = (resolve: (rows: Row[]) => unknown, reject: (e: unknown) => unknown) => {
         const query = condition ? dialect.sqlToQuery(condition) : { sql: "", params: [] }
         queries.push({ table, ...query })
@@ -106,6 +106,7 @@ beforeEach(() => {
     products: [{ id: "food", tenantId: "tenant-1", name: "Hamburguesa", price: "10.10", saleType: "GLASS", categoryId: "cat-food", isActive: true }, { id: "drink", tenantId: "tenant-1", name: "Agua", price: "3.20", saleType: "GLASS", categoryId: null, isActive: true }],
     events: [{ id: "event-1", tenantId: "tenant-1", operationMode: "TICKETS_AND_CONSUMPTIONS" }],
     bars: [{ id: "bar-1", eventId: "event-1", tenantId: "tenant-1" }],
+    bar_products: [{ id: "bp-food", tenantId: "tenant-1", barId: "bar-1", productId: "food", isActive: true, directStock: "10.00" }, { id: "bp-drink", tenantId: "tenant-1", barId: "bar-1", productId: "drink", isActive: true }],
     event_products: [{ id: "ep-food", tenantId: "tenant-1", eventId: "event-1", productId: "food", isActive: true, priceOverride: "12.35", directStock: "10.00" }, { id: "ep-drink", tenantId: "tenant-1", eventId: "event-1", productId: "drink", isActive: true, priceOverride: null, directStock: null }],
   }
 })
@@ -205,7 +206,7 @@ describe("POS de comida y bebidas", () => {
       expect(consumptions).toHaveLength(3)
       expect(new Set(consumptions.map((c) => c.values.qrHash)).size).toBe(3)
       expect(consumptions.every((c) => c.values.tenantId === "tenant-1" && c.values.eventId === "event-1" && c.values.status === "PENDING")).toBe(true)
-      expect(tables.event_products[0].directStock).toBe(mode === "FULL_OPERATION" ? "8.00" : "10.00")
+      expect(tables.bar_products[0].directStock).toBe(mode === "FULL_OPERATION" ? "8.00" : "10.00")
     })
   }
   for (const mismatch of ["inactive", "tenant", "event"]) {
@@ -223,4 +224,18 @@ describe("POS de comida y bebidas", () => {
     expect((await sale()).status).toBe(201)
     expect(writes.find((w) => w.table === "sales")?.values.totalAmount).toBe("3.20")
   })
+})
+
+
+describe("Menú real de la barra en POS", () => {
+  for (const mismatch of ["inactive", "tenant", "bar"]) {
+    test(`no cobra productos fuera de la barra por ${mismatch}`, async () => {
+      const row = tables.bar_products[0]
+      if (mismatch === "inactive") row.isActive = false
+      if (mismatch === "tenant") row.tenantId = "tenant-2"
+      if (mismatch === "bar") row.barId = "bar-2"
+      expect((await sale()).status).toBe(400)
+      expect(writes.some((row) => row.table === "sales")).toBe(false)
+    })
+  }
 })

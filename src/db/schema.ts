@@ -791,6 +791,8 @@ export const barProducts = mysqlTable(
       .notNull()
       .references(() => tenants.id),
     isActive: boolean('is_active').default(true),
+    /** Unidades propias de la barra para productos sin receta. NULL = sin control. */
+    directStock: decimal('direct_stock', { precision: 10, scale: 2 }),
     createdAt: timestamp('created_at').defaultNow(),
   },
   (table) => ({

@@ -589,10 +589,14 @@ export const staffRoute = new Hono()
       return c.json({ error: "La cuenta ya está desactivada" }, 400)
     }
 
-    await db.update(staff).set({ isActive: false }).where(eq(staff.id, id))
-    if (isPromoterAccount(target)) {
-      await db.update(promoters).set({ isActive: false }).where(eq(promoters.staffId, id))
-    }
+    await db.transaction(async (tx) => {
+      await tx.update(staff).set({ isActive: false })
+        .where(and(eq(staff.id, id), staffTenantScope(target.tenantId)))
+      if (isPromoterAccount(target) && target.tenantId) {
+        await tx.update(promoters).set({ isActive: false })
+          .where(and(eq(promoters.staffId, id), eq(promoters.tenantId, target.tenantId)))
+      }
+    })
     return c.json({ ok: true })
   })
   .post("/team/:id/reactivate", authMiddleware, adminOrGeneralPromoter, async (c) => {

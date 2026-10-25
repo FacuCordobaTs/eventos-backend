@@ -8,6 +8,7 @@ import { pool } from "../db"
 import { createHash, randomUUID } from "node:crypto"
 import {
   barInventory,
+  barProducts,
   bars,
   digitalConsumptions,
   eventExpenses,
@@ -457,6 +458,7 @@ export const inventoryRoute = new Hono()
   })
   .post("/items", zValidator("json", upsertItemSchema), async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") return c.json({ error: "No tenés permiso para administrar insumos" }, 403)
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -1564,7 +1566,7 @@ export const inventoryRoute = new Hono()
           .where(
             and(eq(events.id, body.eventId), eq(events.tenantId, tenantId))
           )
-          .limit(1)
+          .limit(1).for("update")
         if (!ev) {
           return { kind: "bad_event" as const }
         }
@@ -1581,7 +1583,7 @@ export const inventoryRoute = new Hono()
         let saleBarId: string | null = null
         if (body.barId != null && body.barId !== "") {
           const [barRow] = await tx
-            .select({ id: bars.id })
+            .select({ id: bars.id, isActive: bars.isActive })
             .from(bars)
             .where(
               and(
@@ -1591,10 +1593,22 @@ export const inventoryRoute = new Hono()
               )
             )
             .limit(1)
-          if (!barRow) {
+          if (!barRow || barRow.isActive === false) {
             return { kind: "bad_bar" as const }
           }
           saleBarId = barRow.id
+        }
+
+        if (body.items.length > 0 && !saleBarId) return { kind: "bad_bar" as const }
+
+        if (saleBarId && body.items.length > 0) {
+          const barMenu = await tx.select({ productId: barProducts.productId }).from(barProducts).where(and(
+            eq(barProducts.barId, saleBarId), eq(barProducts.tenantId, tenantId),
+            eq(barProducts.isActive, true), inArray(barProducts.productId, body.items.map((line) => line.productId))
+          ))
+          if (new Set(barMenu.map((row) => row.productId)).size !== new Set(body.items.map((line) => line.productId)).size) {
+            return { kind: "product_not_in_menu" as const }
+          }
         }
 
         const productIds = [...new Set(body.items.map((i) => i.productId))]
@@ -1697,46 +1711,24 @@ export const inventoryRoute = new Hono()
           }
         }
 
-        // Products without recipes: check directStock if set on eventProducts
+        // Products sold by unit use only the selected bar's physical stock.
         const productsWithRecipes = new Set(recipeRows.map((r) => r.productId))
         const directNeeds = new Map<string, number>()
-        for (const line of tracksStock ? body.items : []) {
-          if (!productsWithRecipes.has(line.productId)) {
-            directNeeds.set(line.productId, (directNeeds.get(line.productId) ?? 0) + line.quantity)
-          }
+        for (const line of tracksStock ? body.items : []) if (!productsWithRecipes.has(line.productId)) {
+          directNeeds.set(line.productId, (directNeeds.get(line.productId) ?? 0) + line.quantity)
         }
-
-        type EpStockEntry = { rowId: string; stock: string }
-        const epStockByProductId = new Map<string, EpStockEntry>()
-        if (directNeeds.size > 0) {
-          const epRows = await tx
-            .select({
-              id: eventProducts.id,
-              productId: eventProducts.productId,
-              directStock: eventProducts.directStock,
-            })
-            .from(eventProducts)
-            .where(
-              and(
-                eq(eventProducts.eventId, body.eventId),
-                eq(eventProducts.tenantId, tenantId),
-                inArray(eventProducts.productId, [...directNeeds.keys()])
-              )
-            )
-
-          for (const ep of epRows) {
-            if (ep.directStock != null) {
-              epStockByProductId.set(ep.productId, { rowId: ep.id, stock: String(ep.directStock) })
-            }
-          }
-
-          for (const [productId, qty] of directNeeds.entries()) {
-            const entry = epStockByProductId.get(productId)
-            if (!entry) continue // null directStock = unlimited
-            const avail = decFromDb(entry.stock)
-            if (!body.allowNegativeStock && avail.lt(dec(qty))) {
-              const prod = prodRows.find((p) => p.id === productId)!
-              return { kind: "insufficient_direct_stock" as const, productName: prod.name }
+        type BarUnitStockEntry = { rowId: string; stock: string }
+        const barUnitStockByProductId = new Map<string, BarUnitStockEntry>()
+        if (saleBarId && directNeeds.size > 0) {
+          const rows = await tx.select().from(barProducts).where(and(
+            eq(barProducts.barId, saleBarId), eq(barProducts.tenantId, tenantId),
+            inArray(barProducts.productId, [...directNeeds.keys()])
+          )).for("update")
+          for (const row of rows) if (row.directStock != null) barUnitStockByProductId.set(row.productId, { rowId: row.id, stock: String(row.directStock) })
+          for (const [productId, quantity] of directNeeds) {
+            const entry = barUnitStockByProductId.get(productId)
+            if (entry && !body.allowNegativeStock && decFromDb(entry.stock).lt(quantity)) return {
+              kind: "insufficient_direct_stock" as const, productName: prodRows.find((p) => p.id === productId)!.name,
             }
           }
         }
@@ -2050,13 +2042,13 @@ export const inventoryRoute = new Hono()
 
         // Deduct directStock for products without recipes
         for (const [productId, qty] of directNeeds.entries()) {
-          const entry = epStockByProductId.get(productId)
+          const entry = barUnitStockByProductId.get(productId)
           if (!entry) continue
           const newStock = decFromDb(entry.stock).minus(dec(qty))
           await tx
-            .update(eventProducts)
+            .update(barProducts)
             .set({ directStock: decToDb(newStock) })
-            .where(eq(eventProducts.id, entry.rowId))
+            .where(eq(barProducts.id, entry.rowId))
         }
 
         const response: PosSaleReplayResponse = {
