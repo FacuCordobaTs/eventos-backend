@@ -754,6 +754,15 @@ describe("Modos de venta e insumos por unidad", () => {
       "Cuba lata",
     );
   });
+  test("eliminar desactiva el producto y el insumo sólo cuando ninguna receta lo usa", async () => {
+    expect((await inventoryRequest("/items/rum", "DELETE")).status).toBe(400);
+    expect(tables.inventory_items[0].isActive).toBe(true);
+    expect((await inventoryRequest("/products/drink", "DELETE")).status).toBe(200);
+    expect(tables.products[0].isActive).toBe(false);
+    staff.role = "BARTENDER";
+    expect((await inventoryRequest("/items/rum", "DELETE")).status).toBe(403);
+    expect((await inventoryRequest("/products/drink", "DELETE")).status).toBe(403);
+  });
   test("roles operativos no cambian modos, recetas ni insumos", async () => {
     staff.role = "BARTENDER";
     expect(

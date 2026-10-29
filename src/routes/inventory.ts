@@ -581,6 +581,9 @@ export const inventoryRoute = new Hono()
   })
   .delete("/items/:id", async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar insumos" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
@@ -620,7 +623,7 @@ export const inventoryRoute = new Hono()
       return c.json(
         {
           error:
-            "No se puede desactivar: el insumo está en la receta de uno o más productos activos. Desactivá esos productos primero.",
+            "No se puede eliminar: el insumo está en la receta de uno o más productos. Quitalo de esas recetas o eliminá esos productos primero.",
         },
         400
       )
@@ -1215,6 +1218,9 @@ export const inventoryRoute = new Hono()
   })
   .delete("/products/:id", async (c) => {
     const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar productos" }, 403)
+    }
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
