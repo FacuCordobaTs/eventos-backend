@@ -1302,7 +1302,8 @@ export const publicRoute = new Hono()
         promoPay: t.promoPay ?? null,
         sold,
         remaining,
-        availableForPurchase: limit == null || sold < limit,
+        isActive: t.isActive !== false,
+        availableForPurchase: t.isActive !== false && (limit == null || sold < limit),
       })
     }
 

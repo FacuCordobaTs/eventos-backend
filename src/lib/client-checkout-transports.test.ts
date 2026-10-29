@@ -133,6 +133,7 @@ describe("checkout con transporte", () => {
         address: "Otro lugar",
         isActive: false
       }
+      rows.ticket_types[0].isActive = false
       await fulfillPendingGuestCheckout(db, result.saleId)
       await fulfillPendingGuestCheckout(db, result.saleId)
       expect(locks).toEqual(["sales", "sales"])
@@ -200,5 +201,25 @@ describe("operación con estados históricos", () => {
     expect(rows.tickets).toHaveLength(1)
     expect(queries.find((q) => q.table === "ticket_types")?.params).toContain("tenant-a")
     expect(rows.events[0].status).toBe(status)
+  })
+})
+
+
+describe("tipos de entrada desactivados", () => {
+  test("rechaza un checkout nuevo antes de crear la venta o emitir entradas", async () => {
+    const { db, rows } = fixture()
+    rows.ticket_types[0].isActive = false
+    await expect(executeClientCheckout(db, { ...params, paymentMethod: "TRANSFER" })).rejects.toThrow("TICKET_TYPE_NOT_FOUND")
+    expect(rows.sales).toHaveLength(0)
+    expect(rows.tickets).toHaveLength(0)
+  })
+  test("rechaza la venta manual sin escribir tickets", async () => {
+    const { db, rows, queries } = fixture()
+    rows.ticket_types[0].isActive = false
+    await expect(executeTicketPurchase(db, {
+      eventId: "event-a", enforceTenantId: "tenant-a", ticketTypeId: "ticket-a", buyerName: "Ana", buyerEmail: null,
+    })).rejects.toThrow("TICKET_TYPE_NOT_FOUND")
+    expect(rows.tickets).toHaveLength(0)
+    expect(queries.find((q) => q.table === "ticket_types")?.params).toEqual(["ticket-a", "tenant-a", "event-a"])
   })
 })

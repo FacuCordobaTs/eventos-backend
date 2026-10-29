@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test"
+import { getTableName, type SQL } from "drizzle-orm"
+import { MySqlDialect } from "drizzle-orm/mysql-core"
 import { createAccessToken } from "../lib/jwt"
 import { resetRateLimits } from "../lib/rate-limit"
 
@@ -11,6 +13,7 @@ const realMailer = await import("../lib/send-checkout-receipt-email")
 const realBroadcast = await import("../lib/public-qr-broadcast")
 
 let selectQueue: unknown[][] = []
+let readConditions: { table: string; sql: string; params: unknown[] }[] = []
 const calls = { claim: [] as unknown[][], create: [] as unknown[][], cancel: [] as unknown[][] }
 let claimResult: unknown
 let createResult: unknown
@@ -27,10 +30,13 @@ let ownerTokens: string[] = []
 const dbUpdates: Record<string, unknown>[] = []
 
 function fakeDb() {
+  let table = ""
   const chain: Record<string, unknown> = {}
   for (const method of ["from", "innerJoin", "leftJoin", "where", "orderBy", "for", "limit"]) {
     chain[method] = () => chain
   }
+  chain.from = (source: never) => { table = getTableName(source); return chain }
+  chain.where = (condition: SQL) => { readConditions.push({ table, ...new MySqlDialect().sqlToQuery(condition) }); return chain }
   chain.then = (resolve: (rows: unknown[]) => unknown, reject: (e: unknown) => unknown) =>
     Promise.resolve(selectQueue.shift() ?? []).then(resolve, reject)
   return {
@@ -126,6 +132,7 @@ function post(path: string, body: unknown, headers: Record<string, string> = {})
 }
 
 beforeEach(() => {
+  readConditions = []
   resetRateLimits()
   selectQueue = []
   calls.claim = []
@@ -521,11 +528,23 @@ describe("tienda y reportes sin estados de evento", () => {
     closingReport: { closedAt: "2026-10-11T04:00:00.000Z", netReal: "12345.67" },
   })
 
+  test("mantiene visible el tipo desactivado sin permitir comprarlo", async () => {
+    selectQueue = [[legacyEvent("on_sale")], [{ name: "Productora" }], [{ id: "type-off", name: "General", price: "1000.00", stockLimit: null, isActive: false, validFrom: null, validUntil: null }], [], []]
+    const res = await publicRoute.request("/events/fiesta")
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.ticketTypes).toHaveLength(1)
+    expect(body.ticketTypes[0]).toMatchObject({ id: "type-off", isActive: false, availableForPurchase: false })
+  })
+
   test.each(["draft", "on_sale", "live", "closed"])("%s: la tienda existente responde por su enlace", async (status: string) => {
     selectQueue = [[legacyEvent(status)], [{ name: "Productora", mpConnected: true }], [], []]
     const res = await publicRoute.request("/events/fiesta")
     expect(res.status).toBe(200)
     expect((await res.json()).event).toMatchObject({ id: "event-1", slug: "fiesta", name: "Fiesta" })
+    const offer = readConditions.find((query) => query.table === "ticket_types")
+    expect(offer?.sql).not.toContain("is_active")
+    expect(offer?.params).toEqual(["event-1", "tenant-1"])
     expect(dbUpdates).toEqual([])
   })
 

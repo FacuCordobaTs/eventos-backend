@@ -112,7 +112,8 @@ export async function executeTicketPurchase(
     )
     .limit(1)
 
-  if (!tt) {
+  // Un pago iniciado antes de desactivar el tipo conserva su fulfillment.
+  if (!tt || (tt.isActive === false && !params.saleId)) {
     throw new PurchaseError("TICKET_TYPE_NOT_FOUND")
   }
 

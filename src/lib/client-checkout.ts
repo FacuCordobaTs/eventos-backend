@@ -332,7 +332,7 @@ async function prepareGuestCheckout(
       )
       .limit(1)
 
-    if (!tt) {
+    if (!tt || tt.isActive === false) {
       throw new PurchaseError("TICKET_TYPE_NOT_FOUND")
     }
 

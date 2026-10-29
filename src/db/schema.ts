@@ -349,6 +349,7 @@ export const ticketTypes = mysqlTable(
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
     name: varchar('name', { length: 100 }).notNull(), // "General", "VIP", "Mesa"
     price: decimal('price', { precision: 10, scale: 2 }).notNull(),
+    isActive: boolean('is_active').notNull().default(true),
     stockLimit: int('stock_limit'), // null = ilimitado
     // Ventana de ingreso/reingreso, instantes UTC. null = sin límite en ese extremo.
     validFrom: timestamp('valid_from'),
@@ -363,10 +364,7 @@ export const ticketTypes = mysqlTable(
   })
 );
 
-// Tandas: escalera de precios por tipo de entrada (spec §4.2).
-// "Early $8.000 (200 cupos) → al agotarse, abre General $10.000; también por fecha".
-// El sistema la ejecuta solo (evaluación perezosa en lectura), ver src/lib/ticket-tiers.ts.
-// Un tipo de entrada SIN filas acá se comporta como hoy: precio/stock plano del ticketType.
+// Tabla histórica conservada por compatibilidad de datos y FKs; no participa de la oferta.
 export const ticketTiers = mysqlTable(
   'ticket_tiers',
   {
