@@ -646,21 +646,16 @@ export const inventoryItems = mysqlTable('inventory_items', {
   tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
   name: varchar('name', { length: 255 }).notNull(),
   /**
-   * Unidad CONTABLE en la que el usuario cuenta el stock: siempre un envase físico entero
-   * ("botella", "lata", "bolsa de hielo"). Es la unidad de la spec §2/§4.3: el stock se cuenta
-   * y se compra en estas unidades, nunca en ml/gramos. Un insumo NUEVO (modelo 1.4+) nace con
-   * `baseUnit='UNIT'` y su etiqueta contable acá.
+   * Los insumos sólo tienen nombre y se cuentan en unidades. `countingUnit`, `baseUnit` y
+   * `packageSize` se conservan por compatibilidad y valen siempre 'unidades' / UNIT / 1
+   * desde la migración 0076.
    */
   countingUnit: varchar('counting_unit', { length: 50 }).notNull().default('unidad'),
-  /**
-   * @deprecated Unidad de laboratorio del modelo viejo (ml/gramos/unidad). Se conserva por
-   * back-compat con recetas/deducciones existentes (inventory-deduction.ts). Los insumos del
-   * modelo nuevo usan 'UNIT' + `countingUnit`. Migra a "rinde N por envase" en tarea 1.5.
-   */
   baseUnit: mysqlEnum('base_unit', ['ML', 'GRAMS', 'UNIT']).notNull(),
-  /** @deprecated ml/gramos por envase (modelo viejo). 0 = sin envase fijo. Ver `countingUnit`. */
   packageSize: decimal('package_size', { precision: 10, scale: 2 }).notNull().default('0'),
   isActive: boolean('is_active').notNull().default(true),
+  /** Orden de los listados de insumos: más reciente primero. */
+  createdAt: timestamp('created_at').defaultNow(),
 });
 
 export const eventInventory = mysqlTable(
@@ -676,7 +671,8 @@ export const eventInventory = mysqlTable(
     tenantId: varchar('tenant_id', { length: 36 })
       .notNull()
       .references(() => tenants.id),
-    stockAllocated: decimal('stock_allocated', { precision: 10, scale: 2 })
+    /** Unidades del insumo. 6 decimales: un trago descuenta 1/N unidades. */
+    stockAllocated: decimal('stock_allocated', { precision: 16, scale: 6 })
       .notNull()
       .default('0'),
     createdAt: timestamp('created_at').defaultNow(),
@@ -713,8 +709,12 @@ export const products = mysqlTable('products', {
   name: varchar('name', { length: 255 }).notNull(),
   price: decimal('price', { precision: 10, scale: 2 }).notNull(),
   isActive: boolean('is_active').default(true),
-  /** GLASS: la receta descuenta quantityUsed en la unidad del insumo; BOTTLE: quantityUsed es botellas × tamaño estándar. */
-  saleType: mysqlEnum('sale_type', ['BOTTLE', 'GLASS']).notNull().default('GLASS'),
+  /**
+   * Cómo se vende: GLASS = trago (cada venta consume 1/N de cada insumo), BOTTLE = botellas
+   * (cada venta consume K unidades enteras de cada insumo), UNIT = stock propio por barra en
+   * `barProducts.directStock`, NONE = sin control de stock.
+   */
+  saleType: mysqlEnum('sale_type', ['BOTTLE', 'GLASS', 'UNIT', 'NONE']).notNull().default('GLASS'),
   imageUrl: varchar('image_url', { length: 512 }),
   /** Categoría opcional. Null = sin categoría. */
   categoryId: varchar('category_id', { length: 36 }).references(() => productCategories.id),
@@ -817,7 +817,8 @@ export const barInventory = mysqlTable(
     tenantId: varchar('tenant_id', { length: 36 })
       .notNull()
       .references(() => tenants.id),
-    currentStock: decimal('current_stock', { precision: 10, scale: 2 })
+    /** Unidades del insumo. 6 decimales: un trago descuenta 1/N unidades. */
+    currentStock: decimal('current_stock', { precision: 16, scale: 6 })
       .notNull()
       .default('0'),
     updatedAt: timestamp('updated_at').onUpdateNow(),
@@ -945,18 +946,13 @@ export const productRecipes = mysqlTable('product_recipes', {
   productId: varchar('product_id', { length: 36 }).notNull().references(() => products.id),
   inventoryItemId: varchar('inventory_item_id', { length: 36 }).notNull().references(() => inventoryItems.id),
   /**
-   * @deprecated Modelo viejo: cantidad consumida por porción en la unidad de laboratorio del
-   * insumo (ml/gramos/UNIT). Ej: 150.00 = 150 ml por trago. Se conserva porque la deducción de
-   * stock (inventory-deduction.ts) todavía descuenta en base units. El modelo nuevo (1.5) es
-   * `yieldPerPackage` ("rinde N por envase"); `quantityUsed` se mantiene sincronizado (derivado)
-   * para no romper la deducción hasta que la Barra (3.2) mueva el stock a unidad contable.
+   * Unidades del insumo que consume UNA venta del producto. Trago (GLASS): 1/N truncado a 6
+   * decimales; Botellas (BOTTLE): K entero. Es el valor que usa la deducción de stock.
    */
-  quantityUsed: decimal('quantity_used', { precision: 10, scale: 2 }).notNull(), // Ej: 150.00
+  quantityUsed: decimal('quantity_used', { precision: 16, scale: 6 }).notNull(),
   /**
-   * Modelo 1.5 "rinde N por envase": cuántas porciones (tragos) salen de UN envase contable del
-   * insumo — la pregunta que el usuario ya sabe responder ("10 tragos por botella"). La deducción
-   * por porción es 1/yieldPerPackage unidades contables. Null en recetas del modelo viejo aún no
-   * backfilleadas. Ver `baseUnitsPerServingFromYield` / `yieldPerPackageFromQuantityUsed`.
+   * Trago (GLASS): N = cuántas ventas terminan una unidad del insumo, tal como lo respondió el
+   * usuario. NULL en Botellas.
    */
   yieldPerPackage: decimal('yield_per_package', { precision: 10, scale: 3 }),
 });

@@ -1,8 +1,24 @@
 import type { inventoryItems } from "../db/schema"
-import type Decimal from "decimal.js"
+import Decimal from "decimal.js"
 import { dec, decFromDb } from "./decimal-money"
 
-export type ProductSaleType = "BOTTLE" | "GLASS"
+/** GLASS = trago, BOTTLE = botellas, UNIT = stock propio por barra, NONE = sin control. */
+export type ProductSaleType = "BOTTLE" | "GLASS" | "UNIT" | "NONE"
+
+/** Modos cuyo stock sale de una receta de insumos. */
+export function saleTypeUsesRecipe(saleType: ProductSaleType): boolean {
+  return saleType === "GLASS" || saleType === "BOTTLE"
+}
+
+/**
+ * Unidades del insumo que consume una venta de trago cuando N ventas terminan una unidad.
+ * Se trunca a 6 decimales: N ventas nunca consumen más de una unidad, así la última venta
+ * no queda bloqueada por redondeo.
+ */
+export function servingFromYield(yieldPerUnit: Decimal): Decimal {
+  if (yieldPerUnit.lte(0)) return dec(0)
+  return dec(1).div(yieldPerUnit).toDecimalPlaces(6, Decimal.ROUND_DOWN)
+}
 
 type ItemDeductionFields = Pick<
   typeof inventoryItems.$inferSelect,

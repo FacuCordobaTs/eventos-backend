@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { drizzle } from "drizzle-orm/mysql2"
-import { and, asc, count, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
+import { and, asc, count, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm"
 import { v4 as uuidv4 } from "uuid"
 import { pool } from "../db"
 import { createHash, randomUUID } from "node:crypto"
@@ -26,13 +26,15 @@ import {
   type PosSaleReplayResponse,
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { dec, decFromDb, decToDb, stockToDb } from "../lib/decimal-money"
 import {
   bottleLoadStockDelta,
   recipeStockDeduction,
-  baseUnitsPerServingFromYield,
-  yieldPerPackageFromQuantityUsed,
+  saleTypeUsesRecipe,
+  servingFromYield,
+  type ProductSaleType,
 } from "../lib/inventory-deduction"
+import { syncDirectStockForSaleType } from "../lib/product-sale-type"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, debitBalance, getBalance } from "../lib/balance"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
@@ -111,21 +113,23 @@ async function categoryBelongsToTenant(
   return row != null
 }
 
-const baseUnitSchema = z.enum(["ML", "GRAMS", "UNIT"])
-
+/** Un insumo sólo tiene nombre: siempre se cuenta en unidades. `id` renombra uno existente. */
 const upsertItemSchema = z.object({
   id: z.string().min(1).optional(),
-  name: z.string().min(1).max(255),
-  /** Unidad contable de la spec 1.4 (botella/lata/bolsa). Es lo único que se pide del insumo nuevo. */
-  countingUnit: z.string().min(1).max(50).optional(),
-  /** @deprecated modelo viejo; opcional para poder crear insumos "implícitos" solo con nombre+unidad. */
-  baseUnit: baseUnitSchema.optional().default("UNIT"),
-  packageSize: z
-    .union([
-      z.number().nonnegative(),
-      z.string().regex(/^\d+(\.\d{1,2})?$/),
-    ])
-    .optional(),
+  name: z.string().trim().min(1).max(255),
+})
+
+/** Columnas legacy fijas de todo insumo: unidades enteras, sin envase. */
+const UNIT_ITEM_FIELDS = { baseUnit: "UNIT", packageSize: "1.00", countingUnit: "unidades" } as const
+
+const normalizeItemName = (value: string) =>
+  value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLocaleLowerCase("es-AR")
+
+type ItemRow = typeof inventoryItems.$inferSelect
+const itemDto = (row: ItemRow) => ({
+  id: row.id,
+  name: row.name,
+  createdAt: row.createdAt?.toISOString() ?? null,
 })
 
 const loadBottlesSchema = z
@@ -191,15 +195,12 @@ function totalExpenseFromLoadBottles(
 const recipeLineSchema = z
   .object({
     inventoryItemId: z.string().min(1),
-    /**
-     * @deprecated Modelo viejo (base units por porción). Opcional: si viene `yieldPerPackage`
-     * se deriva solo. Se mantiene para compatibilidad con clientes que aún mandan quantityUsed.
-     */
+    /** Botellas: unidades enteras del insumo que consume cada venta. */
     quantityUsed: z
-      .union([z.string().regex(/^\d+(\.\d{1,4})?$/), z.number().positive()])
+      .union([z.string().regex(/^\d+(\.\d{1,6})?$/), z.number().positive()])
       .transform((v) => (typeof v === "number" ? String(v) : v))
       .optional(),
-    /** Modelo 1.5: cuántas porciones salen de un envase ("10 tragos por botella"). */
+    /** Trago: cuántas ventas terminan una unidad del insumo. */
     yieldPerPackage: z
       .union([z.string().regex(/^\d+(\.\d{1,3})?$/), z.number().positive()])
       .transform((v) => (typeof v === "number" ? String(v) : v))
@@ -209,46 +210,123 @@ const recipeLineSchema = z
     message: "La receta necesita quantityUsed o yieldPerPackage.",
   })
 
-type RecipeItemFields = { baseUnit: "ML" | "GRAMS" | "UNIT"; packageSize: string }
+type RecipeLineBody = z.infer<typeof recipeLineSchema>
 
 /**
- * Compute the two stored recipe values from a submitted line. Keeps legacy `quantityUsed` (used
- * by the runtime stock deduction) and the new `yieldPerPackage` in sync: whichever the client
- * omits is derived from the other using the insumo's counting-unit config.
+ * Valores guardados de una línea según el modo del producto. `quantityUsed` es siempre
+ * unidades del insumo por venta, que es lo que descuenta el stock.
  */
 function resolveRecipeStorage(
-  line: { quantityUsed?: string; yieldPerPackage?: string },
-  item: RecipeItemFields
-): { quantityUsed: string; yieldPerPackage: string } {
-  if (line.yieldPerPackage != null) {
-    const yld = dec(line.yieldPerPackage)
-    const qu =
-      line.quantityUsed != null
-        ? dec(line.quantityUsed)
-        : baseUnitsPerServingFromYield(item, yld)
-    return { quantityUsed: decToDb(qu), yieldPerPackage: yld.toFixed(3) }
+  line: RecipeLineBody,
+  saleType: ProductSaleType
+): { quantityUsed: string; yieldPerPackage: string | null } | { error: string } {
+  if (saleType === "BOTTLE") {
+    const units = dec(line.quantityUsed ?? "0")
+    if (!units.isInteger() || units.lt(1)) {
+      return { error: "Indicá cuántas botellas enteras consume cada venta (1 o más)." }
+    }
+    return { quantityUsed: stockToDb(units), yieldPerPackage: null }
   }
-  const qu = dec(line.quantityUsed!)
-  const yld = yieldPerPackageFromQuantityUsed(item, qu)
-  return { quantityUsed: decToDb(qu), yieldPerPackage: yld.toFixed(3) }
+  const yld =
+    line.yieldPerPackage != null
+      ? dec(line.yieldPerPackage)
+      : dec(1).div(dec(line.quantityUsed!))
+  const serving = servingFromYield(yld)
+  if (!serving.gt(0)) {
+    return { error: "Indicá cuántas ventas terminan una unidad de cada insumo (mayor a cero)." }
+  }
+  return { quantityUsed: stockToDb(serving), yieldPerPackage: yld.toFixed(3) }
 }
 
-/** yieldPerPackage to expose on read: stored column if present, else derived from quantityUsed. */
+/** yieldPerPackage para lectura: el guardado, o derivado de quantityUsed en recetas viejas. */
 function recipeYieldOut(row: {
   quantityUsed: string
   yieldPerPackage: string | null
-  inventoryBaseUnit: "ML" | "GRAMS" | "UNIT"
-  inventoryPackageSize: string
 }): string | null {
   if (row.yieldPerPackage != null) return row.yieldPerPackage
-  const yld = yieldPerPackageFromQuantityUsed(
-    { baseUnit: row.inventoryBaseUnit, packageSize: row.inventoryPackageSize },
-    dec(row.quantityUsed)
-  )
-  return yld.gt(0) ? yld.toFixed(3) : null
+  const qu = dec(row.quantityUsed)
+  return qu.gt(0) ? dec(1).div(qu).toFixed(3) : null
 }
 
-const saleTypeSchema = z.enum(["BOTTLE", "GLASS"])
+type StoredRecipe = { inventoryItemId: string; quantityUsed: string; yieldPerPackage: string | null }
+
+/** Valida insumos (tenant, activos, sin repetir) y calcula lo que se guarda de cada línea. */
+async function prepareRecipes(
+  db: ReturnType<typeof drizzle>,
+  tenantId: string,
+  saleType: ProductSaleType,
+  lines: RecipeLineBody[]
+): Promise<{ recipes: StoredRecipe[] } | { error: string }> {
+  if (!saleTypeUsesRecipe(saleType)) return { recipes: [] }
+  const invIds = [...new Set(lines.map((r) => r.inventoryItemId))]
+  if (invIds.length !== lines.length) {
+    return { error: "Cada insumo debe aparecer una sola vez en la receta." }
+  }
+  if (invIds.length > 0) {
+    const invRows = await db
+      .select({ id: inventoryItems.id })
+      .from(inventoryItems)
+      .where(
+        and(
+          inArray(inventoryItems.id, invIds),
+          eq(inventoryItems.tenantId, tenantId),
+          eq(inventoryItems.isActive, true)
+        )
+      )
+    if (invRows.length !== invIds.length) {
+      return { error: "Una o más materias primas no existen o están desactivadas." }
+    }
+  }
+  const recipes: StoredRecipe[] = []
+  for (const line of lines) {
+    const stored = resolveRecipeStorage(line, saleType)
+    if ("error" in stored) return stored
+    recipes.push({ inventoryItemId: line.inventoryItemId, ...stored })
+  }
+  return { recipes }
+}
+
+async function loadProductDto(db: ReturnType<typeof drizzle>, tenantId: string, productId: string) {
+  const [p] = await db
+    .select()
+    .from(products)
+    .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+    .limit(1)
+  if (!p) return null
+  const recipes = await db
+    .select({
+      id: productRecipes.id,
+      inventoryItemId: productRecipes.inventoryItemId,
+      quantityUsed: productRecipes.quantityUsed,
+      yieldPerPackage: productRecipes.yieldPerPackage,
+      inventoryName: inventoryItems.name,
+      inventoryBaseUnit: inventoryItems.baseUnit,
+      inventoryPackageSize: inventoryItems.packageSize,
+    })
+    .from(productRecipes)
+    .innerJoin(inventoryItems, eq(productRecipes.inventoryItemId, inventoryItems.id))
+    .where(and(eq(productRecipes.productId, productId), eq(inventoryItems.tenantId, tenantId)))
+  return {
+    id: p.id,
+    name: p.name,
+    price: p.price,
+    isActive: p.isActive,
+    saleType: p.saleType,
+    imageUrl: p.imageUrl ?? null,
+    categoryId: p.categoryId ?? null,
+    recipes: recipes.map((r) => ({
+      id: r.id,
+      inventoryItemId: r.inventoryItemId,
+      quantityUsed: r.quantityUsed,
+      yieldPerPackage: recipeYieldOut(r),
+      inventoryItemName: r.inventoryName,
+      inventoryBaseUnit: r.inventoryBaseUnit,
+      inventoryPackageSize: r.inventoryPackageSize,
+    })),
+  }
+}
+
+const saleTypeSchema = z.enum(["BOTTLE", "GLASS", "UNIT", "NONE"])
 
 const createProductSchema = z.object({
   name: z.string().min(1).max(255),
@@ -261,6 +339,9 @@ const createProductSchema = z.object({
     .optional(),
   recipes: z.array(recipeLineSchema).default([]),
 })
+
+const saleTypeBodySchema = z.object({ saleType: saleTypeSchema })
+const recipeBodySchema = z.object({ recipes: z.array(recipeLineSchema).min(1).max(50) })
 
 const categorySchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -356,15 +437,6 @@ const createSaleSchema = z.object({
 
 const productListed = or(eq(products.isActive, true), isNull(products.isActive))
 
-function normalizePackageSize(body: z.infer<typeof upsertItemSchema>): string {
-  const raw =
-    body.packageSize === undefined
-      ? "0"
-      : typeof body.packageSize === "number"
-        ? body.packageSize
-        : body.packageSize
-  return decToDb(dec(raw))
-}
 
 /**
  * Insumos IMPLÍCITOS (spec §2/§4.3, tarea 1.4): un insumo no es una entidad que el usuario
@@ -445,16 +517,9 @@ export const inventoryRoute = new Hono()
       .where(
         and(eq(inventoryItems.tenantId, tenantId), eq(inventoryItems.isActive, true))
       )
+      .orderBy(desc(inventoryItems.createdAt), asc(inventoryItems.name))
 
-    const items = rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      countingUnit: r.countingUnit,
-      baseUnit: r.baseUnit,
-      packageSize: r.packageSize,
-    }))
-
-    return c.json({ items })
+    return c.json({ items: rows.map(itemDto) })
   })
   .post("/items", zValidator("json", upsertItemSchema), async (c) => {
     const ctx = c as AuthenticatedContext
@@ -465,6 +530,18 @@ export const inventoryRoute = new Hono()
     }
     const body = c.req.valid("json")
     const db = drizzle(pool)
+
+    const sameTenant = await db
+      .select({ id: inventoryItems.id, name: inventoryItems.name })
+      .from(inventoryItems)
+      .where(and(eq(inventoryItems.tenantId, tenantId), eq(inventoryItems.isActive, true)))
+    if (
+      sameTenant.some(
+        (row) => row.id !== body.id && normalizeItemName(row.name) === normalizeItemName(body.name)
+      )
+    ) {
+      return c.json({ error: "Ya existe un insumo con ese nombre." }, 409)
+    }
 
     if (body.id) {
       const [existing] = await db
@@ -480,41 +557,19 @@ export const inventoryRoute = new Hono()
       if (existing.isActive === false) {
         return c.json({ error: "El insumo está desactivado." }, 400)
       }
-      const pkg = normalizePackageSize(body)
       await db
         .update(inventoryItems)
-        .set({
-          name: body.name,
-          baseUnit: body.baseUnit,
-          packageSize: pkg,
-          ...(body.countingUnit ? { countingUnit: body.countingUnit } : {}),
-        })
-        .where(eq(inventoryItems.id, body.id))
-      const [row] = await db
-        .select()
-        .from(inventoryItems)
-        .where(eq(inventoryItems.id, body.id))
-        .limit(1)
-      return c.json({
-        item: {
-          id: row!.id,
-          name: row!.name,
-          countingUnit: row!.countingUnit,
-          baseUnit: row!.baseUnit,
-          packageSize: row!.packageSize,
-        },
-      })
+        .set({ name: body.name })
+        .where(and(eq(inventoryItems.id, body.id), eq(inventoryItems.tenantId, tenantId)))
+      return c.json({ item: itemDto({ ...existing, name: body.name }) })
     }
 
     const id = uuidv4()
-    const pkg = normalizePackageSize(body)
     await db.insert(inventoryItems).values({
       id,
       tenantId,
       name: body.name,
-      countingUnit: body.countingUnit ?? "unidad",
-      baseUnit: body.baseUnit,
-      packageSize: pkg,
+      ...UNIT_ITEM_FIELDS,
       isActive: true,
     })
     const [row] = await db
@@ -522,18 +577,7 @@ export const inventoryRoute = new Hono()
       .from(inventoryItems)
       .where(eq(inventoryItems.id, id))
       .limit(1)
-    return c.json(
-      {
-        item: {
-          id: row!.id,
-          name: row!.name,
-          countingUnit: row!.countingUnit,
-          baseUnit: row!.baseUnit,
-          packageSize: row!.packageSize,
-        },
-      },
-      201
-    )
+    return c.json({ item: itemDto(row!) }, 201)
   })
   .delete("/items/:id", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -822,36 +866,8 @@ export const inventoryRoute = new Hono()
     const body = c.req.valid("json")
     const db = drizzle(pool)
 
-    const invIds = [...new Set(body.recipes.map((r) => r.inventoryItemId))]
-    const itemFieldsById = new Map<string, RecipeItemFields>()
-    if (invIds.length > 0) {
-      const invRows = await db
-        .select({
-          id: inventoryItems.id,
-          baseUnit: inventoryItems.baseUnit,
-          packageSize: inventoryItems.packageSize,
-        })
-        .from(inventoryItems)
-        .where(
-          and(
-            inArray(inventoryItems.id, invIds),
-            eq(inventoryItems.tenantId, tenantId),
-            eq(inventoryItems.isActive, true)
-          )
-        )
-      if (invRows.length !== invIds.length) {
-        return c.json(
-          { error: "Una o más materias primas no existen o están desactivadas." },
-          400
-        )
-      }
-      for (const row of invRows) {
-        itemFieldsById.set(row.id, {
-          baseUnit: row.baseUnit,
-          packageSize: row.packageSize,
-        })
-      }
-    }
+    const prepared = await prepareRecipes(db, tenantId, body.saleType, body.recipes)
+    if ("error" in prepared) return c.json({ error: prepared.error }, 400)
 
     if (body.categoryId != null && !(await categoryBelongsToTenant(db, body.categoryId, tenantId))) {
       return c.json({ error: "La categoría no existe." }, 400)
@@ -870,72 +886,14 @@ export const inventoryRoute = new Hono()
         saleType: body.saleType,
         categoryId: body.categoryId ?? null,
       })
-      if (body.recipes.length > 0) {
+      if (prepared.recipes.length > 0) {
         await tx.insert(productRecipes).values(
-          body.recipes.map((r) => {
-            const stored = resolveRecipeStorage(
-              r,
-              itemFieldsById.get(r.inventoryItemId) ?? {
-                baseUnit: "UNIT",
-                packageSize: "0",
-              }
-            )
-            return {
-              id: uuidv4(),
-              productId,
-              inventoryItemId: r.inventoryItemId,
-              quantityUsed: stored.quantityUsed,
-              yieldPerPackage: stored.yieldPerPackage,
-            }
-          })
+          prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
         )
       }
     })
 
-    const [p] = await db
-      .select()
-      .from(products)
-      .where(eq(products.id, productId))
-      .limit(1)
-    const recipes = await db
-      .select({
-        id: productRecipes.id,
-        inventoryItemId: productRecipes.inventoryItemId,
-        quantityUsed: productRecipes.quantityUsed,
-        yieldPerPackage: productRecipes.yieldPerPackage,
-        inventoryName: inventoryItems.name,
-        inventoryBaseUnit: inventoryItems.baseUnit,
-        inventoryPackageSize: inventoryItems.packageSize,
-      })
-      .from(productRecipes)
-      .innerJoin(
-        inventoryItems,
-        eq(productRecipes.inventoryItemId, inventoryItems.id)
-      )
-      .where(eq(productRecipes.productId, productId))
-
-    return c.json(
-      {
-        product: {
-          id: p!.id,
-          name: p!.name,
-          price: p!.price,
-          isActive: p!.isActive,
-          saleType: p!.saleType,
-          imageUrl: p!.imageUrl ?? null,
-          categoryId: p!.categoryId ?? null,
-          recipes: recipes.map((r) => ({
-            id: r.id,
-            inventoryItemId: r.inventoryItemId,
-            quantityUsed: r.quantityUsed,
-            inventoryItemName: r.inventoryName,
-            inventoryBaseUnit: r.inventoryBaseUnit,
-            inventoryPackageSize: r.inventoryPackageSize,
-          })),
-        },
-      },
-      201
-    )
+    return c.json({ product: await loadProductDto(db, tenantId, productId) }, 201)
   })
   .put("/products/:id", zValidator("json", updateProductSchema), async (c) => {
     const ctx = c as AuthenticatedContext
@@ -959,36 +917,8 @@ export const inventoryRoute = new Hono()
       return c.json({ error: "Producto no encontrado" }, 404)
     }
 
-    const invIds = [...new Set(body.recipes.map((r) => r.inventoryItemId))]
-    const itemFieldsById = new Map<string, RecipeItemFields>()
-    if (invIds.length > 0) {
-      const invRows = await db
-        .select({
-          id: inventoryItems.id,
-          baseUnit: inventoryItems.baseUnit,
-          packageSize: inventoryItems.packageSize,
-        })
-        .from(inventoryItems)
-        .where(
-          and(
-            inArray(inventoryItems.id, invIds),
-            eq(inventoryItems.tenantId, tenantId),
-            eq(inventoryItems.isActive, true)
-          )
-        )
-      if (invRows.length !== invIds.length) {
-        return c.json(
-          { error: "Una o más materias primas no existen o están desactivadas." },
-          400
-        )
-      }
-      for (const row of invRows) {
-        itemFieldsById.set(row.id, {
-          baseUnit: row.baseUnit,
-          packageSize: row.packageSize,
-        })
-      }
-    }
+    const prepared = await prepareRecipes(db, tenantId, body.saleType, body.recipes)
+    if ("error" in prepared) return c.json({ error: prepared.error }, 400)
 
     if (body.categoryId != null && !(await categoryBelongsToTenant(db, body.categoryId, tenantId))) {
       return c.json({ error: "La categoría no existe." }, 400)
@@ -1005,72 +935,80 @@ export const inventoryRoute = new Hono()
           saleType: body.saleType,
           ...(body.categoryId === undefined ? {} : { categoryId: body.categoryId }),
         })
-        .where(eq(products.id, productId))
+        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
       await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
-      if (body.recipes.length > 0) {
+      if (prepared.recipes.length > 0) {
         await tx.insert(productRecipes).values(
-          body.recipes.map((r) => {
-            const stored = resolveRecipeStorage(
-              r,
-              itemFieldsById.get(r.inventoryItemId) ?? {
-                baseUnit: "UNIT",
-                packageSize: "0",
-              }
-            )
-            return {
-              id: uuidv4(),
-              productId,
-              inventoryItemId: r.inventoryItemId,
-              quantityUsed: stored.quantityUsed,
-              yieldPerPackage: stored.yieldPerPackage,
-            }
-          })
+          prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
         )
+      }
+      if (existing.saleType !== body.saleType) {
+        await syncDirectStockForSaleType(tx, tenantId, productId, body.saleType)
       }
     })
 
-    const [p] = await db
-      .select()
-      .from(products)
-      .where(eq(products.id, productId))
-      .limit(1)
-    const recipes = await db
-      .select({
-        id: productRecipes.id,
-        inventoryItemId: productRecipes.inventoryItemId,
-        quantityUsed: productRecipes.quantityUsed,
-        yieldPerPackage: productRecipes.yieldPerPackage,
-        inventoryName: inventoryItems.name,
-        inventoryBaseUnit: inventoryItems.baseUnit,
-        inventoryPackageSize: inventoryItems.packageSize,
-      })
-      .from(productRecipes)
-      .innerJoin(
-        inventoryItems,
-        eq(productRecipes.inventoryItemId, inventoryItems.id)
-      )
-      .where(eq(productRecipes.productId, productId))
-
-    return c.json({
-      product: {
-        id: p!.id,
-        name: p!.name,
-        price: p!.price,
-        isActive: p!.isActive,
-        saleType: p!.saleType,
-        imageUrl: p!.imageUrl ?? null,
-        categoryId: p!.categoryId ?? null,
-        recipes: recipes.map((r) => ({
-          id: r.id,
-          inventoryItemId: r.inventoryItemId,
-          quantityUsed: r.quantityUsed,
-          yieldPerPackage: recipeYieldOut(r),
-          inventoryItemName: r.inventoryName,
-          inventoryBaseUnit: r.inventoryBaseUnit,
-          inventoryPackageSize: r.inventoryPackageSize,
-        })),
-      },
+    return c.json({ product: await loadProductDto(db, tenantId, productId) })
+  })
+  /** Cambia cómo se vende el producto. Cambiar de modo descarta la receta anterior. */
+  .put("/products/:id/sale-type", zValidator("json", saleTypeBodySchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar productos" }, 403)
+    }
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const productId = c.req.param("id")
+    const { saleType } = c.req.valid("json")
+    const db = drizzle(pool)
+    const changed = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ saleType: products.saleType })
+        .from(products)
+        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+        .limit(1)
+        .for("update")
+      if (!existing) return null
+      if (existing.saleType === saleType) return false
+      await tx
+        .update(products)
+        .set({ saleType })
+        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
+      await syncDirectStockForSaleType(tx, tenantId, productId, saleType)
+      return true
     })
+    if (changed === null) return c.json({ error: "Producto no encontrado" }, 404)
+    return c.json({ product: await loadProductDto(db, tenantId, productId), changed })
+  })
+  /** Guarda la receta (Trago) o las botellas (Botellas) del producto según su modo actual. */
+  .put("/products/:id/recipe", zValidator("json", recipeBodySchema), async (c) => {
+    const ctx = c as AuthenticatedContext
+    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+      return c.json({ error: "No tenés permiso para administrar productos" }, 403)
+    }
+    const tenantId = requireTenantId(ctx)
+    if (!tenantId) {
+      return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
+    }
+    const productId = c.req.param("id")
+    const body = c.req.valid("json")
+    const db = drizzle(pool)
+    const existing = await requireProductForTenant(db, productId, tenantId)
+    if (!existing) return c.json({ error: "Producto no encontrado" }, 404)
+    if (!saleTypeUsesRecipe(existing.saleType)) {
+      return c.json({ error: "Este producto no se vende con insumos." }, 400)
+    }
+    const prepared = await prepareRecipes(db, tenantId, existing.saleType, body.recipes)
+    if ("error" in prepared) return c.json({ error: prepared.error }, 400)
+    await db.transaction(async (tx) => {
+      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
+      await tx.insert(productRecipes).values(
+        prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
+      )
+    })
+    return c.json({ product: await loadProductDto(db, tenantId, productId) })
   })
   .post("/products/:id/image", async (c) => {
     const ctx = c as AuthenticatedContext
@@ -1379,11 +1317,11 @@ export const inventoryRoute = new Hono()
             eventId: body.eventId,
             inventoryItemId: body.inventoryItemId,
             tenantId,
-            stockAllocated: decToDb(next),
+            stockAllocated: stockToDb(next),
             createdAt: new Date(),
           })
           .onDuplicateKeyUpdate({
-            set: { stockAllocated: decToDb(next) },
+            set: { stockAllocated: stockToDb(next) },
           })
 
         if (totalExpense.gt(0)) {
@@ -1444,7 +1382,7 @@ export const inventoryRoute = new Hono()
 
       const [sumOthersRow] = await tx
         .select({
-          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
         })
         .from(barInventory)
         .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -1466,7 +1404,7 @@ export const inventoryRoute = new Hono()
       if (bRow) {
         await tx
           .update(barInventory)
-          .set({ currentStock: decToDb(nextBar) })
+          .set({ currentStock: stockToDb(nextBar) })
           .where(
             and(eq(barInventory.id, bRow.id), eq(barInventory.tenantId, tenantId))
           )
@@ -1476,7 +1414,7 @@ export const inventoryRoute = new Hono()
           barId,
           inventoryItemId: body.inventoryItemId,
           tenantId,
-          currentStock: decToDb(nextBar),
+          currentStock: stockToDb(nextBar),
         })
       }
 
@@ -1523,7 +1461,7 @@ export const inventoryRoute = new Hono()
       return c.json({
         ok: true,
         stockAdded: deltaStr,
-        stockAllocated: decToDb(result.next),
+        stockAllocated: stockToDb(result.next),
       })
     }
 
@@ -1533,7 +1471,7 @@ export const inventoryRoute = new Hono()
     return c.json({
       ok: true,
       stockAdded: deltaStr,
-      currentStock: decToDb(result.nextBar),
+      currentStock: stockToDb(result.nextBar),
     })
   })
   .post("/sales", zValidator("json", createSaleSchema), async (c) => {
@@ -1779,7 +1717,7 @@ export const inventoryRoute = new Hono()
             for (const invId of invIds) {
               const [sumR] = await tx
                 .select({
-                  s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+                  s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
                 })
                 .from(barInventory)
                 .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -2012,7 +1950,7 @@ export const inventoryRoute = new Hono()
             const newCap = cap.minus(need)
             await tx
               .update(eventInventory)
-              .set({ stockAllocated: decToDb(newCap) })
+              .set({ stockAllocated: stockToDb(newCap) })
               .where(
                 and(
                   eq(eventInventory.id, evRow.id),
@@ -2028,7 +1966,7 @@ export const inventoryRoute = new Hono()
                 const newBar = barAvail.minus(fromBar)
                 await tx
                   .update(barInventory)
-                  .set({ currentStock: decToDb(newBar) })
+                  .set({ currentStock: stockToDb(newBar) })
                   .where(
                     and(
                       eq(barInventory.id, bRow.id),

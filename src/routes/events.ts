@@ -69,7 +69,7 @@ import { STAFF_ROLES, staffRoles, staffHasRole, isPromoterAccount } from "../lib
 import { ensurePromoterAccount } from "../lib/promoter-account"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, getBalance } from "../lib/balance"
-import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { dec, decFromDb, decToDb, stockToDb } from "../lib/decimal-money"
 import { cashPeriod, computeEventCashPeriod } from "../lib/event-cash-period"
 import { transportRevenue } from "../lib/transports"
 import { evaluateTicketTiers, type TicketTier } from "../lib/ticket-tiers"
@@ -1283,7 +1283,7 @@ async function sumBarStockForEventItem(
 ): Promise<string> {
   const [row] = await db
     .select({
-      s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+      s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
     })
     .from(barInventory)
     .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -3197,7 +3197,7 @@ export const eventsRoute = new Hono()
       if (conv.error) {
         return c.json({ error: conv.error }, 400)
       }
-      const stockStr = decToDb(conv.value)
+      const stockStr = stockToDb(conv.value)
       const sumBars = decFromDb(
         await sumBarStockForEventItem(db, eventId, tenantId, body.inventoryItemId)
       )
@@ -3266,7 +3266,7 @@ export const eventsRoute = new Hono()
         if (initConv.error) {
           return c.json({ error: initConv.error }, 400)
         }
-        initialStr = decToDb(initConv.value)
+        initialStr = stockToDb(initConv.value)
       }
 
       const itemId = uuidv4()
@@ -4164,10 +4164,10 @@ export const eventsRoute = new Hono()
           eventId,
           inventoryItemId: item.id,
           tenantId,
-          stockAllocated: decToDb(next),
+          stockAllocated: stockToDb(next),
           createdAt: new Date(),
         })
-        .onDuplicateKeyUpdate({ set: { stockAllocated: decToDb(next) } })
+        .onDuplicateKeyUpdate({ set: { stockAllocated: stockToDb(next) } })
 
       return next
     })
@@ -4185,7 +4185,7 @@ export const eventsRoute = new Hono()
     return c.json(
       {
         purchase: row ? sanitizePurchase(row) : null,
-        stockAllocated: decToDb(nextAllocated),
+        stockAllocated: stockToDb(nextAllocated),
         inventoryItemId: item.id,
         itemName: item.name,
       },
@@ -4513,7 +4513,7 @@ export const eventsRoute = new Hono()
         itemName: agg.itemName,
         baseUnit: agg.baseUnit,
         packageSize: agg.packageSize,
-        stockAllocated: decToDb(agg.stockAllocated),
+        stockAllocated: stockToDb(agg.stockAllocated),
         totalInBars: decToDb(agg.sumBars),
         bars: agg.bars.sort((a, b) => a.barName.localeCompare(b.barName)),
       }))

@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/mysql2"
 import {
   and,
   asc,
+  desc,
   eq,
   inArray,
   isNull,
@@ -35,7 +36,7 @@ import {
   sales,
 } from "../db/schema"
 import { authMiddleware, type AuthenticatedContext } from "../middleware/auth"
-import { dec, decFromDb, decToDb } from "../lib/decimal-money"
+import { dec, decFromDb, decToDb, stockToDb } from "../lib/decimal-money"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
 import { broadcastPickupUpdate, broadcastReceiptUpdate } from "../lib/public-qr-broadcast"
 import { pickupItemsWithNames } from "../lib/pickup-items"
@@ -72,9 +73,9 @@ const patchBarInventorySchema = z.object({
 
 const setBarStockSchema = z.object({
   inventoryItemId: z.string().min(1).max(36),
-  quantity: z.string().regex(/^\d+(\.\d{1,4})?$/).max(18),
+  quantity: z.string().regex(/^\d+(\.\d{1,6})?$/).max(18),
   totalCost: z.string().regex(/^\d{1,8}(\.\d{1,2})?$/).optional(),
-  expectedCurrentStock: z.string().regex(/^-?\d+(\.\d{1,4})?$/).max(18),
+  expectedCurrentStock: z.string().regex(/^-?\d+(\.\d{1,6})?$/).max(18),
   stockInputAs: z.enum(["BASE_UNITS", "PACKAGES"]),
 })
 
@@ -213,7 +214,7 @@ async function deductRecipeStock(
 
       const [sumR] = await tx
         .select({
-          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
         })
         .from(barInventory)
         .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -251,7 +252,7 @@ async function deductRecipeStock(
         if (bRow) {
           await tx
             .update(barInventory)
-            .set({ currentStock: decToDb(barAvail.minus(deduct)) })
+            .set({ currentStock: stockToDb(barAvail.minus(deduct)) })
             .where(
               and(
                 eq(barInventory.id, bRow.id),
@@ -275,7 +276,7 @@ async function deductRecipeStock(
       const newCap = cap.minus(deduct)
       await tx
         .update(eventInventory)
-        .set({ stockAllocated: decToDb(newCap) })
+        .set({ stockAllocated: stockToDb(newCap) })
         .where(
           and(
             eq(eventInventory.id, evRow.id),
@@ -287,7 +288,7 @@ async function deductRecipeStock(
         const newBar = barAvail.minus(fromBar)
         await tx
           .update(barInventory)
-          .set({ currentStock: decToDb(newBar) })
+          .set({ currentStock: stockToDb(newBar) })
           .where(
             and(
               eq(barInventory.id, bRow.id),
@@ -403,7 +404,7 @@ async function findPickupStockShortages(
     db
       .select({
         inventoryItemId: barInventory.inventoryItemId,
-        total: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+        total: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
       })
       .from(barInventory)
       .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -721,6 +722,7 @@ export const barsRoute = new Hono()
         id: r.id,
         name: r.name,
         price: String(r.price),
+        saleType: r.saleType,
         directStock:
           !tracksStock || r.directStock == null ? null : String(r.directStock),
         isActiveForBar:
@@ -777,9 +779,14 @@ export const barsRoute = new Hono()
           eq(barProducts.barId, barId), eq(barProducts.productId, body.productId),
           eq(barProducts.tenantId, tenantId)
         )).limit(1)
-        if (existing) await tx.update(barProducts).set({ isActive: body.isActive }).where(eq(barProducts.id, existing.id))
+        // Un producto por unidad siempre lleva conteo propio en la barra (0 al sumarlo).
+        const unitStock = prod.saleType === "UNIT" ? "0.00" : null
+        if (existing) await tx.update(barProducts).set({
+          isActive: body.isActive,
+          ...(body.isActive && unitStock && existing.directStock == null ? { directStock: unitStock } : {}),
+        }).where(eq(barProducts.id, existing.id))
         else if (body.isActive) await tx.insert(barProducts).values({
-          id: uuidv4(), barId, productId: body.productId, tenantId, isActive: true,
+          id: uuidv4(), barId, productId: body.productId, tenantId, isActive: true, directStock: unitStock,
         })
         return "ok"
       })
@@ -809,6 +816,7 @@ export const barsRoute = new Hono()
         baseUnit: inventoryItems.baseUnit,
         packageSize: inventoryItems.packageSize,
         countingUnit: inventoryItems.countingUnit,
+        createdAt: inventoryItems.createdAt,
         eventStockAllocated: eventInventory.stockAllocated,
         barRowId: barInventory.id,
         barStock: barInventory.currentStock,
@@ -836,13 +844,13 @@ export const barsRoute = new Hono()
           eq(inventoryItems.isActive, true)
         )
       )
-      .orderBy(asc(inventoryItems.name))
+      .orderBy(desc(inventoryItems.createdAt), asc(inventoryItems.name))
 
     const sumByItem = new Map<string, string>()
     const sumRows = await db
       .select({
         iid: barInventory.inventoryItemId,
-        s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+        s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
       })
       .from(barInventory)
       .innerJoin(bars, eq(barInventory.barId, bars.id))
@@ -873,11 +881,12 @@ export const barsRoute = new Hono()
           baseUnit: r.baseUnit,
           packageSize: r.packageSize,
           countingUnit: r.countingUnit,
+          createdAt: r.createdAt?.toISOString() ?? null,
           eventStockAllocated:
             r.eventStockAllocated == null
               ? "0.00"
               : String(r.eventStockAllocated),
-          unallocatedEventStock: decToDb(unalloc),
+          unallocatedEventStock: stockToDb(unalloc),
           barInventoryRowId: r.barRowId,
           barCurrentStock: r.barStock == null ? "0.00" : String(r.barStock),
         }
@@ -900,8 +909,7 @@ export const barsRoute = new Hono()
       const [product] = await tx.select().from(products).where(and(eq(products.id, body.productId), eq(products.tenantId, tenantId))).limit(1)
       const [menu] = await tx.select().from(barProducts).where(and(eq(barProducts.barId, barId), eq(barProducts.productId, body.productId), eq(barProducts.tenantId, tenantId))).limit(1).for("update")
       if (!product || !menu) return "missing"
-      const recipe = await tx.select({ id: productRecipes.id }).from(productRecipes).where(eq(productRecipes.productId, product.id)).limit(1)
-      if (recipe.length && body.quantity != null) return "recipe"
+      if (product.saleType !== "UNIT" && body.quantity != null) return "recipe"
       const current = menu.directStock == null ? null : decFromDb(menu.directStock)
       const next = body.quantity == null ? null : dec(body.quantity)
       if (current === null ? next === null : next !== null && current.eq(next)) return "ok"
@@ -919,7 +927,7 @@ export const barsRoute = new Hono()
     })
     if (result === "disabled") return c.json({ error: "Este evento no usa control de stock" }, 400)
     if (result === "missing") return c.json({ error: "Producto no encontrado en esta barra" }, 404)
-    if (result === "recipe") return c.json({ error: "Este producto usa insumos: actualizá sus existencias" }, 400)
+    if (result === "recipe") return c.json({ error: "Este producto no se vende por unidad: cambiá su venta a Unidad" }, 400)
     if (result === "conflict") return c.json({ error: "El stock cambió mientras lo editabas. Revisá el conteo actual." }, 409)
     if (result === "invalid_cost") return c.json({ error: "El costo sólo se registra al ingresar mercadería" }, 400)
     return c.json({ ok: true, directStock: body.quantity })
@@ -958,8 +966,8 @@ export const barsRoute = new Hono()
         eq(barInventory.inventoryItemId, item.id)
       )).limit(1).for("update")
       const current = decFromDb(existing?.currentStock ?? "0")
-      const next = dec(decToDb(conversion.value))
-      const stock = decToDb(next)
+      const next = dec(stockToDb(conversion.value))
+      const stock = stockToDb(next)
       if (body.totalCost != null && dec(body.totalCost).gt(0) && next.lt(current)) return { kind: "invalid" as const, error: "El costo sólo se registra al ingresar mercadería" }
       // Un reintento del mismo conteo es idempotente. Un conteo desactualizado no
       // pisa ventas ni cambios de otro operador.
@@ -973,11 +981,11 @@ export const barsRoute = new Hono()
       const total = siblingStocks.reduce((sum, row) => sum.plus(decFromDb(row.stock)), next)
       if (aggregate) {
         const updated = decFromDb(aggregate.stockAllocated).plus(next.minus(current))
-        await tx.update(eventInventory).set({ stockAllocated: decToDb(updated.lt(total) ? total : updated) })
+        await tx.update(eventInventory).set({ stockAllocated: stockToDb(updated.lt(total) ? total : updated) })
           .where(eq(eventInventory.id, aggregate.id))
       } else {
         await tx.insert(eventInventory).values({ id: uuidv4(), tenantId, eventId: bar.eventId,
-          inventoryItemId: item.id, stockAllocated: decToDb(total) })
+          inventoryItemId: item.id, stockAllocated: stockToDb(total) })
       }
       if (body.totalCost != null && dec(body.totalCost).gt(0)) {
         const added = next.minus(current)
@@ -1049,7 +1057,7 @@ export const barsRoute = new Hono()
         return c.json({ error: conv.error }, 400)
       }
       const qty = conv.value
-      const stockStr = decToDb(qty)
+      const stockStr = stockToDb(qty)
 
       const [evInv] = await db
         .select()
@@ -1066,7 +1074,7 @@ export const barsRoute = new Hono()
 
       const [sumOthersRow] = await db
         .select({
-          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(14,2))), 0)`,
+          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
         })
         .from(barInventory)
         .innerJoin(bars, eq(barInventory.barId, bars.id))
