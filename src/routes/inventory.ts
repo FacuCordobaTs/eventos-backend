@@ -34,7 +34,7 @@ import {
   servingFromYield,
   type ProductSaleType,
 } from "../lib/inventory-deduction"
-import { syncDirectStockForSaleType } from "../lib/product-sale-type"
+import { applySaleType } from "../lib/product-sale-type"
 import { findOrCreateCustomer } from "../lib/client-checkout"
 import { creditBalance, debitBalance, getBalance } from "../lib/balance"
 import { emitCommittedStockDeltas } from "../lib/event-stock-broadcast"
@@ -891,6 +891,7 @@ export const inventoryRoute = new Hono()
           prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
         )
       }
+      await applySaleType(tx, tenantId, { id: productId, name: body.name }, body.saleType)
     })
 
     return c.json({ product: await loadProductDto(db, tenantId, productId) }, 201)
@@ -936,20 +937,24 @@ export const inventoryRoute = new Hono()
           ...(body.categoryId === undefined ? {} : { categoryId: body.categoryId }),
         })
         .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
-      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
-      if (prepared.recipes.length > 0) {
-        await tx.insert(productRecipes).values(
-          prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
-        )
+      // Un producto por unidad conserva su insumo propio; los demás modos reemplazan la receta.
+      if (body.saleType !== "UNIT" || existing.saleType !== "UNIT") {
+        await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
+        if (prepared.recipes.length > 0) {
+          await tx.insert(productRecipes).values(
+            prepared.recipes.map((r) => ({ id: uuidv4(), productId, ...r }))
+          )
+        }
       }
-      if (existing.saleType !== body.saleType) {
-        await syncDirectStockForSaleType(tx, tenantId, productId, body.saleType)
-      }
+      await applySaleType(tx, tenantId, { id: productId, name: body.name }, body.saleType)
     })
 
     return c.json({ product: await loadProductDto(db, tenantId, productId) })
   })
-  /** Cambia cómo se vende el producto. Cambiar de modo descarta la receta anterior. */
+  /**
+   * Cambia cómo se vende el producto. Cambiar de modo descarta la receta anterior; UNIT
+   * enlaza el producto con su insumo propio (lo crea si no existe).
+   */
   .put("/products/:id/sale-type", zValidator("json", saleTypeBodySchema), async (c) => {
     const ctx = c as AuthenticatedContext
     if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
@@ -964,20 +969,22 @@ export const inventoryRoute = new Hono()
     const db = drizzle(pool)
     const changed = await db.transaction(async (tx) => {
       const [existing] = await tx
-        .select({ saleType: products.saleType })
+        .select({ saleType: products.saleType, name: products.name })
         .from(products)
         .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
         .limit(1)
         .for("update")
       if (!existing) return null
-      if (existing.saleType === saleType) return false
-      await tx
-        .update(products)
-        .set({ saleType })
-        .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
-      await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
-      await syncDirectStockForSaleType(tx, tenantId, productId, saleType)
-      return true
+      const changed = existing.saleType !== saleType
+      if (changed) {
+        await tx
+          .update(products)
+          .set({ saleType })
+          .where(and(eq(products.id, productId), eq(products.tenantId, tenantId)))
+        await tx.delete(productRecipes).where(eq(productRecipes.productId, productId))
+      }
+      await applySaleType(tx, tenantId, { id: productId, name: existing.name }, saleType)
+      return changed
     })
     if (changed === null) return c.json({ error: "Producto no encontrado" }, 404)
     return c.json({ product: await loadProductDto(db, tenantId, productId), changed })

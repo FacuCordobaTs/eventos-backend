@@ -779,14 +779,9 @@ export const barsRoute = new Hono()
           eq(barProducts.barId, barId), eq(barProducts.productId, body.productId),
           eq(barProducts.tenantId, tenantId)
         )).limit(1)
-        // Un producto por unidad siempre lleva conteo propio en la barra (0 al sumarlo).
-        const unitStock = prod.saleType === "UNIT" ? "0.00" : null
-        if (existing) await tx.update(barProducts).set({
-          isActive: body.isActive,
-          ...(body.isActive && unitStock && existing.directStock == null ? { directStock: unitStock } : {}),
-        }).where(eq(barProducts.id, existing.id))
+        if (existing) await tx.update(barProducts).set({ isActive: body.isActive }).where(eq(barProducts.id, existing.id))
         else if (body.isActive) await tx.insert(barProducts).values({
-          id: uuidv4(), barId, productId: body.productId, tenantId, isActive: true, directStock: unitStock,
+          id: uuidv4(), barId, productId: body.productId, tenantId, isActive: true,
         })
         return "ok"
       })
@@ -909,7 +904,8 @@ export const barsRoute = new Hono()
       const [product] = await tx.select().from(products).where(and(eq(products.id, body.productId), eq(products.tenantId, tenantId))).limit(1)
       const [menu] = await tx.select().from(barProducts).where(and(eq(barProducts.barId, barId), eq(barProducts.productId, body.productId), eq(barProducts.tenantId, tenantId))).limit(1).for("update")
       if (!product || !menu) return "missing"
-      if (product.saleType !== "UNIT" && body.quantity != null) return "recipe"
+      // Las existencias por unidad viven en el insumo propio del producto (PUT /stock).
+      if (body.quantity != null) return "recipe"
       const current = menu.directStock == null ? null : decFromDb(menu.directStock)
       const next = body.quantity == null ? null : dec(body.quantity)
       if (current === null ? next === null : next !== null && current.eq(next)) return "ok"
@@ -927,7 +923,7 @@ export const barsRoute = new Hono()
     })
     if (result === "disabled") return c.json({ error: "Este evento no usa control de stock" }, 400)
     if (result === "missing") return c.json({ error: "Producto no encontrado en esta barra" }, 404)
-    if (result === "recipe") return c.json({ error: "Este producto no se vende por unidad: cambiá su venta a Unidad" }, 400)
+    if (result === "recipe") return c.json({ error: "Las existencias de este producto se cargan en su insumo, desde Stock" }, 400)
     if (result === "conflict") return c.json({ error: "El stock cambió mientras lo editabas. Revisá el conteo actual." }, 409)
     if (result === "invalid_cost") return c.json({ error: "El costo sólo se registra al ingresar mercadería" }, 400)
     return c.json({ ok: true, directStock: body.quantity })

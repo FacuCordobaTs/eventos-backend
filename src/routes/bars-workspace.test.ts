@@ -524,99 +524,47 @@ describe("Entrega de ventas ya descontadas en caja", () => {
   });
 });
 
-describe("Existencias de productos por unidad", () => {
-  function unitStock() {
-    tables.product_recipes = [];
-    tables.products[0].saleType = "UNIT";
-    tables.bar_products.push({
-      id: "bp1",
-      barId: "bar-1",
+describe("Productos que se venden por unidad", () => {
+  function unitProduct() {
+    tables.inventory_items.push({
+      id: "coke",
       tenantId: "tenant-1",
-      productId: "drink",
+      name: "Coca lata",
+      baseUnit: "UNIT",
+      packageSize: "1.00",
+      countingUnit: "unidades",
       isActive: true,
-      directStock: "4.00",
+    });
+    tables.products.push({
+      id: "can",
+      tenantId: "tenant-1",
+      name: "Coca lata",
+      price: "3.00",
+      saleType: "UNIT",
+      isActive: true,
+    });
+    tables.product_recipes.push({
+      id: "own",
+      productId: "can",
+      inventoryItemId: "coke",
+      quantityUsed: "1.000000",
+      yieldPerPackage: null,
     });
     tables.bars.push({ id: "bar-2", eventId: "event-1", tenantId: "tenant-1" });
-    tables.bar_products.push({
-      id: "bp2",
-      barId: "bar-2",
+    tables.bar_inventory.push(
+      { id: "bi1", tenantId: "tenant-1", barId: "bar-1", inventoryItemId: "coke", currentStock: "4.000000" },
+      { id: "bi2", tenantId: "tenant-1", barId: "bar-2", inventoryItemId: "coke", currentStock: "8.000000" },
+    );
+    tables.event_inventory.push({
+      id: "ei",
       tenantId: "tenant-1",
-      productId: "drink",
-      isActive: true,
-      directStock: "8.00",
-    });
-    tables.event_products.push({
-      id: "old",
       eventId: "event-1",
-      tenantId: "tenant-1",
-      productId: "drink",
-      directStock: "12.00",
-      isActive: true,
+      inventoryItemId: "coke",
+      stockAllocated: "12.000000",
     });
   }
-  const setUnits = (
-    quantity: string | null,
-    expectedCurrentStock: string | null,
-    extras: Row = {},
-  ) =>
-    request("/bar-1/product-stock", "PUT", {
-      productId: "drink",
-      quantity,
-      expectedCurrentStock,
-      ...extras,
-    });
-  test("actualiza el conteo de esta barra sin alterar otra barra ni el dato histórico", async () => {
-    unitStock();
-    expect((await setUnits("10", "4.00")).status).toBe(200);
-    expect(tables.bar_products[0].directStock).toBe("10.00");
-    expect(tables.bar_products[1].directStock).toBe("8.00");
-    expect(tables.event_products[0].directStock).toBe("12.00");
-    const result = await request("/bar-1/products?eventId=event-1", "GET");
-    expect(((await result.json()) as Row).products[0].directStock).toBe(
-      "10.00",
-    );
-  });
-  test("reponer y reintentar no duplica costo, y un conteo viejo responde 409", async () => {
-    unitStock();
-    expect((await setUnits("10", "4.00", { totalCost: "120.35" })).status).toBe(
-      200,
-    );
-    const n = writes.length;
-    expect((await setUnits("10", "4.00", { totalCost: "120.35" })).status).toBe(
-      200,
-    );
-    expect(writes).toHaveLength(n);
-    expect(tables.event_expenses).toHaveLength(1);
-    expect((await setUnits("12", "4.00")).status).toBe(409);
-  });
-  test("un conteo nulo quita el límite sólo en esta barra", async () => {
-    unitStock();
-    expect((await setUnits(null, "4.00")).status).toBe(200);
-    expect(tables.bar_products[0].directStock).toBeNull();
-    expect(tables.bar_products[1].directStock).toBe("8.00");
-    expect((await setUnits("0", null)).status).toBe(200);
-    expect(tables.bar_products[0].directStock).toBe("0.00");
-  });
-  test("roles operativos, otro tenant y modos sin inventario no cambian existencias", async () => {
-    unitStock();
-    staff.role = "BARTENDER";
-    expect((await setUnits("10", "4.00")).status).toBe(403);
-    staff.role = "ADMIN";
-    staff.tenantId = "tenant-2";
-    expect((await setUnits("10", "4.00")).status).toBe(404);
-    staff.tenantId = "tenant-1";
-    tables.events[0].operationMode = "TICKETS_AND_CONSUMPTIONS";
-    expect((await setUnits("10", "4.00")).status).toBe(400);
-    expect(writes).toHaveLength(0);
-  });
-  test("productos que no se venden por unidad no tienen conteo propio", async () => {
-    unitStock();
-    tables.products[0].saleType = "GLASS";
-    expect((await setUnits("10", "4.00")).status).toBe(400);
-    expect(writes).toHaveLength(0);
-  });
-  test("entregar una compra web por unidad consume sólo la barra que entrega", async () => {
-    unitStock();
+  test("entregar una compra web descuenta 1 de su insumo sólo en la barra que entrega", async () => {
+    unitProduct();
     tables.sales.push({
       id: "unit-sale",
       tenantId: "tenant-1",
@@ -629,7 +577,7 @@ describe("Existencias de productos por unidad", () => {
       id: "unit-cons",
       tenantId: "tenant-1",
       eventId: "event-1",
-      productId: "drink",
+      productId: "can",
       saleId: "unit-sale",
       status: "PENDING",
       qrHash: "unit-qr",
@@ -637,12 +585,49 @@ describe("Existencias de productos por unidad", () => {
     expect(
       (await request("/bar-1/redeem", "POST", { qrHash: "unit-qr" })).status,
     ).toBe(200);
-    expect(tables.bar_products[0].directStock).toBe("3.00");
-    expect(tables.bar_products[1].directStock).toBe("8.00");
+    expect(tables.bar_inventory[0].currentStock).toBe("3.000000");
+    expect(tables.bar_inventory[1].currentStock).toBe("8.000000");
+    expect(tables.event_inventory[0].stockAllocated).toBe("11.000000");
+  });
+  test("su insumo se puede usar en la receta de otro producto", async () => {
+    unitProduct();
     expect(
-      (await request("/bar-1/redeem", "POST", { qrHash: "unit-qr" })).status,
+      (
+        await inventoryRequest("/products/drink/recipe", "PUT", {
+          recipes: [
+            { inventoryItemId: "rum", yieldPerPackage: "10" },
+            { inventoryItemId: "coke", yieldPerPackage: "2" },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      tables.product_recipes.filter((row) => row.productId === "drink"),
+    ).toHaveLength(2);
+    expect(
+      tables.product_recipes.find((row) => row.productId === "can"),
+    ).toMatchObject({ inventoryItemId: "coke", quantityUsed: "1.000000" });
+  });
+  test("el conteo por producto ya no se escribe: se carga en su insumo", async () => {
+    unitProduct();
+    tables.bar_products.push({
+      id: "bp",
+      barId: "bar-1",
+      tenantId: "tenant-1",
+      productId: "can",
+      isActive: true,
+      directStock: null,
+    });
+    expect(
+      (
+        await request("/bar-1/product-stock", "PUT", {
+          productId: "can",
+          quantity: "10",
+          expectedCurrentStock: null,
+        })
+      ).status,
     ).toBe(400);
-    expect(tables.bar_products[0].directStock).toBe("3.00");
+    expect(writes).toHaveLength(0);
   });
 });
 
@@ -699,22 +684,29 @@ describe("Modos de venta e insumos por unidad", () => {
       yieldPerPackage: null,
     });
   });
-  test("cambiar el modo descarta la receta y ajusta el conteo por unidad", async () => {
+  test("pasar a unidad crea su insumo propio y descarta la receta anterior", async () => {
     tables.bar_products.push({
       id: "bp1",
       barId: "bar-1",
       tenantId: "tenant-1",
       productId: "drink",
       isActive: true,
-      directStock: null,
+      directStock: "5.00",
     });
     const toUnit = await inventoryRequest("/products/drink/sale-type", "PUT", {
       saleType: "UNIT",
     });
     expect(toUnit.status).toBe(200);
     expect(tables.products[0].saleType).toBe("UNIT");
-    expect(tables.product_recipes).toHaveLength(0);
-    expect(tables.bar_products[0].directStock).toBe("0.00");
+    const own = tables.inventory_items.find((row) => row.name === "Cuba libre");
+    expect(own).toMatchObject({ tenantId: "tenant-1", baseUnit: "UNIT", isActive: true });
+    expect(tables.product_recipes).toHaveLength(1);
+    expect(tables.product_recipes[0]).toMatchObject({
+      productId: "drink",
+      inventoryItemId: own!.id,
+      quantityUsed: "1.000000",
+    });
+    expect(tables.bar_products[0].directStock).toBeNull();
     expect(
       (
         await inventoryRequest("/products/drink/recipe", "PUT", {
@@ -725,7 +717,42 @@ describe("Modos de venta e insumos por unidad", () => {
     await inventoryRequest("/products/drink/sale-type", "PUT", {
       saleType: "NONE",
     });
-    expect(tables.bar_products[0].directStock).toBeNull();
+    expect(tables.product_recipes).toHaveLength(0);
+    expect(tables.inventory_items.find((row) => row.id === own!.id)).toBeDefined();
+  });
+  test("pasar a unidad reutiliza el insumo con el mismo nombre", async () => {
+    tables.inventory_items.push({
+      id: "same",
+      tenantId: "tenant-1",
+      name: "cuba líbre",
+      baseUnit: "UNIT",
+      packageSize: "1.00",
+      countingUnit: "unidades",
+      isActive: true,
+    });
+    await inventoryRequest("/products/drink/sale-type", "PUT", {
+      saleType: "UNIT",
+    });
+    expect(tables.inventory_items).toHaveLength(2);
+    expect(tables.product_recipes[0].inventoryItemId).toBe("same");
+  });
+  test("renombrar un producto por unidad renombra su insumo y conserva el enlace", async () => {
+    await inventoryRequest("/products/drink/sale-type", "PUT", {
+      saleType: "UNIT",
+    });
+    const ownId = tables.product_recipes[0].inventoryItemId;
+    const res = await inventoryRequest("/products/drink", "PUT", {
+      name: "Cuba lata",
+      price: "15.10",
+      saleType: "UNIT",
+      recipes: [],
+    });
+    expect(res.status).toBe(200);
+    expect(tables.product_recipes).toHaveLength(1);
+    expect(tables.product_recipes[0].inventoryItemId).toBe(ownId);
+    expect(tables.inventory_items.find((row) => row.id === ownId)?.name).toBe(
+      "Cuba lata",
+    );
   });
   test("roles operativos no cambian modos, recetas ni insumos", async () => {
     staff.role = "BARTENDER";
@@ -741,18 +768,5 @@ describe("Modos de venta e insumos por unidad", () => {
     ).toBe(403);
     expect(writes).toHaveLength(0);
     expect(tables.products[0].saleType).toBe("GLASS");
-  });
-  test("al sumar un producto por unidad a la barra nace con conteo cero", async () => {
-    tables.products[0].saleType = "UNIT";
-    tables.product_recipes = [];
-    expect(
-      (
-        await request("/bar-1/products/toggle", "POST", {
-          productId: "drink",
-          isActive: true,
-        })
-      ).status,
-    ).toBe(200);
-    expect(tables.bar_products[0].directStock).toBe("0.00");
   });
 });
