@@ -60,6 +60,14 @@ export async function sendGuestCheckoutReceiptEmail(input: {
 
   const { db, eventId, saleId, receiptToken, contact } = input
 
+  // La tienda pública pide sólo nombre y DNI: sin email real no hay a quién enviarle el
+  // comprobante. Los clientes creados desde la caja usan un email sintético `@crow.local`.
+  const to = contact.email.trim()
+  if (to === "" || to.endsWith("@crow.local")) {
+    console.warn("[checkout-email] contacto sin email; skipping receipt email")
+    return
+  }
+
   const [evRow] = await db
     .select({ name: events.name, tenantId: events.tenantId })
     .from(events)
@@ -164,7 +172,7 @@ export async function sendGuestCheckoutReceiptEmail(input: {
 
   const { error } = await resend.emails.send({
     from: "Crow <entradas@crow.ar>",
-    to: contact.email.trim(),
+    to,
     subject,
     react: React.createElement(TicketEmail, {
       userName: contact.name.trim(),

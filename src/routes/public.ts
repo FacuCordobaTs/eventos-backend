@@ -603,8 +603,13 @@ const guestCheckoutSchema = z.object({
   clientTotal: z.string().min(1),
   contact: z.object({
     name: z.string().min(1).max(255),
-    email: z.string().email(),
-    phone: z.string().min(1).max(255),
+    /**
+     * La tienda pública pide sólo nombre y DNI: el comprador sin cuenta no deja email ni teléfono.
+     * Sin email no se envía el comprobante por correo (queda en pantalla y se recupera entrando
+     * con el DNI desde `/{slug}/acceso`).
+     */
+    email: z.union([z.string().email(), z.literal("")]).optional(),
+    phone: z.string().max(255).optional(),
     /**
      * Tarea 2.1 — DNI del comprador (la identidad dentro del evento: puerta, caja, saldo).
      * Opcional en el schema: el client lo manda siempre, pero el endpoint no debe romper
@@ -1472,8 +1477,8 @@ export const publicRoute = new Hono()
           eventId: body.eventId,
           contact: {
             name: body.contact.name,
-            email: body.contact.email,
-            phone: body.contact.phone,
+            email: body.contact.email?.trim() ?? "",
+            phone: body.contact.phone?.trim() ?? "",
             // Tarea 2.1 — el DNI viaja al checkout: `findOrCreateCustomer` lo persiste y
             // `executeTicketPurchase` lo snapshotea en `tickets.buyer_dni` (lookup en puerta).
             ...(body.contact.dni ? { dni: body.contact.dni } : {}),
