@@ -37,6 +37,8 @@ import { pickupItemsWithNames } from "../lib/pickup-items"
 import { PurchaseError, purchaseErrorStatus } from "../lib/ticket-purchase"
 import { dec, decToDb } from "../lib/decimal-money"
 import { obtenerTokenValido } from "../lib/mercadopago-utils"
+import { syncMercadoPagoSalePayment } from "../lib/mp-webhook"
+import { clientReturnOrigin } from "../lib/public-event-origin"
 import { qrCodeDataUrl } from "../lib/qr"
 import { v4 as uuidv4 } from "uuid"
 import { randomUUID } from "node:crypto"
@@ -389,12 +391,8 @@ async function runConsumptionsCheckout(input: {
     clientTotal: string
     paymentMethod?: string
   }
-  /**
-   * Comprobante al que vuelve el navegador después de pagar: el de la venta original cuando la
-   * compra cuelga de un comprobante. Sin comprobante previo (sesión de acceso) va `null` y se usa
-   * el de la venta que se acaba de crear, que es el comprobante que el cliente tiene que ver.
-   */
-  returnReceiptToken: string | null
+  /** Origen desde el que se compró: el navegador vuelve ahí después de pagar. */
+  returnOrigin: string
 }): Promise<ConsumptionsCheckoutOutcome> {
   const db = drizzle(pool)
 
@@ -470,7 +468,9 @@ async function runConsumptionsCheckout(input: {
 
   const total = parseFloat(input.body.clientTotal)
   const fee = Math.round(total * 0.01 * 100) / 100
-  const backUrlToken = input.returnReceiptToken ?? result.receiptToken
+  // El navegador vuelve al retiro de la venta nueva: mientras se acredita muestra su estado de pago
+  // y, una vez cobrada, reúne todos los consumos del cliente en el evento.
+  const pickupUrl = `${input.returnOrigin}/receipt/${result.receiptToken}/retirar`
 
   const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
     method: "POST",
@@ -482,9 +482,9 @@ async function runConsumptionsCheckout(input: {
       items: [{ title: "Consumos", quantity: 1, currency_id: "ARS", unit_price: total }],
       marketplace_fee: fee,
       back_urls: {
-        success: `https://crow.ar/receipt/${backUrlToken}`,
-        failure: `https://crow.ar/receipt/${backUrlToken}`,
-        pending: `https://crow.ar/receipt/${backUrlToken}`,
+        success: pickupUrl,
+        failure: pickupUrl,
+        pending: pickupUrl,
       },
       auto_return: "approved",
       external_reference: `totem-sale-${result.saleId}`,
@@ -504,7 +504,10 @@ async function runConsumptionsCheckout(input: {
     return { status: 500, body: { error: "No se pudo obtener el link de pago" } }
   }
 
-  return { status: 200, body: { success: true, url_pago: preference.init_point } }
+  return {
+    status: 200,
+    body: { success: true, url_pago: preference.init_point, receiptToken: result.receiptToken },
+  }
 }
 
 async function countIssued(
@@ -904,6 +907,7 @@ export const publicRoute = new Hono()
       .select({
         id: events.id,
         name: events.name,
+        slug: events.slug,
         date: events.date,
         venue: events.venue,
         location: events.location,
@@ -1009,6 +1013,8 @@ export const publicRoute = new Hono()
         status: pickup.status,
         createdAt: pickup.createdAt ?? null,
         deliveredAt: pickup.deliveredAt ?? null,
+        // Qué unidades reserva el pedido: la pantalla de retiro no las vuelve a ofrecer.
+        consumptionIds: (pickup.itemsJson ?? []).map((item) => item.consumptionId),
         items: await pickupItemsWithNames(db, pickup.itemsJson),
       }))
     )
@@ -1032,6 +1038,7 @@ export const publicRoute = new Hono()
       event: {
         id: ev.id,
         name: ev.name,
+        slug: ev.slug ?? null,
         date: ev.date,
         venue: ev.venue,
         location: ev.location,
@@ -1524,6 +1531,13 @@ export const publicRoute = new Hono()
 
         const total = parseFloat(body.clientTotal)
         const fee = Math.round(total * 0.01 * 100) / 100
+        // Una compra sólo de consumos vuelve directo al retiro en barra; con entradas o transporte,
+        // al comprobante completo.
+        const onlyConsumptions =
+          (body.ticketLines ?? []).length === 0 && (body.transportLines ?? []).length === 0
+        const returnUrl = `${clientReturnOrigin(c.req.header("origin"))}/receipt/${result.receiptToken}${
+          onlyConsumptions ? "/retirar" : ""
+        }`
 
         const mpRes = await fetch("https://api.mercadopago.com/checkout/preferences", {
           method: "POST",
@@ -1542,9 +1556,9 @@ export const publicRoute = new Hono()
             ],
             marketplace_fee: fee,
             back_urls: {
-              success: `https://crow.ar/receipt/${result.receiptToken}`,
-              failure: `https://crow.ar/receipt/${result.receiptToken}`,
-              pending: `https://crow.ar/receipt/${result.receiptToken}`,
+              success: returnUrl,
+              failure: returnUrl,
+              pending: returnUrl,
             },
             auto_return: "approved",
             external_reference: `totem-sale-${result.saleId}`,
@@ -1952,6 +1966,7 @@ export const publicRoute = new Hono()
       .select({
         sale: sales,
         eventName: events.name,
+        eventSlug: events.slug,
         eventDate: events.date,
         eventVenue: events.venue,
         eventLocation: events.location,
@@ -2081,6 +2096,8 @@ export const publicRoute = new Hono()
         status: pickup.status,
         createdAt: pickup.createdAt ?? null,
         deliveredAt: pickup.deliveredAt ?? null,
+        // Qué unidades reserva el pedido: la pantalla de retiro no las vuelve a ofrecer.
+        consumptionIds: (pickup.itemsJson ?? []).map((item) => item.consumptionId),
         items: await pickupItemsWithNames(db, pickup.itemsJson),
       }))
     )
@@ -2128,6 +2145,7 @@ export const publicRoute = new Hono()
       event: {
         id: header.sale.eventId,
         name: header.eventName,
+        slug: header.eventSlug ?? null,
         date: header.eventDate,
         venue: header.eventVenue,
         location: header.eventLocation,
@@ -2165,6 +2183,34 @@ export const publicRoute = new Hono()
       shares,
     })
   })
+  // Confirmación activa al volver de Mercado Pago: no le cree al navegador, le pregunta a Mercado
+  // Pago por esta venta. El token es la credencial y el límite acota las consultas al proveedor.
+  .post("/receipts/:token/sync-payment", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const [sale] = await db
+      .select({
+        id: sales.id,
+        tenantId: sales.tenantId,
+        status: sales.status,
+        paymentMethod: sales.paymentMethod,
+        paid: sales.paid,
+      })
+      .from(sales)
+      .where(eq(sales.receiptToken, token))
+      .limit(1)
+
+    if (!sale) return c.json({ error: "Comprobante no encontrado" }, 404)
+    if (sale.status !== "PENDING" || sale.paymentMethod !== "MERCADOPAGO") {
+      return c.json({ paid: Boolean(sale.paid) })
+    }
+
+    const limited = consumeRateLimit(`receipt:sync:${token}`, 30, 5 * 60 * 1000)
+    if (!limited.ok) return c.json({ paid: false })
+
+    return c.json({ paid: await syncMercadoPagoSalePayment(sale) })
+  })
   .post("/receipts/:token/consumptions-checkout", async (c) => {
     const token = c.req.param("token")
     const db = drizzle(pool)
@@ -2200,7 +2246,7 @@ export const publicRoute = new Hono()
       contact: snap.contact,
       customerId: saleRow.customerId,
       body,
-      returnReceiptToken: token,
+      returnOrigin: clientReturnOrigin(c.req.header("origin")),
     })
     return c.json(outcome.body, outcome.status)
   })
@@ -2233,9 +2279,7 @@ export const publicRoute = new Hono()
       contact: contactFromCustomer(session.customer),
       customerId: session.customer.id,
       body,
-      // Sin comprobante previo, el navegador vuelve al de la venta nueva: es el comprobante que
-      // el cliente tiene que ver cuando Mercado Pago lo devuelve.
-      returnReceiptToken: null,
+      returnOrigin: clientReturnOrigin(c.req.header("origin")),
     })
     return c.json(outcome.body, outcome.status)
   })
@@ -2319,6 +2363,37 @@ export const publicRoute = new Hono()
       return c.json({ token: duplicate.token, status: duplicate.status, items })
     }
 
+    // Una unidad vive en un solo pedido activo: dos QRs no pueden prometer el mismo trago. Un pedido
+    // viejo con alguna unidad ya canjeada por otro camino no reserva nada: la barra lo rechazaría.
+    const requested = new Set(idsSorted)
+    const overlapping = existingRows.filter((o) =>
+      (o.itemsJson ?? []).some((item) => requested.has(item.consumptionId))
+    )
+    if (overlapping.length > 0) {
+      const overlappingIds = overlapping.flatMap((o) =>
+        (o.itemsJson ?? []).map((item) => item.consumptionId)
+      )
+      const stillPending = new Set(
+        (
+          await db
+            .select({ id: digitalConsumptions.id })
+            .from(digitalConsumptions)
+            .where(
+              and(
+                inArray(digitalConsumptions.id, overlappingIds),
+                eq(digitalConsumptions.status, "PENDING")
+              )
+            )
+        ).map((row) => row.id)
+      )
+      const reserved = overlapping.some((o) =>
+        (o.itemsJson ?? []).every((item) => stillPending.has(item.consumptionId))
+      )
+      if (reserved) {
+        return c.json({ error: "Algunos productos ya están en otra orden de retiro" }, 409)
+      }
+    }
+
     const orderId = uuidv4()
     const token = randomUUID()
     await db.insert(pickupOrders).values({
@@ -2335,6 +2410,38 @@ export const publicRoute = new Hono()
     const items = await pickupItemsWithNames(db, itemsJson)
     broadcastReceiptUpdate(body.receiptToken)
     return c.json({ token, status: "PENDING", items }, 201)
+  })
+  // El cliente deshace su orden para armar otra. Las consumiciones nunca se tocaron: siguen PENDING.
+  // La condición sobre el estado evita pisar una entrega que llegó primero.
+  .post("/pickups/:token/cancel", async (c) => {
+    const token = c.req.param("token")
+    const db = drizzle(pool)
+
+    const [row] = await db
+      .select({ id: pickupOrders.id, status: pickupOrders.status })
+      .from(pickupOrders)
+      .where(eq(pickupOrders.token, token))
+      .limit(1)
+    if (!row) return c.json({ error: "Pedido no encontrado" }, 404)
+    if (row.status === "CANCELLED") return c.json({ status: row.status })
+    if (row.status !== "PENDING") {
+      return c.json({ error: "Este pedido ya fue entregado" }, 409)
+    }
+
+    await db
+      .update(pickupOrders)
+      .set({ status: "CANCELLED" })
+      .where(and(eq(pickupOrders.id, row.id), eq(pickupOrders.status, "PENDING")))
+
+    const [after] = await db
+      .select({ status: pickupOrders.status })
+      .from(pickupOrders)
+      .where(eq(pickupOrders.id, row.id))
+      .limit(1)
+    if (after?.status !== "CANCELLED") {
+      return c.json({ error: "Este pedido ya fue entregado" }, 409)
+    }
+    return c.json({ status: after.status })
   })
   // Vista del pedido para el QR del client (tarea 4.1). Sin auth — el token ES la credencial.
   .get("/pickups/:token", async (c) => {

@@ -4,9 +4,14 @@ import { pool } from "../db"
 import { mpProcessedPayments, sales } from "../db/schema"
 import { fulfillPendingGuestCheckout } from "./client-checkout"
 import { dec, decFromDb } from "./decimal-money"
-import { mpGetPayment, type MpPaymentResource } from "./mp-checkout-api"
+import {
+  mpGetPayment,
+  mpSearchPaymentsByExternalReference,
+  type MpPaymentResource,
+} from "./mp-checkout-api"
 import { obtenerTokenValido } from "./mercadopago-utils"
 import { sendGuestCheckoutReceiptEmail } from "./send-checkout-receipt-email"
+import { broadcastReceiptUpdate } from "./public-qr-broadcast"
 import { PurchaseError } from "./ticket-purchase"
 
 export const MP_EXTERNAL_REF_PREFIX = "totem-sale-"
@@ -77,6 +82,19 @@ export async function processMercadoPagoPaymentNotification(
     return
   }
 
+  await applyVerifiedMercadoPagoPayment(verified, resolved.tenantId)
+}
+
+/**
+ * Aplica un pago ya leído de la API de Mercado Pago con la credencial del tenant. Lo usan el
+ * webhook y la confirmación activa del comprobante: el cobro sale siempre de Mercado Pago, nunca
+ * de lo que diga el navegador, y `mpProcessedPayments` hace que dos caminos no lo apliquen dos veces.
+ */
+async function applyVerifiedMercadoPagoPayment(
+  verified: MpPaymentResource,
+  tenantId: string
+): Promise<void> {
+  const paymentId = String(verified.id)
   const saleId = parseSaleIdFromExternalReference(verified.external_reference ?? undefined)
   if (!saleId) {
     console.warn("[mp-webhook] Missing external_reference", paymentId)
@@ -89,7 +107,7 @@ export async function processMercadoPagoPaymentNotification(
     console.warn("[mp-webhook] Sale not found", saleId)
     return
   }
-  if (sale.tenantId !== resolved.tenantId) {
+  if (sale.tenantId !== tenantId) {
     console.warn("[mp-webhook] Tenant mismatch for sale", saleId)
     return
   }
@@ -127,6 +145,11 @@ export async function processMercadoPagoPaymentNotification(
     return
   }
 
+  // Checkout Pro deja reintentar con otro medio sobre la misma preferencia: un rechazo no cierra la
+  // venta, porque el pago siguiente puede aprobarse y tiene que encontrarla todavía PENDING.
+  const retriableRejection =
+    sale.paymentMethod === "MERCADOPAGO" && (status === "rejected" || status === "cancelled")
+
   const db2 = drizzle(pool)
   let skippedProcessedDuplicate = false
   await db2.transaction(async (tx) => {
@@ -142,6 +165,8 @@ export async function processMercadoPagoPaymentNotification(
       }
       throw e
     }
+
+    if (retriableRejection) return
 
     if (terminalRejected) {
       await tx
@@ -178,6 +203,8 @@ export async function processMercadoPagoPaymentNotification(
     return
   }
 
+  broadcastReceiptUpdate(after.receiptToken)
+
   const snap = after.guestCheckoutSnapshot
   const contact =
     snap && typeof snap === "object" && "contact" in snap
@@ -198,4 +225,32 @@ export async function processMercadoPagoPaymentNotification(
       console.error("[mp-webhook] Receipt email failed:", err)
     })
   }
+}
+
+/**
+ * Confirmación activa de una venta de Mercado Pago: si el cliente ya pagó y el webhook todavía no
+ * llegó, busca el pago en Mercado Pago y lo aplica por el mismo camino. Devuelve si la venta quedó
+ * cobrada. Es lo que hace que volver de Mercado Pago muestre el retiro sin esperar la notificación.
+ */
+export async function syncMercadoPagoSalePayment(sale: {
+  id: string
+  tenantId: string
+}): Promise<boolean> {
+  const accessToken = await obtenerTokenValido(sale.tenantId)
+  if (!accessToken) return false
+
+  const payments = await mpSearchPaymentsByExternalReference(
+    accessToken,
+    `${MP_EXTERNAL_REF_PREFIX}${sale.id}`
+  )
+  const approved = payments.find((payment) => (payment.status ?? "").toLowerCase() === "approved")
+  if (!approved) return false
+
+  await applyVerifiedMercadoPagoPayment(approved, sale.tenantId)
+  const [after] = await drizzle(pool)
+    .select({ status: sales.status })
+    .from(sales)
+    .where(eq(sales.id, sale.id))
+    .limit(1)
+  return after?.status === "COMPLETED"
 }

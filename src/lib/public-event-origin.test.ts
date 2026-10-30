@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { publicEventOrigin, publicEventApiPath } from "./public-event-origin"
+import { clientReturnOrigin, publicEventOrigin, publicEventApiPath } from "./public-event-origin"
 
 test("CORS accepts only HTTPS event origins on the platform domain", () => {
   expect(publicEventOrigin("https://dripeo.crow.ar")).toBe(true)
@@ -13,5 +13,13 @@ test("event hosts can use checkout payments but not staff or MP administration",
   expect(publicEventApiPath("/api/mp/process-brick")).toBe(true)
   for (const path of ["/events", "/staff", "/api/mp/disconnect", "/api/mp/auth-url", "/api/mp/status"]) {
     expect(publicEventApiPath(path)).toBe(false)
+  }
+})
+
+test("el retorno del pago sólo vuelve a hosts de evento validados", () => {
+  expect(clientReturnOrigin("https://perronegro3110.crow.ar")).toBe("https://perronegro3110.crow.ar")
+  expect(clientReturnOrigin("https://crow.ar")).toBe("https://crow.ar")
+  for (const origin of ["https://admin.crow.ar", "https://api.crow.ar", "https://evil.example", "http://perronegro3110.crow.ar", "", null, undefined]) {
+    expect(clientReturnOrigin(origin)).toBe("https://crow.ar")
   }
 })

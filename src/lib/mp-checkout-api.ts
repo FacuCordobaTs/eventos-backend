@@ -30,6 +30,29 @@ export async function mpGetPayment(
   return (await res.json()) as MpPaymentResource
 }
 
+/** Pagos de una preferencia/venta, del más nuevo al más viejo. Vacío si la consulta falla. */
+export async function mpSearchPaymentsByExternalReference(
+  accessToken: string,
+  externalReference: string
+): Promise<MpPaymentResource[]> {
+  const query = new URLSearchParams({
+    external_reference: externalReference,
+    sort: "date_created",
+    criteria: "desc",
+  })
+  const res = await fetch(`${MP_API}/v1/payments/search?${query}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  })
+  if (!res.ok) {
+    return []
+  }
+  const data = (await res.json()) as { results?: MpPaymentResource[] }
+  return data.results ?? []
+}
+
 export async function mpCreateCheckoutPreference(input: {
   accessToken: string
   items: {
