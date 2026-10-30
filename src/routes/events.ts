@@ -218,6 +218,10 @@ const duplicateEventSchema = z.object({
 /** ISO 8601 instant from client (UTC or offset); null clears the window. */
 const patchEventSchema = z
   .object({
+    // Fecha y hora del evento. `confirmSend` es la misma confirmación que pide el recordatorio de
+    // WhatsApp cuando mover la fecha hace salir el mensaje en el próximo minuto.
+    date: z.string().min(1).optional(),
+    confirmSend: z.boolean().optional(),
     venue: z.string().max(255).nullable().optional(),
     location: z.string().max(255).nullable().optional(),
     description: z.union([z.string().max(500), z.null()]).optional(),
@@ -235,7 +239,7 @@ const patchEventSchema = z
   })
   .superRefine((data, ctx) => {
     const check = (
-      key: "ticketsAvailableFrom" | "ticketsSalesClosedAt" | "consumptionsAvailableFrom"
+      key: "date" | "ticketsAvailableFrom" | "ticketsSalesClosedAt" | "consumptionsAvailableFrom"
     ) => {
       const v = data[key]
       if (v === undefined || v === null) return
@@ -248,10 +252,12 @@ const patchEventSchema = z
         })
       }
     }
+    check("date")
     check("ticketsAvailableFrom")
     check("ticketsSalesClosedAt")
     check("consumptionsAvailableFrom")
     if (
+      data.date === undefined &&
       data.description === undefined &&
       data.ticketsAvailableFrom === undefined &&
       data.ticketsSalesClosedAt === undefined &&
@@ -4754,6 +4760,7 @@ export const eventsRoute = new Hono()
     }
 
     const setPayload: {
+      date?: Date
       venue?: string | null
       location?: string | null
       description?: string | null
@@ -4773,6 +4780,33 @@ export const eventsRoute = new Hono()
       }
       if (body.venue !== undefined) setPayload.venue = body.venue?.trim() || null
       if (body.location !== undefined) setPayload.location = body.location?.trim() || null
+    }
+    if (body.date !== undefined) {
+      if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") {
+        return c.json({ error: "Solo administradores y gerentes pueden editar la fecha." }, 403)
+      }
+      const ev = await requireEventForTenant(db, eventId, tenantId)
+      if (!ev) {
+        return c.json({ error: "Evento no encontrado" }, 404)
+      }
+      // El recordatorio se calcula sobre esta fecha: si el cambio abre su ventana de envío, sale en
+      // el próximo minuto. Es un envío masivo sin vuelta atrás, así que se confirma como en Mensajes.
+      const nextDate = new Date(body.date)
+      const now = new Date()
+      const sendsBefore = reminderSchedule(ev, now).state === "SENDING"
+      const sendsAfter = reminderSchedule({ ...ev, date: nextDate }, now).state === "SENDING"
+      if (sendsAfter && !sendsBefore && isWhatsAppConfigured() && body.confirmSend !== true) {
+        const { recipients } = await listReminderAudience(db, ev)
+        return c.json(
+          {
+            error: "Con esta fecha el recordatorio de WhatsApp sale en el próximo minuto.",
+            code: "CONFIRM_IMMEDIATE_SEND",
+            recipients: recipients.length,
+          },
+          409
+        )
+      }
+      setPayload.date = nextDate
     }
     if (body.description !== undefined) {
       setPayload.description =

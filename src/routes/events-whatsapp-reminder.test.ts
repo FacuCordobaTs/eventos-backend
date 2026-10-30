@@ -428,3 +428,56 @@ describe("reporte de clientes anteriores sin cierre operativo", () => {
     expect(eventRow.wentLiveAt).toBe(historicalDate)
   })
 })
+
+describe("PATCH /events/:id con fecha", () => {
+  const patchEvent = (body: unknown) =>
+    eventsRoute.request("/event-1", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+
+  test("guarda la nueva fecha y hora", async () => {
+    const res = await patchEvent({ date: at(600).toISOString() })
+    expect(res.status).toBe(200)
+    expect(updates).toEqual([{ date: at(600) }])
+  })
+
+  test.each(["BARTENDER", "SECURITY", "PROMOTER", "GENERAL_PROMOTER"])(
+    "%s no puede cambiarla",
+    async (role: string) => {
+      asRole(role)
+      expect((await patchEvent({ date: at(600).toISOString() })).status).toBe(403)
+      expect(updates).toEqual([])
+    }
+  )
+
+  test("rechaza una fecha inválida", async () => {
+    expect((await patchEvent({ date: "mañana" })).status).toBe(400)
+    expect(updates).toEqual([])
+  })
+
+  test("si abre la ventana del recordatorio pide confirmación y no guarda nada", async () => {
+    const res = await patchEvent({ date: at(30).toISOString() })
+    expect(res.status).toBe(409)
+    expect(await res.json()).toMatchObject({ code: "CONFIRM_IMMEDIATE_SEND", recipients: 2 })
+    expect(updates).toEqual([])
+  })
+
+  test("con la confirmación guarda aunque el recordatorio salga en el próximo minuto", async () => {
+    const res = await patchEvent({ date: at(30).toISOString(), confirmSend: true })
+    expect(res.status).toBe(200)
+    expect(updates).toEqual([{ date: at(30) }])
+  })
+
+  test("un recordatorio ya enviado no pide confirmación", async () => {
+    eventRow = { ...baseEvent(), whatsappReminderSentAt: at(-5) }
+    expect((await patchEvent({ date: at(30).toISOString() })).status).toBe(200)
+  })
+
+  test("un evento de otra productora responde 404", async () => {
+    eventRow = null
+    expect((await patchEvent({ date: at(600).toISOString() })).status).toBe(404)
+    expect(updates).toEqual([])
+  })
+})
