@@ -224,6 +224,8 @@ const patchEventSchema = z
     ticketsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
     ticketsSalesClosedAt: z.union([z.string().min(1), z.null()]).optional(),
     consumptionsAvailableFrom: z.union([z.string().min(1), z.null()]).optional(),
+    consumptionsOnPageEnabled: z.boolean().optional(),
+    consumptionsOnAccessLinkEnabled: z.boolean().optional(),
     slug: z.union([eventSlugSchema, z.null()]).optional(),
     designType: z.enum(["GLASS", "MINIMAL"]).optional(),
     // Tarea 1.3 — Reingreso: bool del evento; la UI de puerta (3.2) lo edita desde el panel.
@@ -254,6 +256,8 @@ const patchEventSchema = z
       data.ticketsAvailableFrom === undefined &&
       data.ticketsSalesClosedAt === undefined &&
       data.consumptionsAvailableFrom === undefined &&
+      data.consumptionsOnPageEnabled === undefined &&
+      data.consumptionsOnAccessLinkEnabled === undefined &&
       data.slug === undefined &&
       data.designType === undefined &&
       data.allowReentry === undefined &&
@@ -536,6 +540,8 @@ function sanitizeEvent(row: typeof events.$inferSelect) {
     consumptionsAvailableFrom: row.consumptionsAvailableFrom
       ? row.consumptionsAvailableFrom.toISOString()
       : null,
+    consumptionsOnPageEnabled: row.consumptionsOnPageEnabled ?? true,
+    consumptionsOnAccessLinkEnabled: row.consumptionsOnAccessLinkEnabled ?? true,
   }
 }
 
@@ -1681,6 +1687,13 @@ export const eventsRoute = new Hono()
         // Configuración del recordatorio de WhatsApp; la marca de "ya se envió" no se hereda.
         whatsappReminderEnabled: source.whatsappReminderEnabled,
         whatsappReminderLeadMinutes: source.whatsappReminderLeadMinutes,
+        // Canales de venta de consumos: sólo tienen sentido si el modo los habilita.
+        ...(supportsConsumptions
+          ? {
+              consumptionsOnPageEnabled: source.consumptionsOnPageEnabled,
+              consumptionsOnAccessLinkEnabled: source.consumptionsOnAccessLinkEnabled,
+            }
+          : {}),
         createdAt: new Date(),
       })
 
@@ -4747,6 +4760,8 @@ export const eventsRoute = new Hono()
       ticketsAvailableFrom?: Date | null
       ticketsSalesClosedAt?: Date | null
       consumptionsAvailableFrom?: Date | null
+      consumptionsOnPageEnabled?: boolean
+      consumptionsOnAccessLinkEnabled?: boolean
       slug?: string | null
       designType?: "GLASS" | "MINIMAL"
       allowReentry?: boolean
@@ -4780,6 +4795,12 @@ export const eventsRoute = new Hono()
         body.consumptionsAvailableFrom === null
           ? null
           : new Date(body.consumptionsAvailableFrom)
+    }
+    if (body.consumptionsOnPageEnabled !== undefined) {
+      setPayload.consumptionsOnPageEnabled = body.consumptionsOnPageEnabled
+    }
+    if (body.consumptionsOnAccessLinkEnabled !== undefined) {
+      setPayload.consumptionsOnAccessLinkEnabled = body.consumptionsOnAccessLinkEnabled
     }
     if (body.slug !== undefined) {
       setPayload.slug = body.slug

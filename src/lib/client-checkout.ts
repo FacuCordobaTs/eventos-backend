@@ -60,6 +60,13 @@ async function insertTransportBookings(
 export type ClientCheckoutTicketLine = { ticketTypeId: string; quantity: number }
 export type ClientCheckoutDrinkLine = { productId: string; quantity: number }
 
+/**
+ * Superficie desde la que se piden consumos. `PAGE` es la página pública del evento
+ * (default histórico); `ACCESS_LINK` es `/{slug}/acceso`; `ANY` acepta cualquiera de las
+ * dos y se usa en el comprobante, que puede haberse abierto desde ambos canales.
+ */
+export type ClientCheckoutChannel = "PAGE" | "ACCESS_LINK" | "ANY"
+
 export type ClientCheckoutContact = {
   name: string
   /** Email. Vacío ("") = desconocido (venta de caja en POS, tarea 5.1): no se pisa el email
@@ -83,6 +90,8 @@ export type ClientCheckoutParams = {
   transportLines?: { transportId: string; quantity: number }[]
   /** Promotor del enlace público compartido. Ausente en compras sin referido. */
   promoterId?: string
+  /** Canal que debe habilitar la venta de consumos. Ausente = `PAGE`. */
+  channel?: ClientCheckoutChannel
 }
 
 export type ClientCheckoutResult = {
@@ -271,6 +280,19 @@ async function prepareGuestCheckout(
     throw new PurchaseError("CONSUMPTIONS_DISABLED")
   }
 
+  if (normalizedDrinks.length > 0) {
+    const channel = params.channel ?? "PAGE"
+    const pageEnabled = ev.consumptionsOnPageEnabled ?? true
+    const accessLinkEnabled = ev.consumptionsOnAccessLinkEnabled ?? true
+    const channelEnabled =
+      channel === "ACCESS_LINK"
+        ? accessLinkEnabled
+        : channel === "ANY"
+          ? pageEnabled || accessLinkEnabled
+          : pageEnabled
+    if (!channelEnabled) throw new PurchaseError("CONSUMPTIONS_DISABLED")
+  }
+
   const tenantId = ev.tenantId
   const transportLines = normalizeTransportLines(params.transportLines ?? [], normalizedTickets)
   const transportBookings: PreparedGuestCheckout["transportBookings"] = []
@@ -311,10 +333,6 @@ async function prepareGuestCheckout(
       throw new PurchaseError("TICKETS_SALES_CLOSED")
     }
   }
-  if (normalizedDrinks.length > 0) {
-    assertWindow(ev.consumptionsAvailableFrom, "CONSUMPTIONS_NOT_YET_AVAILABLE")
-  }
-
   const customerId = await findOrCreateCustomer(tx, params.contact)
 
   const drinkPrices = new Map<string, PricedDrink>()

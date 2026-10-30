@@ -266,7 +266,14 @@ export const events = mysqlTable(
     ticketsAvailableFrom: timestamp('tickets_available_from'),
     /** Cierre de venta de entradas: pasada esta fecha no se puede comprar más. NULL = sin cierre. */
     ticketsSalesClosedAt: timestamp('tickets_sales_closed_at'),
+    /** @deprecated Reemplazada por `consumptionsOnPageEnabled`/`consumptionsOnAccessLinkEnabled`. */
     consumptionsAvailableFrom: timestamp('consumptions_available_from'),
+    /** Venta de consumos desde la página pública del evento. */
+    consumptionsOnPageEnabled: boolean('consumptions_on_page_enabled').notNull().default(true),
+    /** Venta de consumos desde el link de acceso (`/{slug}/acceso`). */
+    consumptionsOnAccessLinkEnabled: boolean('consumptions_on_access_link_enabled')
+      .notNull()
+      .default(true),
     /**
      * Alcance operativo elegido al crear el evento.
      * - TICKETS_ONLY: entradas, acceso, página y promotores.

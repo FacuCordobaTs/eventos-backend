@@ -30,7 +30,10 @@ import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-check
 import { createTransportShare, cancelTransportShare, getTransportSharePreview, claimTransportShare, loadAllOwnerShares } from "../lib/transport-shares"
 import { ensureEventTransportTickets } from "../lib/transport-tickets"
 import { purchasedTransports } from "../lib/transports"
-import type { ClientCheckoutContact } from "../lib/client-checkout"
+import type {
+  ClientCheckoutContact,
+  ClientCheckoutParams,
+} from "../lib/client-checkout"
 import { asignarAliasASale } from "../lib/cucuru-service"
 import { getBalance } from "../lib/balance"
 import { pickupItemsWithNames } from "../lib/pickup-items"
@@ -386,6 +389,8 @@ async function runConsumptionsCheckout(input: {
   contact: ClientCheckoutContact
   /** Para resolver el DNI del titular cuando paga con saldo y el contacto no lo trae. */
   customerId: string | null
+  /** Canal que habilita la compra: el comprobante puede venir de cualquiera de los dos. */
+  channel?: ClientCheckoutParams["channel"]
   body: {
     drinkLines: { productId: string; quantity: number }[]
     clientTotal: string
@@ -436,6 +441,7 @@ async function runConsumptionsCheckout(input: {
         contact,
         paymentMethod: method,
         clientTotal: input.body.clientTotal.trim(),
+        channel: input.channel ?? "ANY",
         ticketLines: [],
         drinkLines: input.body.drinkLines,
       })
@@ -599,6 +605,8 @@ const balanceDepositSchema = z.object({
 
 const guestCheckoutSchema = z.object({
   eventId: z.string().min(1),
+  /** Superficie desde la que se compra: página del evento (default) o link de acceso. */
+  channel: z.enum(["PAGE", "ACCESS_LINK"]).optional(),
   /** Promotor referido por el enlace público del evento. */
   promoterId: z.string().uuid().optional(),
   /** Tarea 6.1 — SALDO: pago con el saldo cargado del cliente (visión §2.7). Requiere DNI en el contacto. */
@@ -1400,6 +1408,8 @@ export const publicRoute = new Hono()
         ticketsAvailableFrom: ev.ticketsAvailableFrom ?? null,
         ticketsSalesClosedAt: ev.ticketsSalesClosedAt ?? null,
         consumptionsAvailableFrom: ev.consumptionsAvailableFrom ?? null,
+        consumptionsOnPageEnabled: ev.consumptionsOnPageEnabled ?? true,
+        consumptionsOnAccessLinkEnabled: ev.consumptionsOnAccessLinkEnabled ?? true,
       },
       ticketTypes: ticketTypesOut,
       transports: await db.select({ id: eventTransports.id, name: eventTransports.name,
@@ -1492,6 +1502,7 @@ export const publicRoute = new Hono()
           },
           paymentMethod: body.paymentMethod,
           clientTotal: body.clientTotal.trim(),
+          channel: body.channel ?? "PAGE",
           ticketLines: body.ticketLines ?? [],
           drinkLines: body.drinkLines ?? [],
           transportLines: body.transportLines ?? [],
@@ -2278,6 +2289,7 @@ export const publicRoute = new Hono()
       tenantId: session.tenantId,
       contact: contactFromCustomer(session.customer),
       customerId: session.customer.id,
+      channel: "ACCESS_LINK",
       body,
       returnOrigin: clientReturnOrigin(c.req.header("origin")),
     })
