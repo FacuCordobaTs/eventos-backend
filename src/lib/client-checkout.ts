@@ -1,8 +1,10 @@
-import { and, count, eq, ne } from "drizzle-orm"
+import { and, count, eq, inArray, isNull, ne, or } from "drizzle-orm"
 import type { MySql2Transaction } from "drizzle-orm/mysql2"
 import * as schema from "../db/schema"
 import type { GuestCheckoutSnapshotJson } from "../db/schema"
 import {
+  barProducts,
+  bars,
   customers,
   digitalConsumptions,
   eventStaff,
@@ -361,7 +363,30 @@ async function prepareGuestCheckout(
           eq(eventProducts.productId, line.productId),
           eq(eventProducts.isActive, true),
           eq(products.tenantId, tenantId),
-          eq(products.isActive, true)
+          eq(products.isActive, true),
+          // Sólo se venden consumos que alguna barra activa del evento tiene en
+          // su menú; `eventProducts` puede conservar productos sin barra.
+          inArray(
+            eventProducts.productId,
+            tx
+              .select({ productId: barProducts.productId })
+              .from(barProducts)
+              .innerJoin(
+                bars,
+                and(
+                  eq(bars.id, barProducts.barId),
+                  eq(bars.eventId, params.eventId),
+                  eq(bars.tenantId, tenantId),
+                  or(eq(bars.isActive, true), isNull(bars.isActive))
+                )
+              )
+              .where(
+                and(
+                  eq(barProducts.tenantId, tenantId),
+                  eq(barProducts.isActive, true)
+                )
+              )
+          )
         )
       )
       .limit(1)

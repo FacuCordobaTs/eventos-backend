@@ -5,6 +5,8 @@ import { drizzle } from "drizzle-orm/mysql2"
 import type { MySql2Database } from "drizzle-orm/mysql2"
 import { pool } from "../db"
 import {
+  barProducts,
+  bars,
   courtesies,
   customerAccessCodes,
   customers,
@@ -22,7 +24,7 @@ import {
   transportTickets,
 } from "../db/schema"
 import type { PickupItemsJson } from "../db/schema"
-import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, ne, or } from "drizzle-orm"
+import { SQL, and, asc, count, desc, eq, gte, inArray, isNotNull, isNull, ne, or } from "drizzle-orm"
 import { courtesyTicketCount } from "../lib/ticket-promo"
 import { executeClientCheckout, findOrCreateCustomer } from "../lib/client-checkout"
 import { createTransportShare, cancelTransportShare, getTransportSharePreview, claimTransportShare, loadAllOwnerShares } from "../lib/transport-shares"
@@ -1280,7 +1282,31 @@ export const publicRoute = new Hono()
           eq(eventProducts.tenantId, ev.tenantId),
           eq(eventProducts.isActive, true),
           eq(products.tenantId, ev.tenantId),
-          eq(products.isActive, true)
+          eq(products.isActive, true),
+          // El cliente sólo puede comprar lo que alguna barra activa del evento
+          // tiene en su menú (`barProducts`). `eventProducts` puede conservar
+          // productos históricos que ya no están asignados a ninguna barra.
+          inArray(
+            eventProducts.productId,
+            db
+              .select({ productId: barProducts.productId })
+              .from(barProducts)
+              .innerJoin(
+                bars,
+                and(
+                  eq(bars.id, barProducts.barId),
+                  eq(bars.eventId, ev.id),
+                  eq(bars.tenantId, ev.tenantId),
+                  or(eq(bars.isActive, true), isNull(bars.isActive))
+                )
+              )
+              .where(
+                and(
+                  eq(barProducts.tenantId, ev.tenantId),
+                  eq(barProducts.isActive, true)
+                )
+              )
+          )
         )
       )
       .orderBy(products.name)
