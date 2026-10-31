@@ -4050,11 +4050,22 @@ export const eventsRoute = new Hono()
     const limitRaw = c.req.query("limit")
     const offsetRaw = c.req.query("offset")
     const barIdRaw = c.req.query("barId")?.trim()
+    const sourceRaw = c.req.query("source")?.trim()
+    const statusRaw = c.req.query("status")?.trim() || "COMPLETED"
     const limit = Math.min(
       Math.max(Number.parseInt(limitRaw ?? "50", 10) || 50, 1),
       200
     )
     const offset = Math.max(Number.parseInt(offsetRaw ?? "0", 10) || 0, 0)
+
+    const source = (["POS", "APP", "WEB"] as const).find((v) => v === sourceRaw)
+    if (sourceRaw && !source) {
+      return c.json({ error: "Origen de venta inválido" }, 400)
+    }
+    const status = (["COMPLETED", "PENDING"] as const).find((v) => v === statusRaw)
+    if (!status) {
+      return c.json({ error: "Estado de venta inválido" }, 400)
+    }
 
     const db = drizzle(pool)
     const ev = await requireEventForTenant(db, eventId, tenantId)
@@ -4074,7 +4085,7 @@ export const eventsRoute = new Hono()
     const saleFilters = [
       eq(sales.eventId, eventId),
       eq(sales.tenantId, tenantId),
-      eq(sales.status, "COMPLETED"),
+      eq(sales.status, status),
       exists(
         db
           .select({ id: saleItems.id })
@@ -4085,12 +4096,16 @@ export const eventsRoute = new Hono()
     if (filterBarId) {
       saleFilters.push(eq(sales.barId, filterBarId))
     }
+    if (source) {
+      saleFilters.push(eq(sales.source, source))
+    }
 
     const pageRows = await db
       .select({
         id: sales.id,
         createdAt: sales.createdAt,
         source: sales.source,
+        status: sales.status,
         totalAmount: sales.totalAmount,
         paymentMethod: sales.paymentMethod,
         staffName: staff.name,
@@ -4163,6 +4178,7 @@ export const eventsRoute = new Hono()
         id: r.id,
         createdAt: r.createdAt,
         source: r.source,
+        status: r.status,
         totalAmount: productLinesTotal(r.id),
         paymentMethod: r.paymentMethod,
         staffName: r.staffName,
