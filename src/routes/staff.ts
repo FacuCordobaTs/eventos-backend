@@ -399,6 +399,49 @@ export const staffRoute = new Hono()
     setCookie(c, "token", token, cookieOptions(c, Math.max(0, payload.exp! - Math.floor(Date.now() / 1000))))
     return c.json({ token, staff: { ...await staffPayloadForClient(db, row), role } })
   })
+  // ---------------------------------------------------------------------------
+  // Acceder como otra persona del equipo desde el detalle del evento.
+  //
+  // Entrega la sesión normal del empleado (un año) para dejar configurado un celular o una
+  // computadora sin pedirle su contraseña. Reemplaza la sesión de quien la abre y **no hay vuelta**:
+  // el token no guarda al administrador, así el empleado no puede recuperar el panel de gestión.
+  // El backend sigue resolviendo los permisos del empleado en cada petición.
+  // ---------------------------------------------------------------------------
+  .post("/team/:id/impersonate", authMiddleware, adminOrManager, async (c) => {
+    const db = drizzle(pool)
+    const ctx = c as unknown as AuthenticatedContext
+    const id = c.req.param("id")
+
+    if (id === ctx.staff.id) {
+      return c.json({ error: "Ya estás en tu propia cuenta" }, 400)
+    }
+    // Sin productora no hay equipo al que acceder: evita emparejar cuentas sueltas por un tenant nulo.
+    if (!ctx.staff.tenantId) {
+      return c.json({ error: "Tu cuenta no tiene una productora asignada" }, 403)
+    }
+
+    const [target] = await db.select().from(staff).where(eq(staff.id, id)).limit(1)
+    if (!target) {
+      return c.json({ error: "Persona no encontrada" }, 404)
+    }
+    if (!tenantMatches(ctx.staff.tenantId, target.tenantId)) {
+      return c.json({ error: "Sin permiso" }, 403)
+    }
+    if (!target.isActive) {
+      return c.json({ error: "La cuenta está desactivada" }, 400)
+    }
+    // Un encargado no puede abrir la sesión de un administrador: eso sería escalar privilegios.
+    if (ctx.staff.role !== "ADMIN" && staffRoles(target).includes("ADMIN")) {
+      return c.json(
+        { error: "Solo un administrador puede acceder como otro administrador" },
+        403
+      )
+    }
+
+    const token = await createAccessToken(target.id, "staff")
+    setCookie(c, "token", token, cookieOptions(c))
+    return c.json({ token, staff: await staffPayloadForClient(db, target) })
+  })
   .get("/team", authMiddleware, async (c) => {
     const db = drizzle(pool)
     const ctx = c as AuthenticatedContext
