@@ -50,7 +50,7 @@ export const staff = mysqlTable(
      * invitación, ve sólo los eventos a los que fue asignado y, dentro de ellos, administra
      * únicamente los promotores que él mismo dio de alta (`promoters.owner_staff_id`).
      */
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER', 'DEPOSIT']).notNull(),
     pinCode: varchar('pin_code', { length: 6 }), // Para acceso rápido en el POS
     roles: json('roles').$type<string[] | null>(), // NULL: compatibility with the single role.
     isActive: boolean('is_active').notNull().default(true),
@@ -676,7 +676,10 @@ export const eventInventory = mysqlTable(
     tenantId: varchar('tenant_id', { length: 36 })
       .notNull()
       .references(() => tenants.id),
-    /** Unidades del insumo. 6 decimales: un trago descuenta 1/N unidades. */
+    /**
+     * Unidades del insumo que quedan en el evento: depósito + barras. Lo disponible en el
+     * depósito se deriva restando la suma de `barInventory.currentStock`. 6 decimales.
+     */
     stockAllocated: decimal('stock_allocated', { precision: 16, scale: 6 })
       .notNull()
       .default('0'),
@@ -834,6 +837,47 @@ export const barInventory = mysqlTable(
       table.barId,
       table.inventoryItemId
     ),
+  })
+);
+
+/**
+ * Libro del depósito del evento. `eventInventory.stockAllocated` es el stock total que queda
+ * (depósito + barras); lo disponible en depósito se deriva restando el stock de todas las barras.
+ * Cada ingreso, conteo o envío a una barra deja una fila acá para poder auditar la noche.
+ */
+export const eventStockMovements = mysqlTable(
+  'event_stock_movements',
+  {
+    id: varchar('id', { length: 36 }).primaryKey(),
+    tenantId: varchar('tenant_id', { length: 36 })
+      .notNull()
+      .references(() => tenants.id),
+    eventId: varchar('event_id', { length: 36 })
+      .notNull()
+      .references(() => events.id),
+    inventoryItemId: varchar('inventory_item_id', { length: 36 })
+      .notNull()
+      .references(() => inventoryItems.id),
+    /** Destino: null = depósito; una barra = envío de mercadería. */
+    barId: varchar('bar_id', { length: 36 }).references(() => bars.id),
+    type: mysqlEnum('type', ['DEPOSIT_IN', 'DEPOSIT_COUNT', 'SEND_TO_BAR']).notNull(),
+    /** Unidades movidas (ingreso o envío). En un conteo, el total contado. */
+    quantity: decimal('quantity', { precision: 16, scale: 6 }).notNull(),
+    /** Saldo del depósito después de la operación. */
+    depositAfter: decimal('deposit_after', { precision: 16, scale: 6 }).notNull(),
+    /** Saldo de la barra destino después de un envío. Null en operaciones del depósito. */
+    barAfter: decimal('bar_after', { precision: 16, scale: 6 }),
+    note: varchar('note', { length: 255 }),
+    createdBy: varchar('created_by', { length: 36 }).references(() => staff.id),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (table) => ({
+    eventCreatedIdx: index('event_stock_movements_event_created_idx').on(
+      table.eventId,
+      table.createdAt
+    ),
+    tenantIdx: index('event_stock_movements_tenant_idx').on(table.tenantId),
+    barIdx: index('event_stock_movements_bar_idx').on(table.barId),
   })
 );
 
@@ -1281,7 +1325,7 @@ export const staffInvitations = mysqlTable(
   {
     id: varchar('id', { length: 36 }).primaryKey(),
     tenantId: varchar('tenant_id', { length: 36 }).notNull().references(() => tenants.id),
-    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER']).notNull(),
+    role: mysqlEnum('role', ['ADMIN', 'MANAGER', 'BARTENDER', 'SECURITY', 'PROMOTER', 'GENERAL_PROMOTER', 'TRANSPORTER', 'DEPOSIT']).notNull(),
     // Datos del destinatario: permiten identificar la invitación y enviarla por WhatsApp.
     inviteeName: varchar('invitee_name', { length: 255 }),
     inviteePhone: varchar('invitee_phone', { length: 32 }),
@@ -1516,6 +1560,32 @@ export const barInventoryRelations = relations(barInventory, ({ one }) => ({
     references: [tenants.id],
   }),
 }));
+
+export const eventStockMovementsRelations = relations(
+  eventStockMovements,
+  ({ one }) => ({
+    event: one(events, {
+      fields: [eventStockMovements.eventId],
+      references: [events.id],
+    }),
+    inventoryItem: one(inventoryItems, {
+      fields: [eventStockMovements.inventoryItemId],
+      references: [inventoryItems.id],
+    }),
+    bar: one(bars, {
+      fields: [eventStockMovements.barId],
+      references: [bars.id],
+    }),
+    tenant: one(tenants, {
+      fields: [eventStockMovements.tenantId],
+      references: [tenants.id],
+    }),
+    createdBy: one(staff, {
+      fields: [eventStockMovements.createdBy],
+      references: [staff.id],
+    }),
+  })
+);
 
 export const inventoryItemsRelations = relations(inventoryItems, ({ many }) => ({
   barInventory: many(barInventory),

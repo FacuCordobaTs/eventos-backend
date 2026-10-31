@@ -4,7 +4,7 @@ import type { WSContext } from "hono/ws"
 import { drizzle } from "drizzle-orm/mysql2"
 import { and, eq } from "drizzle-orm"
 import { pool } from "../db"
-import { events, staff } from "../db/schema"
+import { events, staff, eventStaff } from "../db/schema"
 import { verifyToken } from "../lib/jwt"
 import { resolveStaffRole } from "../lib/staff-roles"
 import {
@@ -16,7 +16,7 @@ export function mountStockWebSocket(app: Hono) {
   app.get(
     "/ws/event/:eventId/stock",
     upgradeWebSocket(async (c) => {
-      const eventId = c.req.param("eventId")
+      const eventId: string = c.req.param("eventId") ?? ""
       const token = c.req.query("token") ?? ""
 
       let roomKey: string | null = null
@@ -34,18 +34,36 @@ export function mountStockWebSocket(app: Hono) {
           .where(eq(staff.id, payload.sub))
           .limit(1)
         const tenantId = st?.tenantId
-        if (!tenantId || !st.isActive || resolveStaffRole(st, payload.activeRole) === "TRANSPORTER") {
+        const activeRole = st ? resolveStaffRole(st, payload.activeRole) : null
+        if (!tenantId || !st.isActive || activeRole === "TRANSPORTER") {
           throw new Error("no tenant")
         }
+        const eventTenantId: string = tenantId
+        const staffId: string = payload.sub ?? ""
         const [ev] = await db
           .select({ id: events.id })
           .from(events)
-          .where(and(eq(events.id, eventId), eq(events.tenantId, tenantId)))
+          .where(and(eq(events.id, eventId), eq(events.tenantId, eventTenantId)))
           .limit(1)
         if (!ev) {
           throw new Error("bad event")
         }
-        roomKey = makeStockRoomKey(tenantId, eventId)
+        // El depósito sólo observa el stock de los eventos donde está asignado.
+        if (activeRole === "DEPOSIT") {
+          const [assignment] = await db
+            .select({ id: eventStaff.id })
+            .from(eventStaff)
+            .where(
+              and(
+                eq(eventStaff.eventId, eventId),
+                eq(eventStaff.staffId, staffId),
+                eq(eventStaff.tenantId, eventTenantId)
+              )
+            )
+            .limit(1)
+          if (!assignment) throw new Error("not assigned")
+        }
+        roomKey = makeStockRoomKey(eventTenantId, eventId)
       } catch {
         roomKey = null
       }

@@ -47,6 +47,7 @@ const roleEnum = z.enum([
   "TRANSPORTER",
   "PROMOTER",
   "GENERAL_PROMOTER",
+  "DEPOSIT",
 ])
 const pinSchema = z.string().regex(/^\d{4,6}$/, "El PIN debe tener entre 4 y 6 dígitos")
 

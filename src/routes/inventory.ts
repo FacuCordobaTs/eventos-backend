@@ -523,12 +523,20 @@ export const inventoryRoute = new Hono()
   })
   .post("/items", zValidator("json", upsertItemSchema), async (c) => {
     const ctx = c as AuthenticatedContext
-    if (ctx.staff.role !== "ADMIN" && ctx.staff.role !== "MANAGER") return c.json({ error: "No tenés permiso para administrar insumos" }, 403)
+    const body = c.req.valid("json")
+    // El encargado de depósito puede dar de alta un insumo nuevo (sólo nombre); renombrar o
+    // desactivar el catálogo compartido sigue siendo de ADMIN/MANAGER.
+    const depositCanCreate = ctx.staff.role === "DEPOSIT" && !body.id
+    if (
+      ctx.staff.role !== "ADMIN" &&
+      ctx.staff.role !== "MANAGER" &&
+      !depositCanCreate
+    )
+      return c.json({ error: "No tenés permiso para administrar insumos" }, 403)
     const tenantId = requireTenantId(ctx)
     if (!tenantId) {
       return c.json({ error: "Tu cuenta no tiene tenant asignado." }, 400)
     }
-    const body = c.req.valid("json")
     const db = drizzle(pool)
 
     const sameTenant = await db

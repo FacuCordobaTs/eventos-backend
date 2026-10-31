@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm"
 import { staff } from "../db/schema"
 
-export const STAFF_ROLES = ["ADMIN", "MANAGER", "BARTENDER", "SECURITY", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER"] as const
+export const STAFF_ROLES = ["ADMIN", "MANAGER", "BARTENDER", "SECURITY", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER", "DEPOSIT"] as const
 export type StaffRole = typeof STAFF_ROLES[number]
 
 export function staffRoles(row: { role: string; roles?: string[] | null }): StaffRole[] {

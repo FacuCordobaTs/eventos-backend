@@ -4,6 +4,7 @@ import { logger } from "hono/logger"
 import { tenantsRoute } from "./routes/tenants"
 import { staffRoute } from "./routes/staff"
 import { eventsRoute } from "./routes/events"
+import { depositRoute } from "./routes/deposit"
 import { transportsRoute } from "./routes/transports"
 import { transportTicketsRoute } from "./routes/transport-tickets"
 import { transportManifestsRoute } from "./routes/transport-manifests"
@@ -64,6 +65,7 @@ app.use("/public/updates/*", serveStatic({ root: "./" }))
 app.route("/tenants", tenantsRoute)
 app.route("/staff", staffRoute)
 app.route("/events", eventsRoute)
+app.route("/events", depositRoute)
 app.route("/event-transports", transportsRoute)
 app.route("/transport-tickets", transportTicketsRoute)
 app.route("/tickets", ticketsRoute)

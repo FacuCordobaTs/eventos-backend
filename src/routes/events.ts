@@ -19,6 +19,7 @@ import {
   eventInventory,
   eventProducts,
   eventExpenses,
+  eventStockMovements,
   events,
   type EventClosingReport,
   type PromoterSalesRow,
@@ -1431,10 +1432,10 @@ export const eventsRoute = new Hono()
       )
     }
     const db = drizzle(pool)
-    // Mismo alcance para los roles acotados a una asignación: seguridad (opera la puerta) y
-    // promotor general (coordina sus promotores en ese evento). El resto ve la productora entera.
+    // Mismo alcance para los roles acotados a una asignación: seguridad (opera la puerta), depósito
+    // (controla stock) y promotor general (coordina sus promotores). El resto ve la productora entera.
     const eventVisibility =
-      ctx.staff.role === "SECURITY" || isGeneralPromoter(ctx)
+      ctx.staff.role === "SECURITY" || ctx.staff.role === "DEPOSIT" || isGeneralPromoter(ctx)
         ? and(
             eq(events.tenantId, tenantId),
             exists(
@@ -1569,6 +1570,7 @@ export const eventsRoute = new Hono()
       // Gastos salen antes que compras porque event_expenses.purchase_id las referencia.
       await tx.delete(eventExpenses).where(and(eq(eventExpenses.eventId, eventId), eq(eventExpenses.tenantId, tenantId)))
       await tx.delete(purchases).where(and(eq(purchases.eventId, eventId), eq(purchases.tenantId, tenantId)))
+      await tx.delete(eventStockMovements).where(and(eq(eventStockMovements.eventId, eventId), eq(eventStockMovements.tenantId, tenantId)))
       await tx.delete(eventStaff).where(and(eq(eventStaff.eventId, eventId), eq(eventStaff.tenantId, tenantId)))
 
       const eventBars = await tx
@@ -5502,7 +5504,10 @@ export const eventsRoute = new Hono()
     }
     // El promotor general abre sólo los eventos de su lista; el listado ya viene acotado por
     // asignación, así que un id suelto no puede ampliarle el alcance.
-    if (isGeneralPromoter(ctx) && !(await isAssignedToEvent(db, id, tenantId, ctx.staff.id))) {
+    if (
+      (isGeneralPromoter(ctx) || ctx.staff.role === "DEPOSIT") &&
+      !(await isAssignedToEvent(db, id, tenantId, ctx.staff.id))
+    ) {
       return c.json({ error: "No estás asignado a este evento." }, 403)
     }
     return c.json({ event: sanitizeEvent(row) })

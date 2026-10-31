@@ -84,11 +84,11 @@ test("legacy roles and removed selections resolve only to currently granted role
 
 test("ADMIN and MANAGER assign all roles, including ADMIN, and create one promoter identity", async () => {
   for (const actor of ["admin", "manager"]) {
-    const response = await request("/events/event-a/staff/employee/roles", actor, { roles: ["ADMIN", "MANAGER", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER", "BARTENDER", "SECURITY", "ADMIN"] }, "PATCH")
-    // The maximum payload is seven; a duplicate is accepted within that limit.
+    const response = await request("/events/event-a/staff/employee/roles", actor, { roles: ["ADMIN", "MANAGER", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER", "BARTENDER", "SECURITY", "DEPOSIT", "ADMIN"] }, "PATCH")
+    // The maximum payload is eight; a duplicate is accepted within that limit.
     expect(response.status).toBe(400)
-    expect((await request("/events/event-a/staff/employee/roles", actor, { roles: ["ADMIN", "MANAGER", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER", "BARTENDER", "SECURITY"] }, "PATCH")).status).toBe(200)
-    expect(tables.staff[2].roles).toHaveLength(7)
+    expect((await request("/events/event-a/staff/employee/roles", actor, { roles: ["ADMIN", "MANAGER", "TRANSPORTER", "PROMOTER", "GENERAL_PROMOTER", "BARTENDER", "SECURITY", "DEPOSIT"] }, "PATCH")).status).toBe(200)
+    expect(tables.staff[2].roles).toHaveLength(8)
     expect(tables.promoters).toHaveLength(1)
   }
 })

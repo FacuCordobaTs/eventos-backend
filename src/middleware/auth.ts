@@ -55,6 +55,23 @@ export const authMiddleware = async (c: Context, next: Next) => {
       !/^\/staff\/device-links\/[^/]+\/approve$/.test(c.req.path)) {
       return c.json({ error: "No tenés permiso para esta operación" }, 403)
     }
+    // El depósito sólo entra a sus eventos asignados y a las rutas de stock. El resto del panel
+    // de la productora (ventas, entradas, equipo, caja) queda fuera del alcance de esta sesión.
+    if (activeRole === "DEPOSIT") {
+      const method = c.req.method
+      const path = c.req.path
+      const allowed =
+        path === "/staff/me" ||
+        path === "/staff/me/role" ||
+        (path === "/events" && method === "GET") ||
+        (/^\/events\/[^/]+$/.test(path) && method === "GET") ||
+        /^\/events\/[^/]+\/deposit(?:\/.*)?$/.test(path) ||
+        (/^\/events\/[^/]+\/stock-snapshot$/.test(path) && method === "GET") ||
+        (path === "/inventory/items" && (method === "GET" || method === "POST"))
+      if (!allowed) {
+        return c.json({ error: "No tenés permiso para esta operación" }, 403)
+      }
+    }
 
     ;(c as AuthenticatedContext).staff = {
       id: staff.id,
