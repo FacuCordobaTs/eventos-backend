@@ -126,8 +126,9 @@ type DeductionLine = { productId: string; quantity: number; saleType: ProductSal
  * Descuenta stock de la barra por receta dentro de la transacción abierta, UNA vez por
  * producto (cantidad agregada de la línea). Compartido por el canje 1×1 (`redeem`) y la
  * entrega de pedidos (`deliver`): entregar 2 fernets de un pedido descuenta exactamente lo
- * mismo que canjear 2 QRs individuales (un Fernet descuenta Coca y Alcohol). Lanza
- * `InsufficientStockError` si no alcanza. Devuelve los inventoryItemIds que cambiaron.
+ * mismo que canjear 2 QRs individuales (un Fernet descuenta Coca y Alcohol). La falta de stock
+ * no bloquea la entrega: igual que en la venta de caja, la barra queda en cero y el total del
+ * evento refleja la diferencia a regularizar. Devuelve los inventoryItemIds que cambiaron.
  */
 async function deductRecipeStock(
   tx: Tx,
@@ -165,10 +166,6 @@ async function deductRecipeStock(
       )).limit(1).for("update")
       if (stock?.directStock != null) {
         const remaining = decFromDb(stock.directStock).minus(line.quantity)
-        if (remaining.lt(0)) {
-          const [product] = await tx.select({ name: products.name }).from(products).where(and(eq(products.id, line.productId), eq(products.tenantId, params.tenantId))).limit(1)
-          throw new InsufficientStockError("Stock insuficiente", line.productId, product?.name ?? "Producto")
-        }
         await tx.update(barProducts).set({ directStock: decToDb(remaining) }).where(eq(barProducts.id, stock.id))
       }
     }
@@ -212,22 +209,6 @@ async function deductRecipeStock(
         .limit(1)
       const cap = evRow ? decFromDb(evRow.stockAllocated) : dec(0)
 
-      const [sumR] = await tx
-        .select({
-          s: sql<string>`coalesce(sum(cast(${barInventory.currentStock} as decimal(20,6))), 0)`,
-        })
-        .from(barInventory)
-        .innerJoin(bars, eq(barInventory.barId, bars.id))
-        .where(
-          and(
-            eq(bars.eventId, params.eventId),
-            eq(bars.tenantId, params.tenantId),
-            eq(barInventory.tenantId, params.tenantId),
-            eq(barInventory.inventoryItemId, r.inventoryItemId)
-          )
-        )
-
-      const sumAll = decFromDb(sumR?.s ?? "0")
       const [bRow] = await tx
         .select()
         .from(barInventory)
@@ -242,34 +223,20 @@ async function deductRecipeStock(
       const barAvail = bRow ? decFromDb(bRow.currentStock) : dec(0)
 
       if (!evRow) {
-        if (deduct.gt(barAvail)) {
-          throw new InsufficientStockError(
-            "Stock insuficiente",
-            r.inventoryItemId,
-            item.name
-          )
-        }
-        if (bRow) {
+        if (bRow && barAvail.gt(0)) {
+          const fromBar = deduct.lte(barAvail) ? deduct : barAvail
           await tx
             .update(barInventory)
-            .set({ currentStock: stockToDb(barAvail.minus(deduct)) })
+            .set({ currentStock: stockToDb(barAvail.minus(fromBar)) })
             .where(
               and(
                 eq(barInventory.id, bRow.id),
                 eq(barInventory.tenantId, params.tenantId)
               )
             )
+          changedItemIds.push(r.inventoryItemId)
         }
         continue
-      }
-
-      const unalloc = cap.minus(sumAll)
-      if (deduct.gt(barAvail.plus(unalloc))) {
-        throw new InsufficientStockError(
-          "Stock insuficiente",
-          r.inventoryItemId,
-          item.name
-        )
       }
 
       const fromBar = deduct.lte(barAvail) ? deduct : barAvail
@@ -485,7 +452,7 @@ type RedeemSetResult =
  * por producto (cantidad agregada). Lo comparten la entrega de pedidos de retiro (tarea 4.2) y
  * la entrega por comprobante de la venta: entregar 2 fernets descuenta exactamente lo mismo que
  * canjear 2 QRs individuales. Corre DENTRO de la transacción del caller: ante `wrong_event` o
- * `race_used` el caller debe descartarla. Lanza `InsufficientStockError` si no alcanza el stock.
+ * `race_used` el caller debe descartarla.
  */
 async function redeemConsumptionSet(
   tx: Tx,

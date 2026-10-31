@@ -506,6 +506,17 @@ describe("Entrega de ventas ya descontadas en caja", () => {
     ).toBe(400);
     expect(tables.bar_inventory[0].currentStock).toBe("0.900000");
   });
+  test("un QR web se entrega aunque falte stock y la barra queda en cero", async () => {
+    posSale();
+    tables.sales[0].source = "WEB";
+    tables.event_inventory[0].stockAllocated = "0.050000";
+    tables.bar_inventory[0].currentStock = "0.050000";
+    expect(
+      (await request("/bar-1/redeem", "POST", { qrHash: "qr" })).status,
+    ).toBe(200);
+    expect(tables.bar_inventory[0].currentStock).toBe("0.000000");
+    expect(tables.event_inventory[0].stockAllocated).toBe("-0.050000");
+  });
   test("el comprobante POS se puede entregar aunque el stock reservado ya esté en cero", async () => {
     posSale();
     const preview = await request("/bar-1/sales/receipt", "GET");
